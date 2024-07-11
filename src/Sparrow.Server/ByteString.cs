@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -246,7 +247,7 @@ namespace Sparrow.Server
             EnsureIsNotBadPointer();
             Memory.Copy(dest + offset, _pointer->Ptr + from, count);
         }
-        
+
         public void CopyTo(Span<byte> dest)
         {
             ToSpan().CopyTo(dest);
@@ -499,7 +500,7 @@ namespace Sparrow.Server
                 GC.SuppressFinalize(this);
             }
         }
-        
+
     }
 
     public interface IByteStringAllocator
@@ -519,7 +520,7 @@ namespace Sparrow.Server
             {
                 return new UnmanagedGlobalSegment(size);
             }
-            catch 
+            catch
             {
                 allocationFailure?.Invoke();
                 throw;
@@ -609,7 +610,7 @@ namespace Sparrow.Server
             {
                 return new UnmanagedGlobalSegment(size);
             }
-            catch 
+            catch
             {
                 allocationFailure?.Invoke();
                 throw;
@@ -659,7 +660,7 @@ namespace Sparrow.Server
                 current.Value?.Dispose();
                 current = current.Next;
             }
-        }       
+        }
     }
 
     public sealed class ByteStringContext : ByteStringContext<ByteStringMemoryCache>
@@ -683,8 +684,13 @@ namespace Sparrow.Server
         { }
     }
 
-    public unsafe class ByteStringContext<TAllocator> : IDisposable where TAllocator : struct, IByteStringAllocator
+    public unsafe class ByteStringContext<TAllocator> : IDisposable 
+        where TAllocator : struct, IByteStringAllocator
     {
+        private static readonly long DefragmentationSegmentsThresholdInBytes = (PlatformDetails.Is32Bits ? 32 : 128) * Sparrow.Global.Constants.Size.Megabyte;
+
+        private static readonly int MinNumberOfSegmentsToDefragment = PlatformDetails.Is32Bits ? 512 : 1024;
+
         public static TAllocator Allocator;
 
         public event Action AllocationFailed;
@@ -727,6 +733,11 @@ namespace Sparrow.Server
             {
                 [MethodImpl(MethodImplOptions.AggressiveInlining)]
                 get { return (int)(End - Current); }
+            }
+
+            public override string ToString()
+            {
+                return $"{nameof(Start)}: {(long)Start}, {nameof(End)}: {(long)End}, {nameof(Size)}: {Size}, {nameof(SizeLeft)}: {SizeLeft}";
             }
         }
 
@@ -798,10 +809,10 @@ namespace Sparrow.Server
         public void Reset()
         {
             if (_disposed)
-            {                
+            {
                 ThrowObjectDisposed();
             }
-                
+
 #if DEBUG
             Generation++;
 #endif
@@ -841,21 +852,59 @@ namespace Sparrow.Server
 
                 ReleaseSegment(segment);
             }
-            
+
             _wholeSegments.Clear();
             _wholeSegments.Add(_internalCurrent);
             _wholeSegments.Add(_externalCurrent);
         }
 
+        internal int NumberOfReadyToUseMemorySegments => _internalReadyToUseMemorySegments?.Count ?? 0;
+
+        public void DefragmentSegments(bool force = false)
+        {
+            // small allocators
+            if (force == false && _totalAllocated <= DefragmentationSegmentsThresholdInBytes)
+                return;
+
+            // small fragmentation
+            var segments = _internalReadyToUseMemorySegments;
+            if (segments == null)
+                return;
+
+            if (force == false && segments.Count < MinNumberOfSegmentsToDefragment)
+                return;
+
+            segments.Sort((x, y) => ((long)x.Start).CompareTo((long)y.Start));
+            
+            byte* currentStart = segments[0].Start, currentEnd = segments[0].End;
+            var currentIdx = 0;
+            
+            for (int i = 1; i < segments.Count; i++)
+            {
+                if (currentEnd == segments[i].Start)
+                {
+                    currentEnd = segments[i].End;
+                }
+                else
+                {
+                    segments[currentIdx++] = new SegmentInformation(currentStart, currentEnd, canDispose: false);
+                    currentStart = segments[i].Start;
+                    currentEnd = segments[i].End;
+                }
+            }
+            segments[currentIdx++] = new SegmentInformation(currentStart, currentEnd, canDispose: false);
+            segments.RemoveRange(currentIdx, segments.Count - currentIdx);
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public InternalScope Allocate<T>(int length, out Span<T> output)
-            where T: unmanaged
+            where T : unmanaged
         {
             var r = Allocate(length * sizeof(T), out ByteString str);
             output = MemoryMarshal.Cast<byte, T>(str.ToSpan());
             return r;
         }
-        
+
         private class ByteStringMemoryManager<T> : MemoryManager<T> where T : unmanaged
         {
             private readonly ByteStringContext<TAllocator> _context;
@@ -875,7 +924,7 @@ namespace Sparrow.Server
                 if (elementIndex < 0 || elementIndex >= _str.Length / sizeof(T))
                     throw new ArgumentOutOfRangeException(nameof(elementIndex));
 
-                return new MemoryHandle(_str._pointer + (elementIndex*sizeof(T)));
+                return new MemoryHandle(_str._pointer + (elementIndex * sizeof(T)));
             }
 
             public override void Unpin()
@@ -1072,7 +1121,7 @@ namespace Sparrow.Server
 
             return AllocateInternalUnlikely(length, allocationUnit, type); // We will allocate also allocating a segment. 
 
-            AllocateWhole:
+        AllocateWhole:
             return AllocateWholeSegment(length, type); // We will pass the length because this is a whole allocated segment able to hold a length size ByteString.
         }
 
@@ -1133,7 +1182,9 @@ namespace Sparrow.Server
             else
             {
                 _allocationBlockSize = Math.Min(2 * Sparrow.Global.Constants.Size.Megabyte, _allocationBlockSize * 2);
-                _internalCurrent = AllocateSegment(_allocationBlockSize);
+                var toAllocate = Math.Max(_allocationBlockSize, allocationUnit);
+                _internalCurrent = AllocateSegment(toAllocate);
+                Debug.Assert(_internalCurrent.SizeLeft >= allocationUnit, $"{_internalCurrent.SizeLeft} >= {allocationUnit}");
             }
 
             var byteString = Create(_internalCurrent.Current, length, allocationUnit, type);
@@ -1300,7 +1351,7 @@ namespace Sparrow.Server
                 byte* end = start + value._pointer->Size;
 
                 // Given that this is put into a reuse queue, we are not providing the Segment because it has no ownership of it.
-                var segment = new SegmentInformation (start, end, false );
+                var segment = new SegmentInformation(start, end, false);
                 _internalReadyToUseMemorySegments.Add(segment);
             }
 
@@ -1329,7 +1380,7 @@ namespace Sparrow.Server
             byte* start = memorySegment.Segment;
             byte* end = start + memorySegment.Size;
 
-            var segment = new SegmentInformation( memorySegment, start, end, true );
+            var segment = new SegmentInformation(memorySegment, start, end, true);
             _wholeSegments.Add(segment);
 
             return segment;
@@ -1356,7 +1407,7 @@ namespace Sparrow.Server
             byte* start = memorySegment.Segment;
             byte* end = start + memorySegment.Size;
 
-            _externalCurrent = new SegmentInformation ( memorySegment, start, end, true );
+            _externalCurrent = new SegmentInformation(memorySegment, start, end, true);
             _externalCurrentLeft = (int)(_externalCurrent.End - _externalCurrent.Start) / ByteStringContext.ExternalAlignedSize;
 
             _wholeSegments.Add(_externalCurrent);
@@ -1862,7 +1913,7 @@ namespace Sparrow.Server
                 _internalReadyToUseMemorySegments.Clear();
             }
         }
-        
+
         private readonly SharedMultipleUseFlag _lowMemoryFlag;
 
         private void ReleaseSegment(SegmentInformation segment)

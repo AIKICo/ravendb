@@ -10,8 +10,10 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using Raven.Client;
 using Raven.Client.Documents.Changes;
+using Raven.Client.Documents.Queries.Timings;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
 using Raven.Client.Exceptions.Commercial;
@@ -24,11 +26,13 @@ using Raven.Client.Exceptions.Security;
 using Raven.Client.Properties;
 using Raven.Client.Util;
 using Raven.Server.Config;
+using Raven.Server.Documents;
 using Raven.Server.Exceptions;
 using Raven.Server.Rachis;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide;
 using Raven.Server.TrafficWatch;
+using Raven.Server.Utils;
 using Raven.Server.Web;
 using Sparrow;
 using Sparrow.Json;
@@ -37,6 +41,7 @@ using Sparrow.Logging;
 using Sparrow.LowMemory;
 using Sparrow.Server.Exceptions;
 using Voron.Exceptions;
+using static Raven.Server.Utils.MetricCacher.Keys;
 
 namespace Raven.Server
 {
@@ -44,7 +49,7 @@ namespace Raven.Server
     {
         private RequestRouter _router;
         private RavenServer _server;
-        private int _requestId;
+        private long _requestId;
         private readonly Logger _logger = LoggingSource.Instance.GetLogger<RavenServerStartup>("Server");
 
         public void Configure(IApplicationBuilder app, ILoggerFactory loggerFactory)
@@ -154,6 +159,10 @@ namespace Raven.Server
             $"If you would rather like to keep your server unsecured, please relax the { RavenConfiguration.GetKey(x => x.Security.UnsecuredAccessAllowed) } setting to match the { RavenConfiguration.GetKey(x => x.Core.ServerUrls) } setting value."
         };
 
+        private static readonly StringValues ContentTypeHeaderValue = "application/json; charset=utf-8";
+
+        internal static readonly StringValues ServerVersionHeaderValue = RavenVersionAttribute.Instance.AssemblyVersion;
+
         private async Task RequestHandler(HttpContext context)
         {
             var requestHandlerContext = new RequestHandlerContext
@@ -166,8 +175,7 @@ namespace Raven.Server
             try
             {
                 context.Response.StatusCode = (int)HttpStatusCode.OK;
-                context.Response.Headers["Content-Type"] = "application/json; charset=utf-8";
-                context.Response.Headers[Constants.Headers.ServerVersion] = RavenVersionAttribute.Instance.AssemblyVersion;
+                context.Response.Headers[Constants.Headers.ContentType] = ContentTypeHeaderValue;
 
                 if (_server.ServerStore.Initialized == false)
                     await _server.ServerStore.InitializationCompleted.WaitAsync();
@@ -182,6 +190,8 @@ namespace Raven.Server
                 {
                     sp?.Stop();
                     exception = e;
+
+                    CheckDatabaseShutdownAndThrowIfNeeded(requestHandlerContext.Database, ref e);
 
                     CheckVersionAndWrapException(context, ref e);
 
@@ -252,6 +262,12 @@ namespace Raven.Server
             }
         }
 
+        private static void CheckDatabaseShutdownAndThrowIfNeeded(DocumentDatabase database, ref Exception e)
+        {
+            if (e is OperationCanceledException && database != null && (database.DatabaseShutdownCompleted.IsSet || database.DatabaseShutdown.IsCancellationRequested))
+                e = new DatabaseDisabledException("The database " + database.Name + " is shutting down", e);
+        }
+
         private static void CheckVersionAndWrapException(HttpContext context, ref Exception e)
         {
             if (RequestRouter.TryGetClientVersion(context, out var version) == false)
@@ -299,6 +315,8 @@ namespace Raven.Server
             (string CustomInfo, TrafficWatchChangeType Type) twTuple =
                 ((string, TrafficWatchChangeType)?)contextItem ?? ("N/A", TrafficWatchChangeType.None);
 
+            var timings = context.Items[nameof(QueryTimings)];
+
             var twn = new TrafficWatchHttpChange
             {
                 TimeStamp = DateTime.UtcNow,
@@ -310,6 +328,7 @@ namespace Raven.Server
                 AbsoluteUri = $"{context.Request.Scheme}://{context.Request.Host}",
                 DatabaseName = database ?? "N/A",
                 CustomInfo = twTuple.CustomInfo,
+                QueryTimings = timings != null ? (QueryTimings)timings : null,
                 Type = twTuple.Type,
                 ClientIP = context.Connection.RemoteIpAddress?.ToString(),
                 CertificateThumbprint = context.Connection.ClientCertificate?.Thumbprint,
@@ -364,9 +383,8 @@ namespace Raven.Server
                 return;
             }
 
-            if (exception is LowMemoryException ||
+            if (exception.IsOutOfMemory() ||
                 exception is HighDirtyMemoryException ||
-                exception is OutOfMemoryException ||
                 exception is VoronUnrecoverableErrorException ||
                 exception is VoronErrorException ||
                 exception is QuotaException ||
@@ -433,7 +451,7 @@ namespace Raven.Server
             if (exception is DatabaseNotRelevantException)
             {
                 response.StatusCode = (int)HttpStatusCode.Gone;
-                response.Headers.Add("Cache-Control", new Microsoft.Extensions.Primitives.StringValues(new[] { "must-revalidate", "no-cache" }));
+                response.Headers["Cache-Control"] = new Microsoft.Extensions.Primitives.StringValues(new[] { "must-revalidate", "no-cache" });
                 return;
             }
 

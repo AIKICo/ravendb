@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using FastTests.Server.Replication;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
+using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.CompareExchange;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Session;
@@ -60,7 +61,7 @@ namespace RachisTests
 
             await ActionWithLeader((l) => l.ServerStore.RemoveFromClusterAsync(watcher.ServerStore.NodeTag));
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(watcher.WebUrl, watcher.ServerStore.NodeTag), ctx);
@@ -194,13 +195,18 @@ namespace RachisTests
                 await store.Maintenance.Server.SendAsync(new AddDatabaseNodeOperation(store.Database));
                 await WaitAndAssertForValueAsync(() => GetMembersCount(store), 3);
 
-                await WaitAndAssertForValueAsync(() =>
+                await WaitAndAssertForValueAsync(async () =>
                 {
-                    var changeVectors = cluster.Nodes.Select(s =>
-                        s.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).Result.ReadLastEtagAndChangeVector().ChangeVector.ToChangeVector()
-                            .SerializeVector()).ToHashSet();
-
-                    return Task.FromResult(changeVectors.Count);
+                    var cvs = new List<string>();
+                    foreach (var node in cluster.Nodes)
+                    {
+                        var database = await node.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                        var changeVector = database.ReadLastEtagAndChangeVector().ChangeVector.ToChangeVector()
+                            .SerializeVector();
+                        cvs.Add(changeVector);
+                    }
+                    
+                    return cvs.ToHashSet().Count;
                 }, 1);
             }
         }
@@ -218,7 +224,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -248,7 +254,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -279,7 +285,7 @@ namespace RachisTests
 
             // here we pusblish a wrong PublicServerUrl, but connect to the ServerUrl, so the HTTP connection should be okay, but will when trying to the TCP connection.
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -309,7 +315,7 @@ namespace RachisTests
             var dest = raft2.ServerStore.GetNodeHttpServerUrl();
 
             using (raft1.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(source, raft1.ServerStore.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var nodeConnectionTest = new TestNodeConnectionCommand(dest, bidirectional: true);
                 await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
@@ -359,7 +365,7 @@ namespace RachisTests
             var dbWatcher = GetDatabaseName();
 
             var fromSeconds = Debugger.IsAttached ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(5);
-            var (_, leader) = await CreateRaftCluster(5);
+            var (nodes, leader) = await CreateRaftCluster(5, leaderIndex: 0);
             Assert.True(leader.ServerStore.LicenseManager.HasHighlyAvailableTasks());
 
             var db = await CreateDatabaseInCluster(dbMain, 5, leader.WebUrl);
@@ -396,7 +402,7 @@ namespace RachisTests
 
                 Assert.True(watcher.MentorNode != watcherDb.Servers[0].ServerStore.NodeTag);
 
-                var watcherRes = await AddWatcherToReplicationTopology((DocumentStore)leaderStore, watcher);
+                var watcherRes = await AddWatcherToReplicationTopology((DocumentStore)leaderStore, watcher, nodes.Select(n => n.WebUrl).ToArray());
                 var tasks = new List<Task>();
                 foreach (var ravenServer in Servers)
                 {
@@ -467,7 +473,7 @@ namespace RachisTests
                     }
                 }
 
-                Assert.True(WaitForDocument<User>(watcherStore, "users/3", u => u.Name == "Karmel3", 30_000));
+                Assert.True(WaitForDocument<User>(watcherStore, "users/3", u => u.Name == "Karmel3", 30_000), $"Doc 'users/3' did not reach watcherStore");
 
                 // rejoin the node
                 var newLeader = await ActionWithLeader(l => l.ServerStore.AddNodeToClusterAsync(responsibleServer.WebUrl, watcherRes.ResponsibleNode));
@@ -716,7 +722,7 @@ namespace RachisTests
             var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
             Servers.Add(server2);
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 var ex = await Assert.ThrowsAsync<RavenException>(async () =>
@@ -754,7 +760,7 @@ namespace RachisTests
                 var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
                 Servers.Add(server2);
 
-                using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
+                using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null, DocumentConventions.DefaultForServer))
                 using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
                 {
                     await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(server2Url, watcher: true), ctx);
@@ -802,7 +808,7 @@ namespace RachisTests
                 var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
                 Servers.Add(server2);
 
-                using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null))
+                using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null))
                 using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
                 {
                     await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(server2Url, watcher: true), ctx);
@@ -818,10 +824,124 @@ namespace RachisTests
                 using (server2.ServerStore.Engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
                 using (context.OpenReadTransaction())
                 {
-                    Assert.Single(SubscriptionStorage.GetResendItems(context, store.Database, state.SubscriptionId));
+                    Assert.Single(SubscriptionStorage.GetResendItemsForSubscriptionId(context, store.Database, state.SubscriptionId));
                 }
 
                 waitForBatch.Set();
+            }
+        }
+
+        [Fact]
+        public async Task ClientRequestExecutorTopologyWillUpdateWhenAddingNewNodeToCluster_RavenDB_20702()
+        {
+            var (nodes, leader) = await CreateRaftCluster(3, leaderIndex: 0, watcherCluster: true);
+
+            var executorB = ClusterRequestExecutor.Create(new string[] { leader.WebUrl }, null, DocumentConventions.Default);
+            
+            await WaitForValueAsync(() =>
+            {
+                foreach (var node in nodes)
+                {
+                    if (executorB?.TopologyNodes == null)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }, true);
+            
+            var serverD = GetNewServer();
+            var serverDUrl = serverD.ServerStore.GetNodeHttpServerUrl();
+            Servers.Add(serverD);
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null, DocumentConventions.DefaultForServer))
+            using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
+            {
+                await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(serverDUrl, "D", watcher: true), ctx);
+                await serverD.ServerStore.Engine.WaitForTopology(Leader.TopologyModification.NonVoter);
+            }
+
+            using (var ctx = JsonOperationContext.ShortTermSingleUse())
+            {
+                //first request to D will not work since the request executor did not update its topology
+                var error = await Assert.ThrowsAnyAsync<RequestedNodeUnavailableException>(async () => await executorB.ExecuteAsync(new GetDatabasesCommand("D"), ctx));
+                Assert.Contains("Could not find requested node", error.Message);
+                //first request will update the topology
+                await executorB.ExecuteAsync(new GetDatabasesCommand("B"), ctx);
+                //second will request straight to D will already have it in the topology
+                await executorB.ExecuteAsync(new GetDatabasesCommand("D"), ctx);
+            }
+        }
+
+        internal class GetDatabasesCommand : RavenCommand
+        {
+            public GetDatabasesCommand(string nodeTag)
+            {
+                SelectedNodeTag = nodeTag;
+            }
+
+            public override bool IsReadRequest => false;
+
+            public override HttpRequestMessage CreateRequest(JsonOperationContext ctx, ServerNode node, out string url)
+            {
+                url = $"{node.Url}/databases";
+                
+                return new HttpRequestMessage
+                {
+                    Method = HttpMethod.Get
+                };
+            }
+
+            public override void SetResponse(JsonOperationContext context, BlittableJsonReaderObject response, bool fromCache)
+            {
+                if (response == null)
+                    return;
+            }
+        }
+
+        [RavenFact(RavenTestCategory.Cluster)]
+        public async Task ThrowForSelectedNodeTagOperationWhenNodeIsInRehab()
+        {
+            var name = GetDatabaseName();
+            var (nodes, leader) = await CreateRaftCluster(3, leaderIndex: 0, watcherCluster: true);
+            var (index, dbNodes) = await CreateDatabaseInCluster(name, replicationFactor: 3, leader.WebUrl);
+
+            var dbNode = nodes.First(x => x.ServerStore.NodeTag != leader.ServerStore.NodeTag);
+
+            using (var store = new DocumentStore()
+                   {
+                       Urls = new string[] { leader.WebUrl },
+                       Database = name,
+                       Conventions = new DocumentConventions()
+                       {
+                           DisableTopologyUpdates = false
+                       }
+                   })
+            {
+                store.Initialize();
+                //take down node
+                await DisposeServerAndWaitForFinishOfDisposalAsync(dbNode);
+
+                var re = store.GetRequestExecutor(store.Database);
+                await AssertWaitForTrueAsync(() =>
+                {
+                    return Task.FromResult(re.TopologyNodes != null &&
+                                           re.TopologyNodes.Count == 3);
+                });
+
+                //wait for it to enter rehab
+                await AssertWaitForValueAsync(async () =>
+                {
+                    var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
+                    if (record.Topology.Rehabs.Contains(dbNode.ServerStore.NodeTag))
+                        return true;
+
+                    return false;
+                }, true);
+                
+                var error = await Assert.ThrowsAnyAsync<RavenException>(async () => await store.Maintenance.SendAsync(new GetStatisticsOperation("test", dbNode.ServerStore.NodeTag)));
+                Assert.True(error.Message.Contains("No connection could be made because the target machine actively refused it") ||
+                            error.Message.Contains("Connection refused"));
             }
         }
 
@@ -834,7 +954,7 @@ namespace RachisTests
             var server2Url = server2.ServerStore.GetNodeHttpServerUrl();
             Servers.Add(server2);
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leader.WebUrl, null, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.WebUrl, null, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
             {
                 await requestExecutor.ExecuteAsync(new AddClusterNodeCommand(server2Url, watcher: true), ctx);
@@ -877,6 +997,34 @@ namespace RachisTests
 
             var topology = cluster.Leader.ServerStore.GetClusterTopology();
             Assert.Equal(3, topology.AllNodes.Count);
+        }
+
+        [RavenFact(RavenTestCategory.Cluster)]
+        public async Task UseProperCommandVersionWhenSingleMember()
+        {
+            var (_, raft1) = await CreateRaftCluster(1, shouldRunInMemory: false);
+
+            await raft1.ServerStore.AddNodeToClusterAsync("http://foo.bar", "B", validateNotInTopology: false);
+            await raft1.ServerStore.AddNodeToClusterAsync("http://foo.baz", "C", validateNotInTopology: false);
+
+            var result = await DisposeServerAndWaitForFinishOfDisposalAsync(raft1);
+
+            raft1 = Servers[0] = GetNewServer(new ServerCreationOptions
+            {
+                CustomSettings = new Dictionary<string, string>
+                {
+                    { RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), result.Url }, 
+                    { RavenConfiguration.GetKey(x => x.Core.ServerUrls), result.Url }
+                },
+                RunInMemory = false,
+                DeletePrevious = false,
+                DataDirectory = result.DataDirectory
+            });
+
+            using (var store = GetDocumentStore(new Options { Server = raft1, }))
+            {
+
+            }
         }
 
         private static async Task WaitForAssertionAsync(Func<Task> action, int timeoutInMs = 15_000)

@@ -36,7 +36,7 @@ using Voron.Impl;
 
 namespace Raven.Server.Documents
 {
-    public unsafe class DocumentsStorage : IDisposable
+    public unsafe partial class DocumentsStorage : IDisposable
     {
         private static readonly Slice DocsSlice;
         public static readonly Slice CollectionEtagsSlice;
@@ -46,6 +46,7 @@ namespace Raven.Server.Documents
         private static readonly Slice LastReplicatedEtagsSlice;
         private static readonly Slice EtagsSlice;
         private static readonly Slice LastEtagSlice;
+        private static readonly Slice LastCompletedClusterTransactionIndexSlice;
         private static readonly Slice GlobalTreeSlice;
         private static readonly Slice GlobalChangeVectorSlice;
         private static readonly Slice GlobalFullChangeVectorSlice;
@@ -116,6 +117,7 @@ namespace Raven.Server.Documents
                 Slice.From(ctx, CollectionName.GetTablePrefix(CollectionTableType.Tombstones), ByteStringType.Immutable, out TombstonesPrefix);
                 Slice.From(ctx, "DeletedEtags", ByteStringType.Immutable, out DeletedEtagsSlice);
                 Slice.From(ctx, "LastReplicatedEtags", ByteStringType.Immutable, out LastReplicatedEtagsSlice);
+                Slice.From(ctx, "LastCompletedClusterTransactionIndex", ByteStringType.Immutable, out LastCompletedClusterTransactionIndexSlice);
                 Slice.From(ctx, "GlobalTree", ByteStringType.Immutable, out GlobalTreeSlice);
                 Slice.From(ctx, "GlobalChangeVector", ByteStringType.Immutable, out GlobalChangeVectorSlice);
                 Slice.From(ctx, "GlobalFullChangeVector", ByteStringType.Immutable, out GlobalFullChangeVectorSlice);
@@ -424,20 +426,6 @@ namespace Raven.Server.Documents
             _documentsMetadataCache = obj.ImmutableExternalState as DocumentTransactionCache;
         }
 
-        public void AssertFixedSizeTrees(Transaction tx)
-        {
-            // here we validate the table fixed size indexes
-            tx.OpenTable(DocsSchema, DocsSlice).AssertValidFixedSizeTrees();
-            tx.OpenTable(DocsSchema, LastReplicatedEtagsSlice).AssertValidFixedSizeTrees();
-            tx.OpenTable(DocsSchema, GlobalTreeSlice).AssertValidFixedSizeTrees();
-        }
-
-        private static void AssertTransaction(DocumentsOperationContext context)
-        {
-            if (context.Transaction == null) //precaution
-                throw new InvalidOperationException("No active transaction found in the context, and at least read transaction is needed");
-        }
-
         public static string GetDatabaseChangeVector(DocumentsOperationContext context)
         {
             return GetDatabaseChangeVector(context.Transaction.InnerTransaction);
@@ -738,6 +726,30 @@ namespace Raven.Server.Documents
 
             return lastEtag;
         }
+        public static long ReadLastCompletedClusterTransactionIndex(Transaction tx)
+        {
+            if (tx == null)
+                throw new InvalidOperationException("No active transaction found in the context, and at least read transaction is needed");
+            var tree = tx.ReadTree(GlobalTreeSlice);
+            if (tree == null)
+            {
+                return 0;
+            }
+            var readResult = tree.Read(LastCompletedClusterTransactionIndexSlice);
+            if (readResult == null)
+            {
+                return 0;
+            }
+
+            return readResult.Reader.ReadLittleEndianInt64();
+        }
+
+        public void SetLastCompletedClusterTransactionIndex(DocumentsOperationContext context, long index)
+        {
+            var tree = context.Transaction.InnerTransaction.CreateTree(GlobalTreeSlice);
+            using (Slice.External(context.Allocator, (byte*)&index, sizeof(long), out Slice indexSlice))
+                tree.Add(LastCompletedClusterTransactionIndexSlice, indexSlice);
+        }
 
         public IEnumerable<Document> GetDocumentsStartingWith(DocumentsOperationContext context, string idPrefix, string startAfterId,
             long start, long take, string collection, Reference<long> skippedResults, DocumentFields fields = DocumentFields.All, CancellationToken token = default)
@@ -900,7 +912,7 @@ namespace Raven.Server.Documents
             if (collectionName == null)
                 yield break;
 
-            var table = context.Transaction.InnerTransaction.OpenTable(DocsSchema,
+            var table = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
                 collectionName.GetTableName(CollectionTableType.Documents));
 
             if (table == null)
@@ -915,7 +927,7 @@ namespace Raven.Server.Documents
             }
         }
 
-        private TestingStuff _forTestingPurposes;
+        internal TestingStuff _forTestingPurposes;
 
         internal TestingStuff ForTestingPurposesOnly()
         {
@@ -927,12 +939,23 @@ namespace Raven.Server.Documents
 
         internal class TestingStuff
         {
+            internal TestingStuff()
+            {
+            }
+
             public ManualResetEventSlim DelayDocumentLoad;
+            public Action<string> OnBeforeOpenTableWhenPutDocumentWithSpecificId { get; set; }
+            public bool? IsDocumentCompressed(DocumentsOperationContext context, Slice lowerDocumentId, out bool? isLargeValue)
+            {
+                var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
+                return table.ForTestingPurposesOnly().IsTableValueCompressed(lowerDocumentId, out isLargeValue);
+            }
         }
 
-        public IEnumerable<Document> GetDocumentsFrom(DocumentsOperationContext context, long etag, long start, long take, DocumentFields fields = DocumentFields.All)
+        public IEnumerable<Document> GetDocumentsFrom(DocumentsOperationContext context, long etag, long start, long take, DocumentFields fields = DocumentFields.All, EventHandler<InvalidOperationException> onCorruptedDataHandler = null)
         {
-            var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
+            var table = new Table(DocsSchema, context.Transaction.InnerTransaction, onCorruptedDataHandler);
+
             // ReSharper disable once LoopCanBeConvertedToQuery
             foreach (var result in table.SeekForwardFrom(DocsSchema.FixedSizeIndexes[AllDocsEtagsSlice], etag, start))
             {
@@ -945,18 +968,18 @@ namespace Raven.Server.Documents
             }
         }
 
-        public IEnumerable<DocumentReplicationItem> GetDocumentsFrom(DocumentsOperationContext context, long etag)
+        public IEnumerable<DocumentReplicationItem> GetDocumentsFrom(DocumentsOperationContext context, long etag, DocumentFields fields = DocumentFields.All)
         {
             var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
 
             // ReSharper disable once LoopCanBeConvertedToQuery
             foreach (var result in table.SeekForwardFrom(DocsSchema.FixedSizeIndexes[AllDocsEtagsSlice], etag, 0))
             {
-                yield return DocumentReplicationItem.From(TableValueToDocument(context, ref result.Reader));
+                yield return DocumentReplicationItem.From(TableValueToDocument(context, ref result.Reader, fields), context);
             }
         }
 
-        public IEnumerable<Document> GetDocuments(DocumentsOperationContext context, IEnumerable<Slice> ids, long start, long take, Reference<int> totalCount)
+        public IEnumerable<Document>  GetDocuments(DocumentsOperationContext context, IEnumerable<Slice> ids, long start, long take)
         {
             var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
 
@@ -965,9 +988,7 @@ namespace Raven.Server.Documents
                 // id must be lowercased
                 if (table.ReadByKey(id, out TableValueReader reader) == false)
                     continue;
-
-                totalCount.Value++;
-
+                
                 if (start > 0)
                 {
                     start--;
@@ -981,7 +1002,7 @@ namespace Raven.Server.Documents
             }
         }
 
-        public IEnumerable<Document> GetDocuments(DocumentsOperationContext context, IEnumerable<string> ids, long start, long take, Reference<int> totalCount)
+        public IEnumerable<Document> GetDocuments(DocumentsOperationContext context, IEnumerable<string> ids, long start, long take)
         {
             var listOfIds = new List<Slice>();
             foreach (var id in ids)
@@ -990,13 +1011,13 @@ namespace Raven.Server.Documents
                 listOfIds.Add(slice);
             }
 
-            return GetDocuments(context, listOfIds, start, take, totalCount);
+            return GetDocuments(context, listOfIds, start, take);
         }
 
-        public IEnumerable<Document> GetDocumentsForCollection(DocumentsOperationContext context, IEnumerable<Slice> ids, string collection, long start, long take, Reference<int> totalCount)
+        public IEnumerable<Document> GetDocumentsForCollection(DocumentsOperationContext context, IEnumerable<Slice> ids, string collection, long start, long take)
         {
             // we'll fetch all documents and do the filtering here since we must check the collection name
-            foreach (var doc in GetDocuments(context, ids, start, int.MaxValue, totalCount))
+            foreach (var doc in GetDocuments(context, ids, start, int.MaxValue))
             {
                 if (collection == Constants.Documents.Collections.AllDocumentsCollection)
                 {
@@ -1006,17 +1027,14 @@ namespace Raven.Server.Documents
 
                 if (doc.TryGetMetadata(out var metadata) == false)
                 {
-                    totalCount.Value--;
                     continue;
                 }
                 if (metadata.TryGet(Constants.Documents.Metadata.Collection, out string c) == false)
                 {
-                    totalCount.Value--;
                     continue;
                 }
                 if (string.Equals(c, collection, StringComparison.OrdinalIgnoreCase) == false)
                 {
-                    totalCount.Value--;
                     continue;
                 }
 
@@ -1033,7 +1051,7 @@ namespace Raven.Server.Documents
             if (collectionName == null)
                 yield break;
 
-            var table = context.Transaction.InnerTransaction.OpenTable(DocsSchema,
+            var table = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
                 collectionName.GetTableName(CollectionTableType.Documents));
 
             if (table == null)
@@ -1195,7 +1213,7 @@ namespace Raven.Server.Documents
             }
         }
 
-        public (int ActualSize, int AllocatedSize)? GetDocumentMetrics(DocumentsOperationContext context, string id)
+        public (int ActualSize, int AllocatedSize, bool IsCompressed)? GetDocumentMetrics(DocumentsOperationContext context, string id)
         {
             using (DocumentIdWorker.GetSliceFromId(context, id, out Slice lowerId))
             {
@@ -1205,9 +1223,10 @@ namespace Raven.Server.Documents
                 {
                     return null;
                 }
-                var allocated = table.GetAllocatedSize(tvr.Id);
 
-                return (tvr.Size, allocated);
+                var info = table.GetInfoFor(tvr.Id);
+
+                return (tvr.Size, info.AllocatedSize, info.IsCompressed);
             }
         }
 
@@ -1323,6 +1342,40 @@ namespace Raven.Server.Documents
             }
         }
 
+        private Table GetTombstoneTableForCollection(DocumentsOperationContext context, string collection)
+        {
+            string tableName;
+
+            if (collection == AttachmentsStorage.AttachmentsTombstones ||
+                collection == RevisionsStorage.RevisionsTombstones)
+            {
+                tableName = collection;
+            }
+            else
+            {
+                var collectionName = GetCollection(collection, throwIfDoesNotExist: false);
+                if (collectionName == null)
+                    return null;
+
+                tableName = collectionName.GetTableName(CollectionTableType.Tombstones);
+            }
+
+            var table = context.Transaction.InnerTransaction.OpenTable(TombstonesSchema, tableName);
+            return table;
+        }
+
+        public long TombstonesCountForCollection(DocumentsOperationContext context, string collection)
+        {
+            var table = GetTombstoneTableForCollection(context, collection);
+            return table?.NumberOfEntries ?? 0;
+        }
+
+        public long TombstonesSizeForCollectionInBytes(DocumentsOperationContext context, string collection)
+        {
+            var table = GetTombstoneTableForCollection(context, collection);
+            return table?.GetReport(includeDetails: false).AllocatedSpaceInBytes ?? 0;
+        }
+
         public IEnumerable<Tombstone> GetTombstonesFrom(
             DocumentsOperationContext context,
             string collection,
@@ -1404,11 +1457,10 @@ namespace Raven.Server.Documents
             return ReadLastDocument(transaction, collectionName, CollectionTableType.Documents, ref result);
         }
 
-        private static bool ReadLastDocument(Transaction transaction, CollectionName collectionName, CollectionTableType collectionType, ref Table.TableValueHolder result)
+        private bool ReadLastDocument(Transaction transaction, CollectionName collectionName, CollectionTableType collectionType, ref Table.TableValueHolder result)
         {
-            var table = transaction.OpenTable(DocsSchema,
-                collectionName.GetTableName(collectionType)
-            );
+            var table = transaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
+                collectionName.GetTableName(collectionType));
 
             // ReSharper disable once UseNullPropagation
             if (table == null)
@@ -1580,19 +1632,20 @@ namespace Raven.Server.Documents
                 DeletedEtag = TableValueToEtag((int)TombstoneTable.DeletedEtag, ref tvr),
                 Type = *(Tombstone.TombstoneType*)tvr.Read((int)TombstoneTable.Type, out int _),
                 TransactionMarker = *(short*)tvr.Read((int)TombstoneTable.TransactionMarker, out int _),
-                ChangeVector = TableValueToChangeVector(context, (int)TombstoneTable.ChangeVector, ref tvr)
+                ChangeVector = TableValueToChangeVector(context, (int)TombstoneTable.ChangeVector, ref tvr),
+                LastModified = TableValueToDateTime((int)TombstoneTable.LastModified, ref tvr)
             };
 
-            if (result.Type == Tombstone.TombstoneType.Document)
+            switch (result.Type)
             {
-                result.Collection = TableValueToId(context, (int)TombstoneTable.Collection, ref tvr);
-                result.Flags = TableValueToFlags((int)TombstoneTable.Flags, ref tvr);
-                result.LastModified = TableValueToDateTime((int)TombstoneTable.LastModified, ref tvr);
-                result.LowerId = UnwrapLowerIdIfNeeded(context, result.LowerId);
-            }
-            else if (result.Type == Tombstone.TombstoneType.Revision)
-            {
-                result.Collection = TableValueToId(context, (int)TombstoneTable.Collection, ref tvr);
+                case Tombstone.TombstoneType.Document:
+                    result.Collection = TableValueToId(context, (int)TombstoneTable.Collection, ref tvr);
+                    result.Flags = TableValueToFlags((int)TombstoneTable.Flags, ref tvr);
+                    result.LowerId = UnwrapLowerIdIfNeeded(context, result.LowerId);
+                    break;
+                case Tombstone.TombstoneType.Revision:
+                    result.Collection = TableValueToId(context, (int)TombstoneTable.Collection, ref tvr);
+                    break;
             }
 
             return result;
@@ -1620,6 +1673,8 @@ namespace Raven.Server.Documents
             CollectionName collectionName = null, NonPersistentDocumentFlags nonPersistentFlags = NonPersistentDocumentFlags.None,
             DocumentFlags documentFlags = DocumentFlags.None)
         {
+            var fromReplication = nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication);
+
             if (ConflictsStorage.ConflictsCount != 0)
             {
                 var result = ConflictsStorage.DeleteConflicts(context, lowerId, expectedChangeVector, changeVector);
@@ -1663,7 +1718,7 @@ namespace Raven.Server.Documents
                     flags = localFlags | documentFlags;
                     var revisionsStorage = DocumentDatabase.DocumentsStorage.RevisionsStorage;
 
-                    if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) &&
+                    if (fromReplication &&
                         localFlags.Contain(DocumentFlags.HasRevisions) != documentFlags.Contain(DocumentFlags.HasRevisions))
                     {
                         var count = revisionsStorage.GetRevisionsCount(context, id);
@@ -1673,7 +1728,7 @@ namespace Raven.Server.Documents
                     if (collectionName.IsHiLo == false &&
                         (flags & DocumentFlags.Artificial) != DocumentFlags.Artificial)
                     {
-                        if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false &&
+                        if (fromReplication == false &&
                             (revisionsStorage.Configuration != null || flags.Contain(DocumentFlags.Resolved)))
                         {
                             revisionsStorage.Delete(context, id, lowerId, collectionName, changeVector ?? local.Tombstone.ChangeVector,
@@ -1731,7 +1786,8 @@ namespace Raven.Server.Documents
                 }
 
                 collectionName = ExtractCollectionName(context, doc.Data);
-                var table = context.Transaction.InnerTransaction.OpenTable(DocsSchema, collectionName.GetTableName(CollectionTableType.Documents));
+                var table = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
+                    collectionName.GetTableName(CollectionTableType.Documents));
 
                 var ptr = table.DirectRead(doc.StorageId, out int size);
                 var tvr = new TableValueReader(ptr, size);
@@ -1756,51 +1812,57 @@ namespace Raven.Server.Documents
 
                 EnsureLastEtagIsPersisted(context, etag);
 
-                var revisionsStorage = DocumentDatabase.DocumentsStorage.RevisionsStorage;
-
-                if (collectionName.IsHiLo == false &&
-                    ((flags & DocumentFlags.Artificial) != DocumentFlags.Artificial) &&
-                    (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false))
+                if (fromReplication == false)
                 {
-                    var shouldVersion = DocumentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionDocument(
-                        collectionName, nonPersistentFlags, local.Document.Data, null, context, id, lastModifiedTicks, ref flags, out var configuration);
+                    var revisionsStorage = DocumentDatabase.DocumentsStorage.RevisionsStorage;
 
-                    if (shouldVersion)
+                    if (collectionName.IsHiLo == false && flags.Contain(DocumentFlags.Artificial) == false)
                     {
-                        if (DocumentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionOldDocument(context, flags, local.Document.Data, local.Document.ChangeVector, collectionName))
+                        var shouldVersion = DocumentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionDocument(
+                            collectionName, nonPersistentFlags, local.Document.Data, null, context, id, lastModifiedTicks, ref flags, out var configuration);
+
+                        if (shouldVersion || flags.Contain(DocumentFlags.HasRevisions))
                         {
-                            DocumentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, local.Document.Data, flags | DocumentFlags.HasRevisions | DocumentFlags.FromOldDocumentRevision, NonPersistentDocumentFlags.None,
-                                local.Document.ChangeVector, local.Document.LastModified.Ticks, configuration, collectionName);
+
+                            if (DocumentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionOldDocument(context, flags, local.Document.Data,
+                                    local.Document.ChangeVector, collectionName))
+                            {
+                                DocumentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, local.Document.Data,
+                                    flags | DocumentFlags.FromOldDocumentRevision, NonPersistentDocumentFlags.None,
+                                    local.Document.ChangeVector, local.Document.LastModified.Ticks, configuration, collectionName);
+                            }
+
+                            revisionsStorage.Delete(context, id, lowerId, collectionName, changeVector ?? local.Tombstone.ChangeVector,
+                                modifiedTicks, nonPersistentFlags, documentFlags == DocumentFlags.Reverted ? documentFlags : flags);
+                        }
+                    }
+
+                    if (flags.Contain(DocumentFlags.HasRevisions))
+                    {
+                        if (revisionsStorage.Configuration == null &&
+                            flags.Contain(DocumentFlags.Resolved) == false)
+                        {
+                            revisionsStorage.DeleteRevisionsFor(context, id, fromDelete: true);
                         }
 
-                        flags |= DocumentFlags.HasRevisions;
-                        revisionsStorage.Delete(context, id, lowerId, collectionName, changeVector ?? local.Tombstone.ChangeVector,
-                            modifiedTicks, nonPersistentFlags, documentFlags);
+                        if (revisionsStorage.Configuration != null)
+                        {
+                            revisionsStorage.Delete(context, id, lowerId, collectionName, changeVector ?? local.Tombstone.ChangeVector,
+                                modifiedTicks, nonPersistentFlags, documentFlags);
+                        }
                     }
+
+                    if (flags.Contain(DocumentFlags.HasAttachments))
+                        AttachmentsStorage.DeleteAttachmentsOfDocument(context, lowerId, changeVector, modifiedTicks);
+
+                    if (flags.Contain(DocumentFlags.HasCounters))
+                        CountersStorage.DeleteCountersForDocument(context, id, collectionName);
+
+                    if (flags.Contain(DocumentFlags.HasTimeSeries))
+                        TimeSeriesStorage.DeleteAllTimeSeriesForDocument(context, id, collectionName);
                 }
 
-                if (flags.Contain(DocumentFlags.HasRevisions) &&
-                    revisionsStorage.Configuration == null &&
-                    flags.Contain(DocumentFlags.Resolved) == false &&
-                    nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
-                    revisionsStorage.DeleteRevisionsFor(context, id);
-
-                if (flags.Contain(DocumentFlags.HasRevisions) &&
-                    revisionsStorage.Configuration != null &&
-                    nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication))
-                    revisionsStorage.Delete(context, id, lowerId, collectionName, changeVector ?? local.Tombstone.ChangeVector,
-                        modifiedTicks, nonPersistentFlags, documentFlags);
-
                 table.Delete(doc.StorageId);
-
-                if (flags.Contain(DocumentFlags.HasAttachments))
-                    AttachmentsStorage.DeleteAttachmentsOfDocument(context, lowerId, changeVector, modifiedTicks);
-
-                if (flags.Contain(DocumentFlags.HasCounters))
-                    CountersStorage.DeleteCountersForDocument(context, id, collectionName);
-
-                if (flags.Contain(DocumentFlags.HasTimeSeries))
-                    TimeSeriesStorage.DeleteAllTimeSeriesForDocument(context, id, collectionName);
 
                 context.Transaction.AddAfterCommitNotification(new DocumentChange
                 {
@@ -1842,6 +1904,15 @@ namespace Raven.Server.Documents
                     changeVector,
                     documentFlags,
                     nonPersistentFlags).Etag;
+
+                // We've to add notification since we're updating last tombstone etag, and we can end up in situation when our indexes will be stale due unprocessed tombstones after replication.
+                context.Transaction.AddAfterCommitNotification(new DocumentChange
+                {
+                    Type = DocumentChangeTypes.Delete,
+                    Id = id,
+                    ChangeVector = changeVector,
+                    CollectionName = collectionName.Name,
+                });
 
                 return new DeleteOperationResult
                 {
@@ -2061,7 +2132,7 @@ namespace Raven.Server.Documents
                     {
                         if (flags.Contain(DocumentFlags.FromClusterTransaction) == false)
                         {
-                            Debug.Assert(false, $"flags must set FromClusterTransaction for the change vector: {changeVector}");
+                            Debug.Assert(false, $"flags: '{flags}' must set FromClusterTransaction for the change vector: {changeVector}");
                         }
                     }
                     break;
@@ -2154,7 +2225,7 @@ namespace Raven.Server.Documents
             //make sure that the relevant collection tree exists
             Table table = isTombstone ?
                 tx.OpenTable(TombstonesSchema, collectionName) :
-                tx.OpenTable(DocsSchema, collectionName);
+                tx.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionObject), collectionName);
 
             table.Delete(storageId);
         }
@@ -2199,10 +2270,11 @@ namespace Raven.Server.Documents
             }
             else
             {
-                table = context.Transaction.InnerTransaction.OpenTable(DocsSchema,
+                table = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
                     collectionName.GetTableName(CollectionTableType.Documents));
                 indexDef = DocsSchema.FixedSizeIndexes[CollectionEtagsSlice];
             }
+
             if (table == null)
             {
                 totalCount = 0;
@@ -2236,7 +2308,8 @@ namespace Raven.Server.Documents
         {
             foreach (var kvp in _collectionsCache)
             {
-                var collectionTable = context.Transaction.InnerTransaction.OpenTable(DocsSchema, kvp.Value.GetTableName(CollectionTableType.Documents));
+                var collectionTable = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(kvp.Value),
+                    kvp.Value.GetTableName(CollectionTableType.Documents));
                 //This is the case where a read transaction reading a collection cached by a later write transaction we can safly ignore it.
                 if (collectionTable == null)
                 {
@@ -2311,7 +2384,7 @@ namespace Raven.Server.Documents
                 };
             }
 
-            var collectionTable = context.Transaction.InnerTransaction.OpenTable(DocsSchema,
+            var collectionTable = context.Transaction.InnerTransaction.OpenTable(DocumentDatabase.GetDocsSchemaForCollection(collectionName),
                 collectionName.GetTableName(CollectionTableType.Documents));
 
             if (collectionTable == null)
@@ -2575,6 +2648,14 @@ namespace Raven.Server.Documents
             }
 
             return result;
+        }
+
+        public bool Exists(DocumentsOperationContext context, string id)
+        {
+            using (DocumentIdWorker.GetSliceFromId(context, id, out Slice lowerDocumentId))
+            {
+                return GetTableValueReaderForDocument(context, lowerDocumentId, throwOnConflict: false, tvr: out _);
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

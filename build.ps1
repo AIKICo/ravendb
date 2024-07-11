@@ -13,9 +13,18 @@ param(
     [switch]$JustNuget,
     [switch]$Debug,
     [switch]$NoBundling,
-    [switch]$DryRunVersionBump = $false,
     [switch]$DryRunSign = $false,
+    [string]$BuildOptions = "",
+    [string]$ArtifactNameSuffix = "",
     [switch]$Help)
+
+if ([string]::IsNullOrEmpty($BuildOptions) -eq $False) {
+  $env:RAVEN_BuildOptions = $BuildOptions
+}
+
+if ([string]::IsNullOrEmpty($ArtifactNameSuffix) -eq $False) {
+  $env:RAVEN_ArtifactNameSuffix = $ArtifactNameSuffix
+}
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -33,6 +42,7 @@ $ErrorActionPreference = "Stop"
 . '.\scripts\validateAssembly.ps1'
 . '.\scripts\validateRuntimeConfig.ps1'
 . '.\scripts\version.ps1'
+. '.\scripts\githubReleases.ps1'
 . '.\scripts\updateSourceWithBuildInfo.ps1'
 . '.\scripts\nuget.ps1'
 . '.\scripts\target.ps1'
@@ -257,8 +267,3 @@ Foreach ($target in $targets) {
 }
 
 write-host "Done creating packages."
-
-if ($buildType -eq 'stable') {
-    BumpVersion $PROJECT_DIR $versionObj.VersionPrefix $versionObj.BuildType $DryRunVersionBump
-}
-

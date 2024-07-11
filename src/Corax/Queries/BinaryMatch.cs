@@ -1,8 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Sparrow.Server;
 
 namespace Corax.Queries
@@ -52,6 +50,7 @@ namespace Corax.Queries
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public int Fill(Span<long> buffer)
         {
+            
             return _fillFunc(ref this, buffer);
         }
 
@@ -62,9 +61,10 @@ namespace Corax.Queries
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Score(Span<long> matches, Span<float> scores)
+        public void Score(Span<long> matches, Span<float> scores, float boostFactor)
         {
-            // Nothing to do if there is no boosting happening at this level. 
+            // Nothing to do if there is no boosting happening at this level.
+            // Remember: When you're sorting by score and primitives can be boosted, those should be true!
             bool innerBoosting = _inner.IsBoosting;
             bool outerBoosting = _outer.IsBoosting;
             if (innerBoosting == false && outerBoosting == false)
@@ -75,20 +75,8 @@ namespace Corax.Queries
             // If there are two chains we need to combine them.
             if (innerBoosting == true && outerBoosting == true)
             {
-                _inner.Score(matches, scores);
-
-                using var _ =  _ctx.Allocate(sizeof(float) * scores.Length, out var bufferHolder);
-                var outerScores = MemoryMarshal.Cast<byte, float>(bufferHolder.ToSpan())[..scores.Length];
-
-                outerScores.Fill(1); // We will fill the scores with 1.0
-
-                // We get the score for the outer chain.
-                _outer.Score(matches, outerScores);
-
-                // We multiply the scores from the outer chain with the current scores and return.
-                for(int i = 0; i < scores.Length; i++)
-                    scores[i] *= outerScores[i];
-
+                _inner.Score(matches, scores, boostFactor);
+                _outer.Score(matches, scores, boostFactor);
                 return;
             }
 
@@ -98,7 +86,7 @@ namespace Corax.Queries
             {
                 // Inner can still be not boosting. In this case it is, so we delegate
                 // the call into the boosting layer that provides us the information.
-                _inner.Score(matches, scores);
+                _inner.Score(matches, scores, boostFactor);
                 return;
             }
 
@@ -106,7 +94,7 @@ namespace Corax.Queries
             {
                 // Outer can still be not boosting. In this case it is, so we delegate
                 // the call into the boosting layer that provides us the information.
-                _outer.Score(matches, scores);
+                _outer.Score(matches, scores, boostFactor);
             }
         }
 

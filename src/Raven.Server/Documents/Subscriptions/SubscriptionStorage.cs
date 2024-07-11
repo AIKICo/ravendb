@@ -27,6 +27,8 @@ using Sparrow.Binary;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
+using Sparrow.Server;
+using Sparrow.Server.Utils;
 using Voron;
 
 namespace Raven.Server.Documents.Subscriptions
@@ -50,7 +52,7 @@ namespace Raven.Server.Documents.Subscriptions
             _db = db;
             _serverStore = serverStore;
             _logger = LoggingSource.Instance.GetLogger<SubscriptionStorage>(db.Name);
-
+            WaitForClusterStabilizationTimeout = TimeSpan.FromMilliseconds(Math.Max(30000, (int)(2 * serverStore.Engine.OperationTimeout.TotalMilliseconds)));
             _concurrentConnectionsSemiSemaphore = new SemaphoreSlim(db.Configuration.Subscriptions.MaxNumberOfConcurrentConnections);
             LowMemoryNotification.Instance.RegisterLowMemoryHandler(this);
         }
@@ -100,10 +102,10 @@ namespace Raven.Server.Documents.Subscriptions
             return etag;
         }
 
-        public SubscriptionConnectionsState OpenSubscription(SubscriptionConnection connection)
+        public async Task<SubscriptionConnectionsState> OpenSubscriptionAsync(SubscriptionConnection connection)
         {
             var subscriptionState = _subscriptions.GetOrAdd(connection.SubscriptionId, subId => new SubscriptionConnectionsState(subId, this));
-            subscriptionState.Initialize(connection);
+            await subscriptionState.InitializeAsync(connection);
             return subscriptionState;
         }
 
@@ -202,7 +204,7 @@ namespace Raven.Server.Documents.Subscriptions
         {
             var subscription = GetSubscriptionFromServerStore(serverContext, name);
             var topology = _serverStore.Cluster.ReadDatabaseTopology(serverContext, _db.Name);
-            return _db.WhoseTaskIsIt(topology, subscription, subscription);
+            return OngoingTasksUtils.WhoseTaskIsIt(_serverStore, topology, subscription, subscription, _db.NotificationCenter);
         }
 
         public async Task<SubscriptionState> AssertSubscriptionConnectionDetails(long id, string name, long? registerConnectionDurationInTicks, CancellationToken token)
@@ -216,7 +218,7 @@ namespace Raven.Server.Documents.Subscriptions
                 var subscription = GetSubscriptionFromServerStore(serverStoreContext, name);
                 var topology = record.Topology;
 
-                var whoseTaskIsIt = _db.WhoseTaskIsIt(topology, subscription, subscription);
+                var whoseTaskIsIt = OngoingTasksUtils.WhoseTaskIsIt(_serverStore, topology, subscription, subscription, _db.NotificationCenter);
                 if (whoseTaskIsIt == null && record.DeletionInProgress.ContainsKey(_serverStore.NodeTag))
                     throw new DatabaseDoesNotExistException($"Stopping subscription '{name}' on node {_serverStore.NodeTag}, because database '{_db.Name}' is being deleted.");
 
@@ -270,13 +272,13 @@ namespace Raven.Server.Documents.Subscriptions
                         RegisterConnectionDurationInTicks = registerConnectionDurationInTicks
                     };
                 }
-                if (subscription.Disabled)
+                if (subscription.Disabled || _db.DisableOngoingTasks)
                     throw new SubscriptionClosedException($"The subscription with id '{id}' and name '{name}' is disabled and cannot be used until enabled");
 
                 return subscription;
             }
 
-            static void FillNodesAvailabilityReportForState(SubscriptionGeneralDataAndStats subscription, DatabaseTopology topology, Dictionary<string, string> databaseTopologyAvailabilityExplenation, List<string> stateGroup, string stateName)
+            static void FillNodesAvailabilityReportForState(SubscriptionState subscription, DatabaseTopology topology, Dictionary<string, string> databaseTopologyAvailabilityExplenation, List<string> stateGroup, string stateName)
             {
                 foreach (var nodeInGroup in stateGroup)
                 {
@@ -378,21 +380,15 @@ namespace Raven.Server.Documents.Subscriptions
                 if (take-- <= 0)
                     yield break;
 
-                var subscriptionState = JsonDeserializationClient.SubscriptionState(keyValue.Value);
-                var subscriptionConnectionsState = GetSubscriptionConnectionsState(serverStoreContext, subscriptionState.SubscriptionName);
+                var task = JsonDeserializationClient.SubscriptionState(keyValue.Value);
+                var subscriptionGeneralData = new SubscriptionGeneralDataAndStats(task);
 
-                var subscriptionGeneralData = new SubscriptionGeneralDataAndStats(subscriptionState)
-                {
-                    Connections = subscriptionConnectionsState?.GetConnections(),
-                    RecentConnections = subscriptionConnectionsState?.RecentConnections,
-                    RecentRejectedConnections = subscriptionConnectionsState?.RecentRejectedConnections
-                };
                 GetSubscriptionInternal(subscriptionGeneralData, history);
                 yield return subscriptionGeneralData;
             }
         }
 
-        public string GetSubscriptionNameById(TransactionOperationContext serverStoreContext, long id)
+        public string GetSubscriptionNameById<T>(TransactionOperationContext<T> serverStoreContext, long id) where T : RavenTransaction
         {
             foreach (var keyValue in ClusterStateMachine.ReadValuesStartingWith(serverStoreContext,
                 SubscriptionState.SubscriptionPrefix(_db.Name)))
@@ -417,6 +413,7 @@ namespace Raven.Server.Documents.Subscriptions
             public long Batch;
             public string ChangeVector;
             public SubscriptionType Type;
+            public long SubscriptionId;
 
             public DynamicJsonValue ToJson()
             {
@@ -430,22 +427,42 @@ namespace Raven.Server.Documents.Subscriptions
             }
         }
 
-        public static IEnumerable<ResendItem> GetResendItems(ClusterOperationContext context, string database, long id)
+        public static IEnumerable<ResendItem> GetResendItemsForSubscriptionId(ClusterOperationContext context, string database, long id)
         {
             var subscriptionState = context.Transaction.InnerTransaction.OpenTable(ClusterStateMachine.SubscriptionStateSchema, ClusterStateMachine.SubscriptionState);
             using (SubscriptionConnectionsState.GetDatabaseAndSubscriptionPrefix(context, database, id, out var prefix))
             using (Slice.External(context.Allocator, prefix, out var prefixSlice))
             {
-                var resendItem = new ResendItem();
-
                 foreach (var item in subscriptionState.SeekByPrimaryKeyPrefix(prefixSlice, Slices.Empty, 0))
                 {
-                    resendItem.Type = (SubscriptionType)item.Key[prefixSlice.Size];
-                    resendItem.Id = item.Value.Reader.ReadStringWithPrefix((int)ClusterStateMachine.SubscriptionStateTable.Key, prefix.Length + 2);
-                    resendItem.ChangeVector = item.Value.Reader.ReadString((int)ClusterStateMachine.SubscriptionStateTable.ChangeVector);
-                    resendItem.Batch = Bits.SwapBytes(item.Value.Reader.ReadLong((int)ClusterStateMachine.SubscriptionStateTable.BatchId));
+                    yield return new ResendItem
+                    {
+                        Type = (SubscriptionType)item.Key[prefixSlice.Size],
+                        Id = item.Value.Reader.ReadStringWithPrefix((int)ClusterStateMachine.SubscriptionStateTable.Key, prefix.Length + 2),
+                        ChangeVector = item.Value.Reader.ReadString((int)ClusterStateMachine.SubscriptionStateTable.ChangeVector),
+                        Batch = Bits.SwapBytes(item.Value.Reader.ReadLong((int)ClusterStateMachine.SubscriptionStateTable.BatchId)),
+                        SubscriptionId = id
+                    };
+                }
+            }
+        }
 
-                    yield return resendItem;
+        public static IEnumerable<ResendItem> GetResendItemsForDatabase(ClusterOperationContext context, string database)
+        {
+            var subscriptionState = context.Transaction.InnerTransaction.OpenTable(ClusterStateMachine.SubscriptionStateSchema, ClusterStateMachine.SubscriptionState);
+            using var _ = Slice.From(context.Allocator, database.ToLowerInvariant(), SpecialChars.RecordSeparator, ByteStringType.Immutable, out var dbNamePrefix);
+            {
+                foreach (var item in subscriptionState.SeekByPrimaryKeyPrefix(dbNamePrefix, Slices.Empty, 0))
+                {
+                    yield return new ResendItem
+                    {
+                        Type = (SubscriptionType)item.Key[dbNamePrefix.Size + sizeof(long) + sizeof(byte)],
+                        Id = item.Value.Reader.ReadStringWithPrefix((int)ClusterStateMachine.SubscriptionStateTable.Key,
+                            dbNamePrefix.Size + sizeof(long) + sizeof(byte) + sizeof(byte) + sizeof(byte)),
+                        ChangeVector = item.Value.Reader.ReadString((int)ClusterStateMachine.SubscriptionStateTable.ChangeVector),
+                        Batch = Bits.SwapBytes(item.Value.Reader.ReadLong((int)ClusterStateMachine.SubscriptionStateTable.BatchId)),
+                        SubscriptionId = item.Value.Reader.ReadLongWithPrefix((int)ClusterStateMachine.SubscriptionStateTable.Key, dbNamePrefix.Size)
+                    };
                 }
             }
         }
@@ -468,8 +485,8 @@ namespace Raven.Server.Documents.Subscriptions
                 if (take-- <= 0)
                     yield break;
 
-                var subscriptionData = GetSubscriptionFromServerStore(context, subscriptionConnectionsState.SubscriptionName);
-                GetRunningSubscriptionInternal(history, subscriptionData, subscriptionConnectionsState);
+                var state = GetSubscriptionFromServerStore(context, subscriptionConnectionsState.SubscriptionName);
+                var subscriptionData = GetRunningSubscriptionInternal(history, state, subscriptionConnectionsState);
                 yield return subscriptionData;
             }
         }
@@ -490,27 +507,27 @@ namespace Raven.Server.Documents.Subscriptions
 
         public SubscriptionGeneralDataAndStats GetSubscription(TransactionOperationContext context, long? id, string name, bool history)
         {
-            SubscriptionGeneralDataAndStats subscription;
+            SubscriptionState state;
 
             if (string.IsNullOrEmpty(name) == false)
             {
-                subscription = GetSubscriptionFromServerStore(context, name);
+                state = GetSubscriptionFromServerStore(context, name);
             }
             else if (id.HasValue)
             {
-                subscription = GetSubscriptionFromServerStore(context, id.ToString());
+                state = GetSubscriptionFromServerStore(context, id.ToString());
             }
             else
             {
                 throw new ArgumentNullException("Must receive either subscription id or subscription name in order to provide subscription data");
             }
 
-            GetSubscriptionInternal(subscription, history);
+            var subscription = GetSubscriptionInternal(state, history);
 
             return subscription;
         }
 
-        public SubscriptionGeneralDataAndStats GetSubscriptionFromServerStore(TransactionOperationContext context, string name)
+        public SubscriptionState GetSubscriptionFromServerStore(TransactionOperationContext context, string name)
         {
             var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(_db.Name, name));
 
@@ -518,41 +535,34 @@ namespace Raven.Server.Documents.Subscriptions
                 throw new SubscriptionDoesNotExistException($"Subscription with name '{name}' was not found in server store");
 
             var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
-            var subscriptionConnectionsState = GetSubscriptionConnectionsState(context, subscriptionState.SubscriptionName);
 
-            var subscriptionJsonValue = new SubscriptionGeneralDataAndStats(subscriptionState)
-            {
-                Connections = subscriptionConnectionsState?.GetConnections(),
-                RecentConnections = subscriptionConnectionsState?.RecentConnections,
-                RecentRejectedConnections = subscriptionConnectionsState?.RecentRejectedConnections
-            };
-            return subscriptionJsonValue;
+            return subscriptionState;
         }
 
         public SubscriptionGeneralDataAndStats GetRunningSubscription(TransactionOperationContext context, long? id, string name, bool history)
         {
-            SubscriptionGeneralDataAndStats subscription;
+            SubscriptionState state;
             if (string.IsNullOrEmpty(name) == false)
             {
-                subscription = GetSubscriptionFromServerStore(context, name);
+                state = GetSubscriptionFromServerStore(context, name);
             }
             else if (id.HasValue)
             {
                 name = GetSubscriptionNameById(context, id.Value);
-                subscription = GetSubscriptionFromServerStore(context, name);
+                state = GetSubscriptionFromServerStore(context, name);
             }
             else
             {
                 throw new ArgumentNullException("Must receive either subscription id or subscription name in order to provide subscription data");
             }
 
-            if (_subscriptions.TryGetValue(subscription.SubscriptionId, out SubscriptionConnectionsState subscriptionConnectionsState) == false)
+            if (_subscriptions.TryGetValue(state.SubscriptionId, out SubscriptionConnectionsState subscriptionConnectionsState) == false)
                 return null;
 
             if (subscriptionConnectionsState.IsSubscriptionActive() == false)
                 return null;
 
-            GetRunningSubscriptionInternal(history, subscription, subscriptionConnectionsState);
+            var subscription = GetRunningSubscriptionInternal(history, state, subscriptionConnectionsState);
             return subscription;
         }
 
@@ -577,9 +587,15 @@ namespace Raven.Server.Documents.Subscriptions
             if (subscriptionBlittable == null)
                 return null;
 
-            var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
+            if (subscriptionBlittable.TryGet(nameof(SubscriptionState.SubscriptionId), out long id) == false)
+            {
+                if (_logger.IsOperationsEnabled)
+                    _logger.Info($"Could not figure out the Subscription Task ID for subscription named: '{subscriptionName}'.");
 
-            if (_subscriptions.TryGetValue(subscriptionState.SubscriptionId, out SubscriptionConnectionsState concurrentSubscription) == false)
+                return null;
+            }
+
+            if (_subscriptions.TryGetValue(id, out SubscriptionConnectionsState concurrentSubscription) == false)
                 return null;
 
             return concurrentSubscription;
@@ -587,10 +603,10 @@ namespace Raven.Server.Documents.Subscriptions
 
         public class SubscriptionGeneralDataAndStats : SubscriptionState
         {
-            public SubscriptionConnection Connection => Connections?.FirstOrDefault();
             public List<SubscriptionConnection> Connections;
-            public IEnumerable<SubscriptionConnection> RecentConnections;
-            public IEnumerable<SubscriptionConnection> RecentRejectedConnections;
+            public IEnumerable<SubscriptionConnectionInfo> RecentConnections;
+            public IEnumerable<SubscriptionConnectionInfo> RecentRejectedConnections;
+            public IEnumerable<SubscriptionConnectionInfo> CurrentPendingConnections;
 
             public SubscriptionGeneralDataAndStats() { }
 
@@ -605,6 +621,7 @@ namespace Raven.Server.Documents.Subscriptions
                 NodeTag = @base.NodeTag;
                 LastBatchAckTime = @base.LastBatchAckTime;
                 LastClientConnectionTime = @base.LastClientConnectionTime;
+                RaftCommandIndex = @base.RaftCommandIndex;
                 Disabled = @base.Disabled;
             }
         }
@@ -628,27 +645,66 @@ namespace Raven.Server.Documents.Subscriptions
         {
             subscriptionData.RecentConnections = subscriptionConnectionsState.RecentConnections;
             subscriptionData.RecentRejectedConnections = subscriptionConnectionsState.RecentRejectedConnections;
+            subscriptionData.CurrentPendingConnections = subscriptionConnectionsState.PendingConnections;
         }
 
-        private static void GetRunningSubscriptionInternal(bool history, SubscriptionGeneralDataAndStats subscriptionData, SubscriptionConnectionsState subscriptionConnectionsState)
+        private static SubscriptionGeneralDataAndStats GetRunningSubscriptionInternal(bool history, SubscriptionState state, SubscriptionConnectionsState subscriptionConnectionsState)
         {
-            subscriptionData.Connections = subscriptionConnectionsState.GetConnections();
+            var subscriptionData = new SubscriptionGeneralDataAndStats(state)
+            {
+                Connections = subscriptionConnectionsState.GetConnections()
+            };
+
             if (history) // Only valid for this node
                 SetSubscriptionHistory(subscriptionConnectionsState, subscriptionData);
+
+            return subscriptionData;
         }
 
-        private void GetSubscriptionInternal(SubscriptionGeneralDataAndStats subscriptionData, bool history)
+        private SubscriptionGeneralDataAndStats GetSubscriptionInternal(SubscriptionState state, bool history)
         {
-            if (_subscriptions.TryGetValue(subscriptionData.SubscriptionId, out SubscriptionConnectionsState concurrentSubscription))
+            var subscriptionData = new SubscriptionGeneralDataAndStats(state);
+            if (_subscriptions.TryGetValue(state.SubscriptionId, out SubscriptionConnectionsState concurrentSubscription))
             {
                 subscriptionData.Connections = concurrentSubscription.GetConnections();
 
                 if (history)//Only valid if this is my subscription
                     SetSubscriptionHistory(concurrentSubscription, subscriptionData);
             }
+
+            return subscriptionData;
         }
 
-        public void HandleDatabaseRecordChange(DatabaseRecord databaseRecord)
+        public TimeSpan WaitForClusterStabilizationTimeout;
+
+        public bool ShouldWaitForClusterStabilization()
+        {
+            var lastState = _serverStore.Engine.LastState;
+            if (lastState == null)
+                return false;
+
+            switch (lastState.To)
+            {
+                // get last cluster state
+                case RachisState.Passive:
+                    // if the last state was passive, we will throw on next cluster command
+                    return false;
+                case RachisState.Candidate:
+                    {
+                        if (DateTime.UtcNow - lastState.When < WaitForClusterStabilizationTimeout)
+                        {
+                            return true;
+                        }
+
+                        return false;
+                    }
+                default:
+                    // we are fine to proceed with the subscription on this node
+                    return false;
+            }
+        }
+
+        public void HandleDatabaseRecordChange(DatabaseTopology topology)
         {
             using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (context.OpenReadTransaction())
@@ -660,15 +716,18 @@ namespace Raven.Server.Documents.Subscriptions
                     if (subscriptionName == null)
                         continue;
 
-                    var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(databaseRecord.DatabaseName, subscriptionName));
+                    var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(_db.Name, subscriptionName));
                     if (subscriptionBlittable == null)
                     {
                         DeleteAndSetException(subscriptionStateKvp.Key, new SubscriptionDoesNotExistException($"The subscription {subscriptionName} had been deleted"));
                         continue;
                     }
 
+                    if (subscriptionStateKvp.Value.IsSubscriptionActive() == false)
+                        continue;
+
                     var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
-                    if (subscriptionState.Disabled)
+                    if (subscriptionState.Disabled || _db.DisableOngoingTasks)
                     {
                         DropSubscriptionConnections(subscriptionStateKvp.Key, new SubscriptionClosedException($"The subscription {subscriptionName} is disabled and cannot be used until enabled"));
                         continue;
@@ -690,11 +749,18 @@ namespace Raven.Server.Documents.Subscriptions
                         continue;
                     }
 
-                    var whoseTaskIsIt = _db.WhoseTaskIsIt(databaseRecord.Topology, subscriptionState, subscriptionState);
+                    if (_serverStore.Engine.CurrentState == RachisState.Passive)
+                    {
+                        DropSubscriptionConnections(subscriptionStateKvp.Key,
+                            new SubscriptionDoesNotBelongToNodeException($"Subscription operation was stopped on '{_serverStore.NodeTag}', because current node state is '{RachisState.Passive}'."));
+                    }
+
+                    // we pass here RachisState.Follower so the task won't be disconnected if the node is in candidate state
+                    var whoseTaskIsIt = OngoingTasksUtils.WhoseTaskIsIt(_serverStore, topology, RachisState.Follower, subscriptionState, subscriptionState, _db.NotificationCenter);
                     if (whoseTaskIsIt != _serverStore.NodeTag)
                     {
                         DropSubscriptionConnections(subscriptionStateKvp.Key,
-                            new SubscriptionDoesNotBelongToNodeException("Subscription operation was stopped, because it's now under a different server's responsibility"));
+                            new SubscriptionDoesNotBelongToNodeException($"Subscription operation was stopped on '{_serverStore.NodeTag}', because it's now under node '{whoseTaskIsIt}' responsibility"));
                     }
                 }
             }
@@ -722,7 +788,7 @@ namespace Raven.Server.Documents.Subscriptions
 
                 var recentConnection = kvp.Value.MostRecentEndedConnection();
 
-                if (recentConnection != null && recentConnection.Stats.LastMessageSentAt < oldestPossibleIdleSubscription)
+                if (recentConnection != null && recentConnection.Date < oldestPossibleIdleSubscription)
                 {
                     if (_subscriptions.TryRemove(kvp.Key, out var subsState))
                     {

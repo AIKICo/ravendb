@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Indexes.Analysis;
+using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.Configuration;
@@ -17,6 +18,7 @@ using Raven.Client.Documents.Operations.ETL.OLAP;
 using Raven.Client.Documents.Operations.ETL.Queue;
 using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Documents.Operations.Expiration;
+using Raven.Client.Documents.Operations.Refresh;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Documents.Operations.TimeSeries;
@@ -27,10 +29,10 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations.Integrations.PostgreSQL;
 using Raven.Client.Util;
 using Raven.Server.Config;
-using Raven.Server.Config.Categories;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.PeriodicBackup;
+using Raven.Server.Extensions;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Commands;
@@ -39,30 +41,35 @@ using Raven.Server.Smuggler.Documents.Data;
 using Raven.Server.Web.System;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using BackupUtils = Raven.Server.Utils.BackupUtils;
 
 namespace Raven.Server.Smuggler.Documents
 {
     public class StreamDestination : ISmugglerDestination
     {
         private readonly Stream _stream;
-        private GZipStream _gzipStream;
+        private Stream _outputStream;
         private readonly DocumentsOperationContext _context;
         private readonly DatabaseSource _source;
+        private readonly ExportCompressionAlgorithm _compressionAlgorithm;
+        private readonly CompressionLevel _compressionLevel;
         private AsyncBlittableJsonTextWriter _writer;
         private DatabaseSmugglerOptionsServerSide _options;
         private Func<LazyStringValue, bool> _filterMetadataProperty;
 
-        public StreamDestination(Stream stream, DocumentsOperationContext context, DatabaseSource source)
+        public StreamDestination(Stream stream, DocumentsOperationContext context, DatabaseSource source, ExportCompressionAlgorithm compressionAlgorithm, CompressionLevel compressionLevel)
         {
             _stream = stream;
             _context = context;
             _source = source;
+            _compressionAlgorithm = compressionAlgorithm;
+            _compressionLevel = compressionLevel;
         }
 
-        public IAsyncDisposable InitializeAsync(DatabaseSmugglerOptionsServerSide options, SmugglerResult result, long buildVersion)
+        public IAsyncDisposable InitializeAsync(DatabaseSmugglerOptionsServerSide options, SmugglerResult result, Action<IOperationProgress> onProgress, long buildVersion)
         {
-            _gzipStream = new GZipStream(_stream, CompressionMode.Compress, leaveOpen: true);
-            _writer = new AsyncBlittableJsonTextWriter(_context, _gzipStream);
+            _outputStream = BackupUtils.GetCompressionStream(_stream, _compressionAlgorithm, _compressionLevel);
+            _writer = new AsyncBlittableJsonTextWriter(_context, _outputStream);
             _options = options;
 
             SetupMetadataFilterMethod(_context);
@@ -76,7 +83,7 @@ namespace Raven.Server.Smuggler.Documents
             {
                 _writer.WriteEndObject();
                 await _writer.DisposeAsync();
-                await _gzipStream.DisposeAsync();
+                await _outputStream.DisposeAsync();
             });
         }
 
@@ -196,6 +203,11 @@ namespace Raven.Server.Smuggler.Documents
             return new StreamTimeSeriesActions(_writer, _context, nameof(DatabaseItemType.TimeSeries));
         }
 
+        public ITimeSeriesActions TimeSeriesDeletedRanges()
+        {
+            return new StreamTimeSeriesActions(_writer, _context, nameof(DatabaseItemType.TimeSeriesDeletedRanges));
+        }
+
         public IIndexActions Indexes()
         {
             return new StreamIndexActions(_writer, _context);
@@ -216,7 +228,7 @@ namespace Raven.Server.Smuggler.Documents
                 _writer.WriteStartObject();
             }
 
-            public async ValueTask WriteDatabaseRecordAsync(DatabaseRecord databaseRecord, SmugglerProgressBase.DatabaseRecordProgress progress, AuthorizationStatus authorizationStatus, DatabaseRecordItemType databaseRecordItemType)
+            public async ValueTask WriteDatabaseRecordAsync(DatabaseRecord databaseRecord, SmugglerResult result, AuthorizationStatus authorizationStatus, DatabaseRecordItemType databaseRecordItemType)
             {
                 _writer.WritePropertyName(nameof(databaseRecord.DatabaseName));
                 _writer.WriteString(databaseRecord.DatabaseName);
@@ -277,6 +289,13 @@ namespace Raven.Server.Smuggler.Documents
                     WriteExpiration(databaseRecord.Expiration);
                 }
 
+                if (databaseRecordItemType.Contain(DatabaseRecordItemType.Refresh))
+                {
+                    _writer.WriteComma();
+                    _writer.WritePropertyName(nameof(databaseRecord.Refresh));
+                    WriteRefresh(databaseRecord.Refresh);
+                }
+
                 if (databaseRecordItemType.Contain(DatabaseRecordItemType.Client))
                 {
                     _writer.WriteComma();
@@ -296,6 +315,13 @@ namespace Raven.Server.Smuggler.Documents
                     _writer.WriteComma();
                     _writer.WritePropertyName(nameof(databaseRecord.Analyzers));
                     WriteAnalyzers(databaseRecord.Analyzers);
+                }
+
+                if (databaseRecordItemType.Contain(DatabaseRecordItemType.IndexesHistory))
+                {
+                    _writer.WriteComma();
+                    _writer.WritePropertyName(nameof(databaseRecord.IndexesHistory));
+                    WriteIndexesHistory(databaseRecord.IndexesHistory);
                 }
 
                 switch (authorizationStatus)
@@ -372,7 +398,7 @@ namespace Raven.Server.Smuggler.Documents
                             _writer.WritePropertyName(nameof(databaseRecord.OlapEtls));
                             WriteOlapEtls(databaseRecord.OlapEtls);
                         }
-                        
+
                         if (databaseRecordItemType.Contain(DatabaseRecordItemType.ElasticSearchConnectionStrings))
                         {
                             _writer.WriteComma();
@@ -417,7 +443,7 @@ namespace Raven.Server.Smuggler.Documents
                             _writer.WriteEndObject();
                         }
 
-                        
+
 
                         break;
                 }
@@ -506,6 +532,68 @@ namespace Raven.Server.Smuggler.Documents
 
                     _writer.WritePropertyName(analyzer.Key);
                     _context.Write(_writer, analyzer.Value.ToJson());
+                }
+
+                _writer.WriteEndObject();
+            }
+
+            private void WriteIndexesHistory(Dictionary<string, List<IndexHistoryEntry>> indexesHistory)
+            {
+                if (indexesHistory == null)
+                {
+                    _writer.WriteNull();
+                    return;
+                }
+
+                _writer.WriteStartObject();
+
+                var first = true;
+                foreach (var historyOfIndex in indexesHistory)
+                {
+                    if (first == false)
+                        _writer.WriteComma();
+                    first = false;
+
+                    _writer.WritePropertyName(historyOfIndex.Key);
+                    bool isFirstChangeOfIndex = true;
+
+                    _writer.WriteStartArray();
+                    foreach (var changeOfIndex in historyOfIndex.Value)
+                    {
+                        if (isFirstChangeOfIndex == false)
+                            _writer.WriteComma();
+                        isFirstChangeOfIndex = false;
+
+                        _writer.WriteStartObject();
+
+                        _writer.WritePropertyName(nameof(changeOfIndex.Source));
+                        _writer.WriteString(changeOfIndex.Source);
+                        _writer.WriteComma();
+
+                        _writer.WritePropertyName(nameof(changeOfIndex.CreatedAt));
+                        _writer.WriteDateTime(changeOfIndex.CreatedAt, true);
+                        _writer.WriteComma();
+
+                        _writer.WritePropertyName(nameof(changeOfIndex.RollingDeployment));
+                        _writer.WriteStartObject();
+                        bool isFirstRolling = true;
+                        foreach (var (rollingName, rollingIndexDeployment) in changeOfIndex?.RollingDeployment)
+                        {
+                            if (isFirstRolling == false)
+                                _writer.WriteComma();
+                            isFirstRolling = false;
+                            _writer.WritePropertyName(rollingName);
+                            _context.Write(_writer, rollingIndexDeployment.ToJson());
+                        }
+                        _writer.WriteEndObject();
+                        _writer.WriteComma();
+
+                        _writer.WritePropertyName(nameof(changeOfIndex.Definition));
+                        _context.Write(_writer, changeOfIndex.Definition.ToJson());
+
+                        _writer.WriteEndObject();
+                    }
+                    _writer.WriteEndArray();
                 }
 
                 _writer.WriteEndObject();
@@ -612,7 +700,7 @@ namespace Raven.Server.Smuggler.Documents
 
                 _writer.WriteEndArray();
             }
-            
+
             private void WriteElasticSearchEtls(List<ElasticSearchEtlConfiguration> elasticSearchEtlConfiguration)
             {
                 if (elasticSearchEtlConfiguration == null)
@@ -729,6 +817,17 @@ namespace Raven.Server.Smuggler.Documents
                 _context.Write(_writer, expiration.ToJson());
             }
 
+            private void WriteRefresh(RefreshConfiguration refresh)
+            {
+                if (refresh == null)
+                {
+                    _writer.WriteNull();
+                    return;
+                }
+
+                _context.Write(_writer, refresh.ToJson());
+            }
+
             private void WriteRevisions(RevisionsConfiguration revisions)
             {
                 if (revisions == null)
@@ -815,7 +914,7 @@ namespace Raven.Server.Smuggler.Documents
 
                 _writer.WriteEndObject();
             }
-            
+
             private void WriteElasticSearchConnectionStrings(Dictionary<string, ElasticSearchConnectionString> connections)
             {
                 _writer.WriteStartObject();
@@ -922,7 +1021,7 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        private class StreamCounterActions : StreamActionsBase, ICounterActions
+        private class StreamCounterActions : StreamActionsBaseWithBuilder, ICounterActions
         {
             private readonly DocumentsOperationContext _context;
 
@@ -967,7 +1066,7 @@ namespace Raven.Server.Smuggler.Documents
                 throw new NotSupportedException("RegisterForDisposal is never used in StreamCounterActions. Shouldn't happen.");
             }
 
-            public StreamCounterActions(AsyncBlittableJsonTextWriter writer, DocumentsOperationContext context, string propertyName) : base(writer, propertyName)
+            public StreamCounterActions(AsyncBlittableJsonTextWriter writer, DocumentsOperationContext context, string propertyName) : base(context, writer, propertyName)
             {
                 _context = context;
             }
@@ -978,16 +1077,30 @@ namespace Raven.Server.Smuggler.Documents
                 return _context;
             }
 
+            public BlittableJsonDocumentBuilder GetBuilderForNewDocument(UnmanagedJsonParser parser, JsonParserState state, BlittableMetadataModifier modifier = null)
+            {
+                return GetOrCreateBuilder(parser, state, "stream/object", modifier);
+            }
+
+            public BlittableMetadataModifier GetMetadataModifierForNewDocument(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false,
+                bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None)
+            {
+                return GetOrCreateMetadataModifier(firstEtagOfLegacyRevision, legacyRevisionsCount, legacyImport, readLegacyEtag, operateOnTypes);
+            }
+
             public Stream GetTempStream()
             {
                 throw new NotSupportedException("GetTempStream is never used in StreamCounterActions. Shouldn't happen");
             }
         }
 
-        private class StreamTimeSeriesActions : StreamActionsBase, ITimeSeriesActions
+        private class StreamTimeSeriesActions : StreamActionsBaseWithBuilder, ITimeSeriesActions
         {
-            public StreamTimeSeriesActions(AsyncBlittableJsonTextWriter writer, DocumentsOperationContext context, string propertyName) : base(writer, propertyName)
+            private readonly DocumentsOperationContext _context;
+
+            public StreamTimeSeriesActions(AsyncBlittableJsonTextWriter writer, DocumentsOperationContext context, string propertyName) : base(context, writer, propertyName)
             {
+                _context = context;
             }
 
             public async ValueTask WriteTimeSeriesAsync(TimeSeriesItem item)
@@ -1039,6 +1152,73 @@ namespace Raven.Server.Smuggler.Documents
                     await Writer.MaybeFlushAsync();
                 }
             }
+
+            public async ValueTask WriteTimeSeriesDeletedRangeAsync(TimeSeriesDeletedRangeItemForSmuggler deletedRangeItem)
+            {
+                using (deletedRangeItem)
+                {
+                    if (First == false)
+                        Writer.WriteComma();
+
+                    First = false;
+
+                    Writer.WriteStartObject();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.DocId));
+                    Writer.WriteString(deletedRangeItem.DocId, skipEscaping: true);
+                    Writer.WriteComma();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.Name));
+                    Writer.WriteString(deletedRangeItem.Name, skipEscaping: true);
+                    Writer.WriteComma();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.Collection));
+                    Writer.WriteString(deletedRangeItem.Collection);
+                    Writer.WriteComma();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.ChangeVector));
+                    Writer.WriteString(deletedRangeItem.ChangeVector);
+                    Writer.WriteComma();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.From));
+                    Writer.WriteDateTime(deletedRangeItem.From, isUtc: true);
+                    Writer.WriteComma();
+
+                    Writer.WritePropertyName(nameof(TimeSeriesDeletedRangeItemForSmuggler.To));
+                    Writer.WriteDateTime(deletedRangeItem.To, isUtc: true);
+
+                    Writer.WriteEndObject();
+
+                    await Writer.MaybeFlushAsync();
+                }
+            }
+
+            public void RegisterForDisposal(IDisposable data)
+            {
+                throw new NotSupportedException($"{nameof(RegisterForDisposal)} is never used in {nameof(StreamTimeSeriesActions)}. Shouldn't happen.");
+            }
+
+            public void RegisterForReturnToTheContext(AllocatedMemoryData data)
+            {
+                throw new NotSupportedException($"{nameof(RegisterForReturnToTheContext)} is never used in {nameof(StreamTimeSeriesActions)}. Shouldn't happen.");
+            }
+
+            public DocumentsOperationContext GetContextForNewDocument()
+            {
+                _context.CachedProperties.NewDocument();
+                return _context;
+            }
+
+            public BlittableJsonDocumentBuilder GetBuilderForNewDocument(UnmanagedJsonParser parser, JsonParserState state, BlittableMetadataModifier modifier = null)
+            {
+                return GetOrCreateBuilder(parser, state, "stream/object", modifier);
+            }
+
+            public BlittableMetadataModifier GetMetadataModifierForNewDocument(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false,
+                bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None)
+            {
+                return GetOrCreateMetadataModifier(firstEtagOfLegacyRevision, legacyRevisionsCount, legacyImport, readLegacyEtag, operateOnTypes);
+            }
         }
 
         private class StreamSubscriptionActions : StreamActionsBase, ISubscriptionActions
@@ -1089,7 +1269,7 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        private class StreamDocumentActions : StreamActionsBase, IDocumentActions
+        private class StreamDocumentActions : StreamActionsBaseWithBuilder, IDocumentActions
         {
             private readonly DocumentsOperationContext _context;
             private readonly DatabaseSource _source;
@@ -1098,7 +1278,7 @@ namespace Raven.Server.Smuggler.Documents
             private HashSet<string> _attachmentStreamsAlreadyExported;
 
             public StreamDocumentActions(AsyncBlittableJsonTextWriter writer, DocumentsOperationContext context, DatabaseSource source, DatabaseSmugglerOptionsServerSide options, Func<LazyStringValue, bool> filterMetadataProperty, string propertyName)
-                : base(writer, propertyName)
+                : base(context, writer, propertyName)
             {
                 _context = context;
                 _source = source;
@@ -1106,24 +1286,29 @@ namespace Raven.Server.Smuggler.Documents
                 _filterMetadataProperty = filterMetadataProperty;
             }
 
-            public async ValueTask WriteDocumentAsync(DocumentItem item, SmugglerProgressBase.CountsWithLastEtagAndAttachments progress)
+            public ValueTask WriteDocumentAsync(DocumentItem item, SmugglerProgressBase.CountsWithLastEtagAndAttachments progress, Func<ValueTask> beforeFlush)
             {
                 if (item.Attachments != null)
                     throw new NotSupportedException();
 
-                var document = item.Document;
-                using (document)
+                return new ValueTask(AsyncWork());
+
+                async Task AsyncWork()
                 {
-                    if (_options.OperateOnTypes.HasFlag(DatabaseItemType.Attachments))
-                        await WriteUniqueAttachmentStreamsAsync(document, progress);
+                    var document = item.Document;
+                    using (document)
+                    {
+                        if (_options.OperateOnTypes.HasFlag(DatabaseItemType.Attachments))
+                            await WriteUniqueAttachmentStreamsAsync(document, progress);
 
-                    if (First == false)
-                        Writer.WriteComma();
-                    First = false;
+                        if (First == false)
+                            Writer.WriteComma();
+                        First = false;
 
-                    Writer.WriteDocument(_context, document, metadataOnly: false, _filterMetadataProperty);
+                        Writer.WriteDocument(_context, document, metadataOnly: false, _filterMetadataProperty);
 
-                    await Writer.MaybeFlushAsync();
+                        await Writer.MaybeFlushAsync();
+                    }
                 }
             }
 
@@ -1240,6 +1425,17 @@ namespace Raven.Server.Smuggler.Documents
                 return _context;
             }
 
+            public BlittableJsonDocumentBuilder GetBuilderForNewDocument(UnmanagedJsonParser parser, JsonParserState state, BlittableMetadataModifier modifier = null)
+            {
+                return GetOrCreateBuilder(parser, state, "stream/object", modifier);
+            }
+
+            public BlittableMetadataModifier GetMetadataModifierForNewDocument(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false,
+                bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None)
+            {
+                return GetOrCreateMetadataModifier(firstEtagOfLegacyRevision, legacyRevisionsCount, legacyImport, readLegacyEtag, operateOnTypes);
+            }
+
             private async ValueTask WriteAttachmentStreamAsync(LazyStringValue hash, Stream stream, string tag)
             {
                 if (First == false)
@@ -1346,6 +1542,49 @@ namespace Raven.Server.Smuggler.Documents
             {
                 throw new NotSupportedException();
             }
+
+
+            public ValueTask FlushAsync()
+            {
+                return ValueTask.CompletedTask;
+            }
+        }
+
+        private abstract class StreamActionsBaseWithBuilder : StreamActionsBase
+        {
+            protected readonly JsonOperationContext Context;
+
+            private BlittableJsonDocumentBuilder _builder;
+            private BlittableMetadataModifier _metadataModifier;
+
+            protected StreamActionsBaseWithBuilder(JsonOperationContext context, AsyncBlittableJsonTextWriter writer, string propertyName)
+                : base(writer, propertyName)
+            {
+                Context = context;
+            }
+
+            protected BlittableJsonDocumentBuilder GetOrCreateBuilder(UnmanagedJsonParser parser, JsonParserState state, string debugTag, BlittableMetadataModifier modifier = null)
+            {
+                return _builder ??= new BlittableJsonDocumentBuilder(Context, BlittableJsonDocumentBuilder.UsageMode.ToDisk, debugTag, parser, state, modifier: modifier);
+            }
+
+            protected BlittableMetadataModifier GetOrCreateMetadataModifier(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false,
+                bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None)
+            {
+                _metadataModifier ??= new BlittableMetadataModifier(Context, legacyImport, readLegacyEtag, operateOnTypes);
+                _metadataModifier.FirstEtagOfLegacyRevision = firstEtagOfLegacyRevision;
+                _metadataModifier.LegacyRevisionsCount = legacyRevisionsCount;
+
+                return _metadataModifier;
+            }
+
+            public override ValueTask DisposeAsync()
+            {
+                _builder?.Dispose();
+                _metadataModifier?.Dispose();
+
+                return base.DisposeAsync();
+            }
         }
 
         private abstract class StreamActionsBase : IAsyncDisposable
@@ -1364,7 +1603,7 @@ namespace Raven.Server.Smuggler.Documents
                 Writer.WriteStartArray();
             }
 
-            public ValueTask DisposeAsync()
+            public virtual ValueTask DisposeAsync()
             {
                 Writer.WriteEndArray();
                 return default;

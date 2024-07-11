@@ -29,6 +29,7 @@ import compactDatabaseDialog = require("viewmodels/resources/compactDatabaseDial
 import notificationCenter = require("common/notifications/notificationCenter");
 import saveDatabaseLockModeCommand = require("commands/resources/saveDatabaseLockModeCommand");
 import databaseSettings = require("viewmodels/database/settings/databaseSettings");
+import restartDatabaseCommand = require("../../commands/resources/restartDatabaseCommand");
 
 type databaseState = "errored" | "disabled" | "online" | "offline" | "remote";
 type filterState = databaseState | 'local' | 'all';
@@ -84,11 +85,13 @@ class databases extends viewModelBase {
     
     notificationCenter = notificationCenter.instance;
     
+    localNodeTag = ko.observable<string>();
+    
     constructor() {
         super();
 
         this.bindToCurrentInstance("newDatabase", "toggleDatabase", "togglePauseDatabaseIndexing", 
-            "toggleDisableDatabaseIndexing", "deleteDatabase", "activateDatabase", "updateDatabaseInfo",
+            "toggleDisableDatabaseIndexing", "restartDatabase", "deleteDatabase", "activateDatabase", "updateDatabaseInfo",
             "allowDatabaseDelete", "preventDatabaseDelete", "preventDatabaseDeleteWithError",
             "compactDatabase", "databasePanelClicked", "openNotificationCenter");
 
@@ -157,6 +160,8 @@ class databases extends viewModelBase {
             const selected = this.getSelectedDatabases();
             return selected.filter(x => x.lockMode() === "Unlock");
         });
+
+        this.localNodeTag = this.clusterManager.localNodeTag;
     }
 
     // Override canActivate: we can always load this page, regardless of any system db prompt.
@@ -681,7 +686,27 @@ class databases extends viewModelBase {
                 }
             });
     }
-    
+
+    restartDatabase(db: databaseInfo): void {
+        eventsCollector.default.reportEvent("databases", "restart-database");
+        this.changesContext.disconnectIfCurrent(db.asDatabase(), "DatabaseRestarted");
+
+        this.confirmationMessage("Restart database?",
+            `The database will be restarted on <strong>node ${generalUtils.escapeHtml(this.localNodeTag())}</strong>`, {
+            buttons: ["Cancel", "Restart"],
+            html: true
+        })
+            .done(result => {
+                if (result.can) {
+                    db.inProgressAction("Restarting the database");
+
+                    new restartDatabaseCommand(db.asDatabase())
+                        .execute()
+                        .always(() => db.inProgressAction(null));
+                }
+            });
+    }
+
     compactDatabase(db: databaseInfo) {
         eventsCollector.default.reportEvent("databases", "compact");
         this.changesContext.disconnectIfCurrent(db.asDatabase(), "DatabaseDisabled");

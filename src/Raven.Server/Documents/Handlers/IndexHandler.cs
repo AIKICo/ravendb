@@ -59,7 +59,7 @@ namespace Raven.Server.Documents.Handlers
             if (newIndex == null)
                 throw new IndexDoesNotExistException($"Could not find side-by-side index for '{name}'.");
 
-            using (var token = CreateOperationToken(TimeSpan.FromMinutes(15)))
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationToken(TimeSpan.FromMinutes(15)))
             {
                 Database.IndexStore.ReplaceIndexes(name, newIndex.Name, token.Token);
             }
@@ -420,6 +420,7 @@ namespace Raven.Server.Documents.Handlers
                                         Status = x.Status,
                                         LockMode = x.Definition.LockMode,
                                         Priority = x.Definition.Priority,
+                                        ReferencedCollections = x.GetReferencedCollectionNames()
                                     };
                                 }
                                 catch (Exception e)
@@ -466,6 +467,7 @@ namespace Raven.Server.Documents.Handlers
                                         Status = x.Status,
                                         LockMode = x.Definition.LockMode,
                                         Priority = x.Definition.Priority,
+                                        ReferencedCollections = x.GetReferencedCollectionNames()
                                     };
                                 }
                             })
@@ -574,6 +576,11 @@ namespace Raven.Server.Documents.Handlers
         {
             var name = GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
 
+            if (LoggingSource.AuditLog.IsInfoEnabled)
+            {
+                LogAuditFor(Database.Name, "RESET", $"Index '{name}'");
+            }
+
             IndexDefinition indexDefinition;
             lock (Database)
             {
@@ -624,10 +631,7 @@ namespace Raven.Server.Documents.Handlers
 
             if (LoggingSource.AuditLog.IsInfoEnabled)
             {
-                var clientCert = GetCurrentCertificate();
-
-                var auditLog = LoggingSource.AuditLog.GetLogger(Database.Name, "Audit");
-                auditLog.Info($"Index {name} DELETE by {clientCert?.Subject} {clientCert?.Thumbprint}");
+                LogAuditFor(Database.Name, "DELETE", $"Index '{name}'");
             }
 
             HttpContext.Response.StatusCode = await Database.IndexStore.TryDeleteIndexIfExists(name, GetRaftRequestIdFromQuery())
@@ -834,7 +838,7 @@ namespace Raven.Server.Documents.Handlers
         {
             var field = GetQueryStringValueAndAssertIfSingleAndNotEmpty("field");
 
-            using (var token = CreateTimeLimitedOperationToken())
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationToken())
             using (var context = QueryOperationContext.Allocate(Database))
             {
                 var name = GetIndexNameFromCollectionAndField(field) ?? GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
@@ -972,43 +976,54 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/indexes/performance/live", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, SkipUsagesCount = true)]
         public async Task PerformanceLive()
         {
-            using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
+            try
             {
-                var indexNames = GetIndexesToReportOn().Select(x => x.Name).ToList();
-                if (GetBoolValueQueryString("includeSideBySide", false) ?? false)
+                using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
                 {
-                    // user requested to track side by side indexes as well
-                    // add extra names to indexNames list
-                    var complementaryIndexes = new HashSet<string>();
-                    foreach (var indexName in indexNames)
+                    var indexNames = GetIndexesToReportOn().Select(x => x.Name).ToList();
+                    if (GetBoolValueQueryString("includeSideBySide", false) ?? false)
                     {
-                        if (indexName.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
-                            complementaryIndexes.Add(indexName.Substring(Constants.Documents.Indexing.SideBySideIndexNamePrefix.Length));
-                        else
-                            complementaryIndexes.Add(Constants.Documents.Indexing.SideBySideIndexNamePrefix + indexName);
+                        // user requested to track side by side indexes as well
+                        // add extra names to indexNames list
+                        var complementaryIndexes = new HashSet<string>();
+                        foreach (var indexName in indexNames)
+                        {
+                            if (indexName.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
+                                complementaryIndexes.Add(indexName.Substring(Constants.Documents.Indexing.SideBySideIndexNamePrefix.Length));
+                            else
+                                complementaryIndexes.Add(Constants.Documents.Indexing.SideBySideIndexNamePrefix + indexName);
+                        }
+
+                        indexNames.AddRange(complementaryIndexes);
                     }
 
-                    indexNames.AddRange(complementaryIndexes);
-                }
+                    var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
+                    var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
 
-                var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
-                var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
-
-                await using (var ms = new MemoryStream())
-                using (var collector = new LiveIndexingPerformanceCollector(Database, indexNames))
-                {
-                    // 1. Send data to webSocket without making UI wait upon opening webSocket
-                    await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
-
-                    // 2. Send data to webSocket when available
-                    while (Database.DatabaseShutdown.IsCancellationRequested == false)
+                    await using (var ms = new MemoryStream())
+                    using (var collector = new LiveIndexingPerformanceCollector(Database, indexNames))
                     {
-                        if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                        // 1. Send data to webSocket without making UI wait upon opening webSocket
+                        await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+
+                        // 2. Send data to webSocket when available
+                        while (Database.DatabaseShutdown.IsCancellationRequested == false)
                         {
-                            break;
+                            if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                            {
+                                break;
+                            }
                         }
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // disposing
+            }
+            catch (ObjectDisposedException)
+            {
+                // disposing
             }
         }
         
@@ -1064,11 +1079,7 @@ namespace Raven.Server.Documents.Handlers
                     else
                     {
                         var listOfIds = ids.Select(x => x.ToString());
-                        var _ = new Reference<int>
-                        {
-                            Value = 0
-                        };
-                        var docs = Database.DocumentsStorage.GetDocuments(context, listOfIds, 0, long.MaxValue, _);
+                        var docs = Database.DocumentsStorage.GetDocuments(context, listOfIds, 0, long.MaxValue);
                         foreach (var doc in docs)
                         {
                             if (doc.TryGetMetadata(out var metadata) && metadata.TryGet(Constants.Documents.Metadata.Collection, out string collectionStr))
@@ -1157,6 +1168,45 @@ namespace Raven.Server.Documents.Handlers
         }
 
         private static readonly int DefaultInputSizeForTestingJavaScriptIndex = 10;
+
+        [RavenAction("/databases/*/indexes/debug/metadata", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, IsDebugInformationEndpoint = true)]
+        public async Task Metadata()
+        {
+            using (var context = QueryOperationContext.Allocate(Database, needsServerContext: true))
+            await using (var writer = new AsyncBlittableJsonTextWriterForDebug(context.Documents, ServerStore, ResponseBodyStream()))
+            {
+                var indexMetadata = GetIndexesToReportOn()
+                    .OrderBy(x => x.Name)
+                    .Select(x =>
+                    {
+                        var timeFields = x._indexStorage.ReadIndexTimeFields();
+                        var hasTimeFields = timeFields.Count > 0;
+
+                        return new DynamicJsonValue
+                        {
+                            [nameof(x.Name)] = x.Name,
+                            [nameof(x.Definition.Version)] = x.Definition.Version,
+                            [nameof(x.Type)] = x.Type,
+                            [nameof(x.Definition.State)] = x.Definition.State,
+                            [nameof(x.Definition.LockMode)] = x.Definition.LockMode,
+                            [nameof(x.SourceType)] = x.SourceType,
+                            [nameof(x.Definition.Priority)] = x.Definition.Priority,
+                            [nameof(x.SearchEngineType)] = x.SearchEngineType,
+                            [nameof(x.Definition.HasDynamicFields)] = x.Definition.HasDynamicFields,
+                            [nameof(x.Definition.HasCompareExchange)] = x.Definition.HasCompareExchange,
+                            ["HasTimeFields"] = hasTimeFields,
+                            ["TimeFields"] = timeFields
+                        };
+                    }).ToArray();
+                
+                writer.WriteStartObject();
+
+                writer.WriteArray(context.Documents, "Results", indexMetadata, 
+                    (w, c, metadata) => c.Write(w, metadata));
+
+                writer.WriteEndObject();
+            }
+        }
 
         private IEnumerable<Index> GetIndexesToReportOn()
         {

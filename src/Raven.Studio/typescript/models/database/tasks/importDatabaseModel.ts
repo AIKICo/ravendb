@@ -15,6 +15,7 @@ class importDatabaseModel {
     includeLegacyAttachments = ko.observable(false);
     includeAttachments = ko.observable(true);
     includeTimeSeries = ko.observable(true);
+    includeTimeSeriesDeletedRanges = ko.observable(true);
     includeSubscriptions = ko.observable(true);
     includeDocumentsTombstones = ko.observable(true);
     includeCompareExchangeTombstones = ko.observable(true);
@@ -27,6 +28,9 @@ class importDatabaseModel {
     includeExpiredDocuments = ko.observable(true);
     includeArtificialDocuments = ko.observable(false);
     removeAnalyzers = ko.observable(false);
+
+    includeAllCollections = ko.observable<boolean>(true);
+    includedCollections = ko.observableArray<string>([]);
     
     transformScript = ko.observable<string>();
 
@@ -75,10 +79,17 @@ class importDatabaseModel {
                 this.includeIndexes(true);
             }
         });
+
+        this.databaseModel.includeIndexHistory.subscribe(indexHistory => {
+            if (indexHistory) {
+                this.includeIndexes(true);
+            }
+        });
         
         this.includeIndexes.subscribe(indexes => {
             if (!indexes) {
                 this.removeAnalyzers(false);
+                this.databaseModel.includeIndexHistory(false);
             }
         });
 
@@ -153,6 +164,9 @@ class importDatabaseModel {
         if (this.includeTimeSeries()) {
             operateOnTypes.push("TimeSeries");
         }
+        if (this.includeTimeSeriesDeletedRanges()) {
+            operateOnTypes.push("TimeSeriesDeletedRanges");
+        }
         if (this.includeSubscriptions()) {
             operateOnTypes.push("Subscriptions");
         }
@@ -172,7 +186,8 @@ class importDatabaseModel {
             RemoveAnalyzers: this.removeAnalyzers(),
             EncryptionKey: this.encryptedInput() ? this.encryptionKey() : undefined,
             OperateOnTypes: operateOnTypes.join(",") as Raven.Client.Documents.Smuggler.DatabaseItemType,
-            OperateOnDatabaseRecordTypes: recordTypes
+            OperateOnDatabaseRecordTypes: recordTypes,
+            Collections: this.includeAllCollections() ? null : this.includedCollections(),
         } as Raven.Client.Documents.Smuggler.DatabaseSmugglerImportOptions;
     }
 
@@ -188,6 +203,7 @@ class importDatabaseModel {
                 || this.includeCounters() 
                 || this.includeLegacyCounters()
                 || this.includeTimeSeries()
+                || this.includeTimeSeriesDeletedRanges()
                 || this.includeRevisionDocuments() 
                 || this.includeDocuments()
                 || this.includeAttachments()

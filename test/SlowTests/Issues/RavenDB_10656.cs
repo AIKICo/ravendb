@@ -8,6 +8,7 @@ using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Server.Documents;
+using Raven.Server.NotificationCenter;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -142,6 +143,11 @@ namespace SlowTests.Issues
                 ["Products"] = 0,
                 ["Users"] = 0
             };
+        }
+
+        public Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> GetDisabledSubscribersCollections(HashSet<string> tombstoneCollections)
+        {
+            throw new NotImplementedException();
         }
     }
 }

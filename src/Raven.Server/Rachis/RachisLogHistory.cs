@@ -177,6 +177,27 @@ namespace Raven.Server.Rachis
             UpdateInternal(context, cmd, guid, type, index, term, HistoryStatus.Committed, result, exception);
         }
 
+        public void UpdateHistoryLogPreservingGuidAndStatus(ClusterOperationContext context, long index, long term, BlittableJsonReaderObject cmd)
+        {
+            var list = GetLogByIndex(context, index);
+            if (list == null || list.Count != 1)
+            {
+                return;
+            }
+
+            var cmdDjv = list[0];
+            
+            var guid = (string)cmdDjv[nameof(LogHistoryColumn.Guid)];
+            if (guid == null)
+                return;
+
+            var type = GetTypeFromCommand(cmd);
+            if (Enum.TryParse<HistoryStatus>((string)cmdDjv[nameof(LogHistoryColumn.State)], out var status) == false)
+                return;
+
+            UpdateInternal(context, cmd, guid, type, index, term, status, result: null, exception: null);
+        }
+
         private unsafe void UpdateInternal(ClusterOperationContext context, BlittableJsonReaderObject cmd, string guid, string type, long index, long term, HistoryStatus status, object result, Exception exception)
         {
             var table = context.Transaction.InnerTransaction.OpenTable(LogHistoryTable, LogHistorySlice);
@@ -200,7 +221,16 @@ namespace Raven.Server.Rachis
                 var diff = TimeSpan.FromTicks(ticks - previous);
                 if (diff > TimeSpan.FromSeconds(2))
                 {
-                    Console.WriteLine($"Command {type} at index:{index}, term:{term} took {diff} to commit (result:{result}, exception:{exception}){Environment.NewLine}{cmd}");
+                    BlittableJsonReaderObject blittableResult = null;
+                    if (result != null)
+                    {
+                        blittableResult = context.ReadObject(new DynamicJsonValue
+                        {
+                            ["Result"] = result
+                        }, "set-history-result");
+                    }
+
+                    Console.WriteLine($"Command {type} at index:{index}, term:{term} took {diff} to commit (result:{blittableResult}, exception:{exception}){Environment.NewLine}{cmd}");
                 }
             }
             using (Slice.From(context.Allocator, guid, out var guidSlice))
@@ -413,13 +443,17 @@ namespace Raven.Server.Rachis
             }
         }
 
-        public unsafe bool HasHistoryLog(ClusterOperationContext context, BlittableJsonReaderObject cmd, out long index, out object result, out Exception exception)
+        public bool HasHistoryLog(ClusterOperationContext context, BlittableJsonReaderObject cmd, out long index, out object result, out Exception exception)
+        {
+            var guid = GetGuidFromCommand(cmd);
+            return HasHistoryLog(context, guid, out index, out result, out exception);
+        }
+        public unsafe bool HasHistoryLog(ClusterOperationContext context, string guid, out long index, out object result, out Exception exception)
         {
             result = null;
             exception = null;
             index = 0;
 
-            var guid = GetGuidFromCommand(cmd);
             if (guid == null) // shouldn't happened in new cluster version!
                 return false;
 
@@ -466,6 +500,41 @@ namespace Raven.Server.Rachis
                 }
 
                 return true;
+            }
+        }
+
+        public unsafe bool TryGetResultByGuid<T>(ClusterOperationContext context, string guid, out T result)
+        {
+            result = default(T);
+
+            var table = context.Transaction.InnerTransaction.OpenTable(LogHistoryTable, LogHistorySlice);
+            using (Slice.From(context.Allocator, guid, out var guidSlice))
+            {
+                if (table.ReadByKey(guidSlice, out var reader) == false)
+                    return false;
+
+                var bytes = reader.Read((int)LogHistoryColumn.Result, out int size);
+                if (size == 0)
+                    return false;
+
+                var cmd = new BlittableJsonReaderObject(bytes, size, context);
+
+                if (typeof(T) == typeof(ClusterTransactionResult))
+                {
+                    if (cmd.TryGet(nameof(LogHistoryColumn.Result), out BlittableJsonReaderObject resultAsBlt) == false)
+                        // Should never happen! (we are getting here after the command is completed int the db, so it ha been applied and should have results).
+                        throw new InvalidOperationException($"'Results' field is inaccessible in '{cmd}' for type {typeof(T).FullName}");
+
+                    result = (T)(object)ClusterTransactionCommand.GetResults(resultAsBlt);
+                }
+                else
+                {
+                    if (cmd.TryGet(nameof(LogHistoryColumn.Result), out result) == false)
+                        // Should never happen! (we are getting here after the command is completed int the db, so it ha been applied and should have results).
+                        throw new InvalidOperationException($"'Results' field is inaccessible in '{cmd}' for type {typeof(T).FullName}");
+                }
+
+                return result != null;
             }
         }
     }

@@ -56,7 +56,7 @@ namespace SlowTests.Issues
 
                         await commands.ExecuteAsync(csvImportCommand);
 
-                        var operation = new Operation(commands.RequestExecutor, () => store.Changes(), store.Conventions, operationId);
+                        var operation = new Operation(commands.RequestExecutor, () => store.Changes(store.Database, Server.ServerStore.NodeTag), store.Conventions, operationId, Server.ServerStore.NodeTag);
 
                         await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(5));
                     }
@@ -112,7 +112,7 @@ namespace SlowTests.Issues
 
                     await commands.ExecuteAsync(csvImportCommand);
 
-                    var operation = new Operation(commands.RequestExecutor, () => store.Changes(), store.Conventions, operationId);
+                    var operation = new Operation(commands.RequestExecutor, () => store.Changes(store.Database, Server.ServerStore.NodeTag), store.Conventions, operationId, Server.ServerStore.NodeTag);
 
                     await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(5));
                 }
@@ -250,7 +250,7 @@ namespace SlowTests.Issues
             public string Title { get; set; }
         }
 
-        private class InValidCsvImportOptions
+        public class InValidCsvImportOptions
         {
             public string Delimiter { get; set; }
             public string Quote { get; set; } // Quote is char in CSVHelper
@@ -259,7 +259,7 @@ namespace SlowTests.Issues
             public string TrimOptions { get; set; }
         }
 
-        private class CsvImportCommand : RavenCommand
+        public class CsvImportCommand : RavenCommand
         {
             private readonly Stream _stream;
             private readonly string _collection;

@@ -352,11 +352,7 @@ namespace Raven.Server.Utils.Cli
             Console.ResetColor();
 
             LoggingSource.Instance.DisableConsoleLogging();
-            var prevLogMode = LoggingSource.Instance.LogMode;
-            SetupLogMode(LogMode.None, cli._server.Configuration.Logs);
             Program.WriteServerStatsAndWaitForEsc(cli._server);
-            SetupLogMode(prevLogMode, cli._server.Configuration.Logs);
-            Console.WriteLine($"LogMode set back to {prevLogMode}.");
             return true;
         }
 
@@ -418,11 +414,7 @@ namespace Raven.Server.Utils.Cli
             Console.ResetColor();
 
             LoggingSource.Instance.DisableConsoleLogging();
-            var prevLogMode = LoggingSource.Instance.LogMode;
-            SetupLogMode(LogMode.None, cli._server.Configuration.Logs);
             Program.WriteThreadsInfoAndWaitForEsc(cli._server, maxTopThreads, updateIntervalInMs, cpuUsageThreshold);
-            SetupLogMode(prevLogMode, cli._server.Configuration.Logs);
-            Console.WriteLine($"LogMode set back to {prevLogMode}.");
             return true;
         }
 
@@ -592,13 +584,15 @@ namespace Raven.Server.Utils.Cli
         public static string GetInfoText()
         {
             var memoryInfo = MemoryInformation.GetMemoryInformationUsingOneTimeSmapsReader();
+            var dirtyMemoryState = MemoryInformation.GetDirtyMemoryState();
+
             using (var currentProcess = Process.GetCurrentProcess())
             {
                 return $" Build {ServerVersion.Build}, Version {ServerVersion.Version}, SemVer {ServerVersion.FullVersion}, Commit {ServerVersion.CommitHash}" +
                        Environment.NewLine +
                        $" PID {currentProcess.Id}, {IntPtr.Size * 8} bits, {ProcessorInfo.ProcessorCount} Cores, Arch: {RuntimeInformation.OSArchitecture}" +
                        Environment.NewLine +
-                       $" {memoryInfo.TotalPhysicalMemory} Physical Memory, {memoryInfo.AvailableMemory} Available Memory, {memoryInfo.AvailableMemoryForProcessing} Calculated Available Memory, {memoryInfo.TotalScratchDirtyMemory} Scratch Dirty Memory" +
+                       $" {memoryInfo.TotalPhysicalMemory} Physical Memory, {memoryInfo.AvailableMemory} Available Memory, {memoryInfo.AvailableMemoryForProcessing} Calculated Available Memory, {dirtyMemoryState.TotalDirty} Scratch Dirty Memory" +
                        Environment.NewLine +
                        $" {RuntimeSettings.Describe()}" +
                        Environment.NewLine +
@@ -784,7 +778,7 @@ namespace Raven.Server.Utils.Cli
 
                 try
                 {
-                    AdminCertificatesHandler.PutCertificateCollectionInCluster(certDef, certBytes, password, cli._server.ServerStore, ctx, RaftIdGenerator.NewId()).Wait();
+                    AdminCertificatesHandler.PutCertificateCollectionInCluster(certDef, certBytes, password, cli._server.ServerStore, ctx, null, RaftIdGenerator.NewId()).Wait();
                 }
                 catch (Exception e)
                 {
@@ -829,7 +823,7 @@ namespace Raven.Server.Utils.Cli
             byte[] outputBytes;
             try
             {
-                outputBytes = AdminCertificatesHandler.GenerateCertificateInternal(certDef, cli._server.ServerStore, RaftIdGenerator.NewId()).Result;
+                outputBytes = AdminCertificatesHandler.GenerateCertificateInternal(certDef, cli._server.ServerStore, null, RaftIdGenerator.NewId()).Result;
             }
             catch (Exception e)
             {
@@ -1023,6 +1017,12 @@ namespace Raven.Server.Utils.Cli
             using (cli._server.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
                 var adminJsScript = new AdminJsScript(jsCli.Script);
+                if (LoggingSource.AuditLog.IsInfoEnabled)
+                {
+                    var auditLog = LoggingSource.AuditLog.GetLogger("Server", "Audit");
+                    auditLog.Info($"RavenCli, no certificate, Execute AdminJSConsole Script: \"{adminJsScript.Script}\"");
+                }
+
                 var result = jsCli.AdminConsole.ApplyScript(adminJsScript);
 
                 if (cli._consoleColoring)
@@ -1126,7 +1126,7 @@ namespace Raven.Server.Utils.Cli
                 SizeClient.Humane(MemoryInformation.GetWorkingSetInBytes()),
                 SizeClient.Humane(AbstractLowMemoryMonitor.GetUnmanagedAllocationsInBytes()),
                 SizeClient.Humane(AbstractLowMemoryMonitor.GetManagedMemoryInBytes()),
-                SizeClient.Humane(MemoryInformation.GetTotalScratchAllocatedMemory()),
+                SizeClient.Humane(MemoryInformation.GetTotalScratchAllocatedMemoryInBytes()),
                 SizeClient.Humane(totalMemoryMapped));
         }
 
@@ -1136,7 +1136,7 @@ namespace Raven.Server.Utils.Cli
             WriteText($"ImportDir for database {args[0]} from dir `{args[1]}` to {cli._server.ServerStore.GetNodeHttpServerUrl()}", ConsoleColor.Yellow, cli);
 
             var url = $"{cli._server.ServerStore.GetNodeHttpServerUrl()}/databases/{args[0]}/smuggler/import-dir?dir={args[1]}";
-            using (var client = new HttpClient())
+            using (var client = new RavenHttpClient())
             {
                 WriteText("Sending at " + DateTime.UtcNow, TextColor, cli);
                 var result = client.GetAsync(url).Result;
@@ -1253,7 +1253,7 @@ namespace Raven.Server.Utils.Cli
             [Command.TrustServerCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandTrustServerCert },
             [Command.TrustClientCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandTrustClientCert },
             [Command.GenerateClientCert] = new SingleAction { NumOfArgs = 3, DelegateFunc = CommandGenerateClientCert },
-            [Command.ReplaceClusterCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandReplaceClusterCert },
+            [Command.ReplaceClusterCert] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandReplaceClusterCert },
             [Command.TriggerCertificateRefresh] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandTriggerCertificateRefresh },
             [Command.Info] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandInfo },
             [Command.Logo] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandLogo },

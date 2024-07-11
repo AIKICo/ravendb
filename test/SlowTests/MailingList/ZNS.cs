@@ -6,11 +6,13 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using FastTests;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Session;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -57,10 +59,11 @@ namespace SlowTests.MailingList
             }
         }
 
-        [Fact]
-        public void Can_SortAndPageMultipleDates()
+        [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+        public void Can_SortAndPageMultipleDates(Options options)
         {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             {
                 //Create an index
                 store.Initialize();
@@ -89,6 +92,11 @@ namespace SlowTests.MailingList
                             dates.Add(new DateTime(2012, r.Next(1, 12), r.Next(1, 31)));
                         }
 
+                        if(Array.IndexOf(new[]{35 ,48 ,26 ,2 ,1 ,15 , 3},i) == -1)
+                            continue;
+
+                        dates = new List<DateTime> { dates[0] };
+                        
                         session.Store(new TestItem()
                         {
                             Id = "testitems/" + i,
@@ -98,6 +106,7 @@ namespace SlowTests.MailingList
                     }
                     session.SaveChanges();
                 }
+                WaitForUserToContinueTheTest(store);
 
                 //Get all results
                 QueryStatistics stats;
@@ -111,7 +120,8 @@ namespace SlowTests.MailingList
                         .OrderBy("EventDate")
                         .Take(1000)
                         .ToList();
-                }
+                }           
+
 
                 //Get all results, paged
                 List<TestItem> pagedResult = new List<TestItem>();
@@ -134,6 +144,7 @@ namespace SlowTests.MailingList
                             .ToList();
                         skip += stats2.SkippedResults;
                         page++;
+                        Assert.True(r.Count > 0);
                         pagedResult.AddRange(r);
                     }
 

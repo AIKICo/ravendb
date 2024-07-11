@@ -7,6 +7,7 @@ using Raven.Server.Dashboard;
 using Raven.Server.Utils.Cpu;
 using Sparrow.Logging;
 using Sparrow.Platform;
+using Sparrow.Server.Utils;
 using Sparrow.Utils;
 
 namespace Raven.Server.Utils
@@ -97,10 +98,23 @@ namespace Raven.Server.Utils
 
                             int? managedThreadId = null;
                             string threadName = null;
+                            long? unmanagedAllocations = null;
+
                             if (threadAllocations.TryGetValue((ulong)thread.Id, out var threadStats))
                             {
-                                threadName = threadStats.Name ?? "Thread Pool Thread";
                                 managedThreadId = threadStats.ManagedThreadId;
+
+                                if (ThreadNames.FullThreadNames.TryGetValue(managedThreadId.Value, out var fullThreadName))
+                                {
+                                    threadName = fullThreadName;
+                                    threadsInfo.DedicatedThreadsCount++;
+                                }
+                                else
+                                {
+                                    threadName = threadStats.Name ?? "Thread Pool Thread";
+                                }
+
+                                unmanagedAllocations = threadStats.TotalAllocated;
                             }
 
                             var threadState = GetThreadInfoOrDefault<ThreadState?>(() => thread.ThreadState);
@@ -110,6 +124,7 @@ namespace Raven.Server.Utils
                                 CpuUsage = threadCpuUsage.Value,
                                 Name = threadName ?? "Unmanaged Thread",
                                 ManagedThreadId = managedThreadId,
+                                UnmanagedAllocationsInBytes = unmanagedAllocations,
 #pragma warning disable CA1416 // Validate platform compatibility
                                 StartingTime = GetThreadInfoOrDefault<DateTime?>(() => thread.StartTime.ToUniversalTime()),
 #pragma warning restore CA1416 // Validate platform compatibility

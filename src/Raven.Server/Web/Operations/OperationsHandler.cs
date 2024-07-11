@@ -29,6 +29,10 @@ namespace Raven.Server.Web.Operations
                     writer.WritePropertyName(nameof(GetNextOperationIdCommand.NodeTag));
                     writer.WriteString(Server.ServerStore.NodeTag);
                     writer.WriteEndObject();
+
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Operations);
+
                 }
             }
         }

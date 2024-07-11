@@ -6,6 +6,7 @@ using System.Threading;
 using Raven.Server.Utils;
 using Sparrow.Server;
 using Sparrow.Threading;
+using Tests.Infrastructure;
 using Voron;
 using Voron.Data.BTrees;
 using Voron.Impl;
@@ -14,7 +15,7 @@ using Constants = Voron.Global.Constants;
 
 namespace FastTests.Voron
 {
-    public abstract class StorageTest : LinuxRaceConditionWorkAround, IDisposable
+    public abstract class StorageTest : ParallelTestBase
     {
         private Lazy<StorageEnvironment> _storageEnvironment;
         public StorageEnvironment Env => _storageEnvironment.Value;
@@ -166,7 +167,7 @@ namespace FastTests.Voron
             return Tuple.Create(item1, item2);
         }
 
-        private void ForceConstantCompressionAcceleration(StorageEnvironmentOptions options)
+        protected void ForceConstantCompressionAcceleration(StorageEnvironmentOptions options)
         {
             options.ForTestingPurposesOnly().WriteToJournalCompressionAcceleration = 1;
         }

@@ -331,7 +331,8 @@ namespace Raven.Server.Documents.TimeSeries
             deletionRangeRequest.From = EnsureMillisecondsPrecision(deletionRangeRequest.From);
             deletionRangeRequest.To = EnsureMillisecondsPrecision(deletionRangeRequest.To);
 
-            if (InsertDeletedRange(context, deletionRangeRequest, remoteChangeVector) == null)
+            remoteChangeVector = InsertDeletedRange(context, deletionRangeRequest, remoteChangeVector);
+            if (remoteChangeVector == null)
                 return null;
 
             var collection = deletionRangeRequest.Collection;
@@ -436,9 +437,10 @@ namespace Raven.Server.Documents.TimeSeries
 
                         if (canDeleteEntireSegment && readOnlySegment.NumberOfLiveEntries > 1)
                         {
-                            deleted = readOnlySegment.NumberOfLiveEntries;
-                            holder.AddNewValue(baseline, new double[numberOfValues], Slices.Empty.AsSpan(), ref newSegment, TimeSeriesValuesSegment.Dead);
-                            holder.AddNewValue(readOnlySegment.GetLastTimestamp(baseline), new double[numberOfValues], Slices.Empty.AsSpan(), ref newSegment, TimeSeriesValuesSegment.Dead);
+                            deleted += readOnlySegment.NumberOfLiveEntries;
+                            Span<double> emptyValues = stackalloc double[numberOfValues];
+                            holder.AddNewValue(baseline, emptyValues, Slices.Empty.AsSpan(), ref newSegment, TimeSeriesValuesSegment.Dead);
+                            holder.AddNewValue(end, emptyValues, Slices.Empty.AsSpan(), ref newSegment, TimeSeriesValuesSegment.Dead);
                             holder.AppendDeadSegment(newSegment);
                             if (updateMetadata)
                             {
@@ -447,6 +449,7 @@ namespace Raven.Server.Documents.TimeSeries
                                 RemoveTimeSeriesNameFromMetadata(context, slicer.DocId, slicer.Name);
                             }
 
+                            changeVector = holder.ChangeVector;
                             return true;
                         }
 
@@ -487,6 +490,8 @@ namespace Raven.Server.Documents.TimeSeries
                             }
                             changeVector = holder.ChangeVector;
                         }
+                        else if (holder.FromReplication)
+                            holder.UpdateSegmentChangeVector(newSegment);
 
                         return end < to;
                     }
@@ -522,12 +527,12 @@ namespace Raven.Server.Documents.TimeSeries
         {
             var storage = ctx.DocumentDatabase.DocumentsStorage;
 
-            var doc = storage.Get(ctx, docId);
-            if (doc == null)
-                return;
-
             var tss = storage.TimeSeriesStorage;
             if (tss.Stats.GetStats(ctx, docId, tsName).Count > 0)
+                return;
+            
+            var doc = storage.Get(ctx, docId);
+            if (doc == null)
                 return;
 
             var data = doc.Data;
@@ -611,24 +616,28 @@ namespace Raven.Server.Documents.TimeSeries
         {
             // this will be called as part of document's delete
 
+            // create 'DeletedRange' items
+            var seriesNames = Stats.GetTimeSeriesNamesForDocumentOriginalCasing(context, documentId);
+            var deletionRangeRequest = new DeletionRangeRequest
+            {
+                DocumentId = documentId,
+                Collection = collection.Name,
+                From = DateTime.MinValue,
+                To = DateTime.MaxValue
+            };
+            foreach (var name in seriesNames)
+            {
+                deletionRangeRequest.Name = name;
+                InsertDeletedRange(context, deletionRangeRequest);
+            }
+
+            // delete segments, stats and roll-ups
             var table = GetOrCreateTimeSeriesTable(context.Transaction.InnerTransaction, collection);
             using (DocumentIdWorker.GetSliceFromId(context, documentId, out Slice documentKeyPrefix, SpecialChars.RecordSeparator))
             {
                 table.DeleteByPrimaryKeyPrefix(documentKeyPrefix);
                 Stats.DeleteByPrimaryKeyPrefix(context, collection, documentKeyPrefix);
                 Rollups.DeleteByPrimaryKeyPrefix(context, documentKeyPrefix);
-            }
-        }
-
-        public void DeleteTimeSeriesForDocument(DocumentsOperationContext context, string documentId, CollectionName collection, string name)
-        {
-            var table = GetOrCreateTimeSeriesTable(context.Transaction.InnerTransaction, collection);
-            using (var slicer = new TimeSeriesSliceHolder(context, documentId, name, collection.Name))
-            {
-                table.DeleteByPrimaryKeyPrefix(slicer.TimeSeriesPrefixSlice);
-                Stats.DeleteStats(context, collection, slicer.StatsKey);
-                Rollups.DeleteByPrimaryKeyPrefix(context, slicer.StatsKey);
-                RemoveTimeSeriesNameFromMetadata(context, slicer.DocId, slicer.Name);
             }
         }
 
@@ -711,7 +720,7 @@ namespace Raven.Server.Documents.TimeSeries
                     return false;
                 }
 
-                holder.AppendToNewSegment(segment, baseline, changeVector);
+                holder.AppendToNewSegment(segment, baseline);
 
                 context.Transaction.AddAfterCommitNotification(new TimeSeriesChange
                 {
@@ -743,10 +752,9 @@ namespace Raven.Server.Documents.TimeSeries
             using (var holder = new TimeSeriesSegmentHolder(this, context, documentId, name, collectionName, fromReplicationChangeVector: changeVector, timeStamp: baseline))
             {
                 if (holder.LoadClosestSegment() == false)
-                    holder.AppendToNewSegment(segment, baseline, changeVectorFromReplication: changeVector);
+                    holder.AppendToNewSegment(segment, baseline);
                 else
-                    holder.AppendExistingSegment(segment, changeVectorFromReplication: changeVector);
-
+                    holder.AppendExistingSegment(segment);
 
                 context.Transaction.AddAfterCommitNotification(new TimeSeriesChange
                 {
@@ -761,7 +769,6 @@ namespace Raven.Server.Documents.TimeSeries
 
                 return true;
             }
-
         }
 
         public bool EnsureNoOverlap(
@@ -893,6 +900,7 @@ namespace Raven.Server.Documents.TimeSeries
             public DateTime BaselineDate;
             public TimeSeriesValuesSegment ReadOnlySegment;
             public string ReadOnlyChangeVector;
+            public string ChangeVectorFromReplication;
 
             private long _currentEtag;
 
@@ -917,8 +925,7 @@ namespace Raven.Server.Documents.TimeSeries
                 _name = name;
 
                 FromReplication = fromReplicationChangeVector != null;
-                if (context.LastDatabaseChangeVector == null)
-                    _tss.GenerateChangeVector(_context, fromReplicationChangeVector); // update the database change vector
+                ChangeVectorFromReplication = fromReplicationChangeVector;
             }
 
             public TimeSeriesSegmentHolder(
@@ -929,7 +936,7 @@ namespace Raven.Server.Documents.TimeSeries
                 CollectionName collection,
                 DateTime timeStamp,
                 string fromReplicationChangeVector = null
-                ) : this(tss, context, docId, name, collection, fromReplicationChangeVector)
+            ) : this(tss, context, docId, name, collection, fromReplicationChangeVector)
             {
                 SliceHolder = new TimeSeriesSliceHolder(_context, docId, name, _collection.Name).WithBaseline(timeStamp);
                 SliceHolder.CreateSegmentBuffer();
@@ -943,14 +950,12 @@ namespace Raven.Server.Documents.TimeSeries
                 string name,
                 CollectionName collection,
                 AppendOptions options
-                ) : this(tss, context, docId, name, collection, options.ChangeVectorFromReplication)
+            ) : this(tss, context, docId, name, collection, options.ChangeVectorFromReplication)
             {
                 FromSmuggler = options.FromSmuggler;
                 SliceHolder = allocator;
                 BaselineDate = allocator.CurrentBaseline;
                 allocator.CreateSegmentBuffer();
-                if (context.LastDatabaseChangeVector == null)
-                    _tss.GenerateChangeVector(context, options.ChangeVectorFromReplication); // update the database change vector
             }
 
             private void Initialize()
@@ -983,13 +988,36 @@ namespace Raven.Server.Documents.TimeSeries
                 _tss.Stats.UpdateCountOfExistingStats(_context, SliceHolder, _collection, -ReadOnlySegment.NumberOfLiveEntries);
             }
 
-            public long AppendExistingSegment(TimeSeriesValuesSegment newValueSegment, string changeVectorFromReplication = null)
+            private string GetSegmentMergedChangeVector()
+            {
+                if (ReadOnlyChangeVector == null)
+                {
+                    // append new segment - take change vector from replication or create a new one
+                    return ChangeVectorFromReplication ?? _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag);
+                }
+
+                if (ChangeVectorFromReplication == null)
+                {
+                    // local change - merge existing change vector with new database change vector
+                    return ChangeVectorUtils.MergeVectors(ReadOnlyChangeVector, _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag));
+                }
+
+                return ChangeVectorUtils.GetConflictStatus(ChangeVectorFromReplication, ReadOnlyChangeVector) switch
+                {
+                    ConflictStatus.Update => ChangeVectorFromReplication,
+                    ConflictStatus.Conflict => ChangeVectorUtils.MergeVectors(ChangeVectorFromReplication, _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag)),
+                    ConflictStatus.AlreadyMerged => ReadOnlyChangeVector,
+                    _ => throw new ArgumentOutOfRangeException()
+                };
+            }
+
+            public long AppendExistingSegment(TimeSeriesValuesSegment newValueSegment)
             {
                 if (newValueSegment.RecomputeRequired)
                     newValueSegment = newValueSegment.Recompute(_context.Allocator);
 
                 _currentEtag = _tss._documentsStorage.GenerateNextEtag();
-                _currentChangeVector = changeVectorFromReplication ?? _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag);
+                _currentChangeVector = GetSegmentMergedChangeVector();
 
                 ValidateSegment(newValueSegment);
                 if (newValueSegment.NumberOfLiveEntries == 0)
@@ -1019,10 +1047,10 @@ namespace Raven.Server.Documents.TimeSeries
                 return count;
             }
 
-            public void AppendDeadSegment(TimeSeriesValuesSegment newValueSegment, string changeVectorFromReplication = null)
+            public void AppendDeadSegment(TimeSeriesValuesSegment newValueSegment)
             {
                 _currentEtag = _tss._documentsStorage.GenerateNextEtag();
-                _currentChangeVector = changeVectorFromReplication ?? _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag);
+                _currentChangeVector = GetSegmentMergedChangeVector();
 
                 ValidateSegment(newValueSegment);
                 MarkSegmentAsPendingDeletion(_context, _collection.Name, _currentEtag);
@@ -1045,7 +1073,7 @@ namespace Raven.Server.Documents.TimeSeries
                 EnsureStatsAndDataIntegrity(_context, _docId, _name, newValueSegment, _collection, BaselineDate);
             }
 
-            public void AppendToNewSegment(TimeSeriesValuesSegment newSegment, DateTime baseline, string changeVectorFromReplication = null)
+            public void AppendToNewSegment(TimeSeriesValuesSegment newSegment, DateTime baseline)
             {
                 ValidateSegment(newSegment);
 
@@ -1053,7 +1081,7 @@ namespace Raven.Server.Documents.TimeSeries
                 SliceHolder.SetBaselineToKey(BaselineDate);
 
                 _currentEtag = _tss._documentsStorage.GenerateNextEtag();
-                _currentChangeVector = changeVectorFromReplication ?? _tss._documentsStorage.GetNewChangeVector(_context, _currentEtag);
+                _currentChangeVector = GetSegmentMergedChangeVector();
 
                 _tss.Stats.UpdateStats(_context, SliceHolder, _collection, newSegment, BaselineDate, newSegment.NumberOfLiveEntries);
                 _tss._documentDatabase.TimeSeriesPolicyRunner?.MarkSegmentForPolicy(_context, SliceHolder, baseline, _currentChangeVector, newSegment.NumberOfLiveEntries);
@@ -1086,6 +1114,33 @@ namespace Raven.Server.Documents.TimeSeries
                 newSegment.Append(_context.Allocator, 0, item.Values.Span, SliceHolder.TagAsSpan(item.Tag), item.Status);
 
                 AppendToNewSegment(newSegment, item.Timestamp);
+            }
+
+            public void UpdateSegmentChangeVector(TimeSeriesValuesSegment segment)
+            {
+                if (ChangeVectorFromReplication == null || ChangeVectorUtils.GetConflictStatus(ChangeVectorFromReplication, ReadOnlyChangeVector) != ConflictStatus.Conflict)
+                    return;
+
+                _currentEtag = _tss._documentsStorage.GenerateNextEtag();
+                _currentChangeVector = ChangeVectorUtils.MergeVectors(ReadOnlyChangeVector, ChangeVectorFromReplication);
+
+                if (segment.RecomputeRequired)
+                    segment = segment.Recompute(_context.Allocator);
+
+                ValidateSegment(segment);
+
+                using (Slice.From(_context.Allocator, _currentChangeVector, out Slice cv))
+                using (Table.Allocate(out var tvb))
+                {
+                    tvb.Add(SliceHolder.TimeSeriesKeySlice);
+                    tvb.Add(Bits.SwapBytes(_currentEtag));
+                    tvb.Add(cv);
+                    tvb.Add(segment.Ptr, segment.NumberOfBytes);
+                    tvb.Add(SliceHolder.CollectionSlice);
+                    tvb.Add(_context.GetTransactionMarker());
+
+                    Table.Set(tvb);
+                }
             }
 
             public void AddNewValue(SingleResult result, ref TimeSeriesValuesSegment segment)
@@ -2001,6 +2056,8 @@ namespace Raven.Server.Documents.TimeSeries
 
                     if (segmentChanged)
                         timeSeriesSegment.AppendExistingSegment(splitSegment);
+                    else if (timeSeriesSegment.FromReplication)
+                        timeSeriesSegment.UpdateSegmentChangeVector(splitSegment);
 
                     return retryAppend;
                 }
@@ -2428,17 +2485,17 @@ namespace Raven.Server.Documents.TimeSeries
             return item;
         }
 
-        public TimeSeriesSegmentEntry GetTimeSeries(DocumentsOperationContext context, Slice key)
+        public TimeSeriesSegmentEntry GetTimeSeries(DocumentsOperationContext context, Slice key, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All)
         {
             var table = new Table(TimeSeriesSchema, context.Transaction.InnerTransaction);
 
             if (table.ReadByKey(key, out var reader) == false)
                 return null;
 
-            return CreateTimeSeriesItem(context, ref reader);
+            return CreateTimeSeriesItem(context, ref reader, fields);
         }
 
-        public TimeSeriesSegmentEntry GetTimeSeries(DocumentsOperationContext context, long etag)
+        public TimeSeriesSegmentEntry GetTimeSeries(DocumentsOperationContext context, long etag, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All)
         {
             var table = new Table(TimeSeriesSchema, context.Transaction.InnerTransaction);
             var index = TimeSeriesSchema.FixedSizeIndexes[AllTimeSeriesEtagSlice];
@@ -2446,13 +2503,13 @@ namespace Raven.Server.Documents.TimeSeries
             if (table.Read(context.Allocator, index, etag, out var tvr) == false)
                 return null;
 
-            return CreateTimeSeriesItem(context, ref tvr);
+            return CreateTimeSeriesItem(context, ref tvr, fields);
         }
 
-        public IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, long etag, long take) =>
-            GetTimeSeries(context, etag, long.MaxValue, take);
+        public IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, long etag, long take, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All) =>
+            GetTimeSeries(context, etag, long.MaxValue, take, fields);
 
-        private static IEnumerable<TimeSeriesSegmentEntry> GetTimeSeries(DocumentsOperationContext context, long fromEtag, long toEtag, long take = long.MaxValue)
+        private static IEnumerable<TimeSeriesSegmentEntry> GetTimeSeries(DocumentsOperationContext context, long fromEtag, long toEtag, long take = long.MaxValue, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All)
         {
             var table = new Table(TimeSeriesSchema, context.Transaction.InnerTransaction);
 
@@ -2461,7 +2518,7 @@ namespace Raven.Server.Documents.TimeSeries
                 if (take-- <= 0)
                     yield break;
 
-                var item = CreateTimeSeriesItem(context, ref result.Reader);
+                var item = CreateTimeSeriesItem(context, ref result.Reader, fields);
                 if (item.Etag > toEtag)
                     yield break;
 
@@ -2469,10 +2526,10 @@ namespace Raven.Server.Documents.TimeSeries
             }
         }
 
-        public IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, string collection, long etag, long take) =>
-            GetTimeSeriesFrom(context, collection, etag, long.MaxValue, take);
+        public IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, string collection, long etag, long take, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All) =>
+            GetTimeSeriesFrom(context, collection, etag, long.MaxValue, take, fields);
 
-        public IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, string collection, long fromEtag, long toEtag, long take)
+        private IEnumerable<TimeSeriesSegmentEntry> GetTimeSeriesFrom(DocumentsOperationContext context, string collection, long fromEtag, long toEtag, long take, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All)
         {
             var collectionName = _documentsStorage.GetCollection(collection, throwIfDoesNotExist: false);
             if (collectionName == null)
@@ -2488,7 +2545,7 @@ namespace Raven.Server.Documents.TimeSeries
                 if (take-- <= 0)
                     yield break;
 
-                var item = CreateTimeSeriesItem(context, ref result.Reader);
+                var item = CreateTimeSeriesItem(context, ref result.Reader, fields);
                 if (item.Etag > toEtag)
                     yield break;
 
@@ -2496,30 +2553,87 @@ namespace Raven.Server.Documents.TimeSeries
             }
         }
 
-        internal static TimeSeriesSegmentEntry CreateTimeSeriesItem(JsonOperationContext context, ref TableValueReader reader)
+        internal static TimeSeriesSegmentEntry CreateTimeSeriesItem(JsonOperationContext context, ref TableValueReader reader, TimeSeriesSegmentEntryFields fields = TimeSeriesSegmentEntryFields.All)
         {
-            var etag = *(long*)reader.Read((int)TimeSeriesTable.Etag, out _);
-            var changeVectorPtr = reader.Read((int)TimeSeriesTable.ChangeVector, out int changeVectorSize);
-            var segmentPtr = reader.Read((int)TimeSeriesTable.Segment, out int segmentSize);
-            var keyPtr = reader.Read((int)TimeSeriesTable.TimeSeriesKey, out int keySize);
-
-            TimeSeriesValuesSegment.ParseTimeSeriesKey(keyPtr, keySize, context, out var docId, out var lowerName, out var baseline);
-
-            var luceneKey = ToLuceneKey(context, docId, lowerName, baseline);
-
-            return new TimeSeriesSegmentEntry
+            if (fields.Contain(TimeSeriesSegmentEntryFields.All))
             {
-                Key = new LazyStringValue(null, keyPtr, keySize, context),
-                LuceneKey = luceneKey,
-                DocId = docId,
-                Name = lowerName,
-                ChangeVector = Encoding.UTF8.GetString(changeVectorPtr, changeVectorSize),
-                Segment = new TimeSeriesValuesSegment(segmentPtr, segmentSize),
-                SegmentSize = segmentSize,
-                Collection = DocumentsStorage.TableValueToId(context, (int)TimeSeriesTable.Collection, ref reader),
-                Start = baseline,
-                Etag = Bits.SwapBytes(etag),
-            };
+                var etag = *(long*)reader.Read((int)TimeSeriesTable.Etag, out _);
+                var changeVectorPtr = reader.Read((int)TimeSeriesTable.ChangeVector, out int changeVectorSize);
+                var segmentPtr = reader.Read((int)TimeSeriesTable.Segment, out int segmentSize);
+                var keyPtr = reader.Read((int)TimeSeriesTable.TimeSeriesKey, out int keySize);
+
+                TimeSeriesValuesSegment.ParseTimeSeriesKey(keyPtr, keySize, context, out var docId, out var lowerName, out var baseline);
+
+                var luceneKey = ToLuceneKey(context, docId, lowerName, baseline);
+
+                return new TimeSeriesSegmentEntry
+                {
+                    Key = new LazyStringValue(null, keyPtr, keySize, context),
+                    LuceneKey = luceneKey,
+                    DocId = docId,
+                    Name = lowerName,
+                    ChangeVector = Encoding.UTF8.GetString(changeVectorPtr, changeVectorSize),
+                    Segment = new TimeSeriesValuesSegment(segmentPtr, segmentSize),
+                    SegmentSize = segmentSize,
+                    Collection = DocumentsStorage.TableValueToId(context, (int)TimeSeriesTable.Collection, ref reader),
+                    Start = baseline,
+                    Etag = Bits.SwapBytes(etag),
+                };
+            }
+
+            return CreateTimeSeriesItemPartial(context, ref reader, fields);
+
+            static TimeSeriesSegmentEntry CreateTimeSeriesItemPartial(JsonOperationContext context, ref TableValueReader reader, TimeSeriesSegmentEntryFields fields)
+            {
+                var result = new TimeSeriesSegmentEntry();
+
+                if (fields.Contain(TimeSeriesSegmentEntryFields.Key))
+                {
+                    var keyPtr = reader.Read((int)TimeSeriesTable.TimeSeriesKey, out int keySize);
+
+                    result.Key = new LazyStringValue(null, keyPtr, keySize, context);
+
+                    if (fields.Contain(TimeSeriesSegmentEntryFields.DocIdNameAndStart))
+                    {
+                        TimeSeriesValuesSegment.ParseTimeSeriesKey(keyPtr, keySize, context, out var docId, out var lowerName, out var baseline);
+
+                        result.DocId = docId;
+                        result.Name = lowerName;
+                        result.Start = baseline;
+
+                        if (fields.Contain(TimeSeriesSegmentEntryFields.LuceneKey))
+                        {
+                            result.LuceneKey = ToLuceneKey(context, docId, lowerName, baseline);
+                        }
+                    }
+                }
+
+                if (result.DocId == null && fields.Contain(TimeSeriesSegmentEntryFields.DocIdNameAndStart))
+                    throw new InvalidOperationException($"Cannot request '{nameof(TimeSeriesSegmentEntryFields.DocIdNameAndStart)}' fields if '{nameof(TimeSeriesSegmentEntryFields.Key)}' field is not requested");
+
+                if (result.LuceneKey == null && fields.Contain(TimeSeriesSegmentEntryFields.LuceneKey))
+                    throw new InvalidOperationException($"Cannot request '{nameof(TimeSeriesSegmentEntryFields.LuceneKey)}' fields if '{nameof(TimeSeriesSegmentEntryFields.DocIdNameAndStart)}' field is not requested");
+
+                if (fields.Contain(TimeSeriesSegmentEntryFields.ChangeVector))
+                {
+                    var changeVectorPtr = reader.Read((int)TimeSeriesTable.ChangeVector, out int changeVectorSize);
+                    result.ChangeVector = Encoding.UTF8.GetString(changeVectorPtr, changeVectorSize);
+                }
+
+                if (fields.Contain(TimeSeriesSegmentEntryFields.Segment))
+                {
+                    var segmentPtr = reader.Read((int)TimeSeriesTable.Segment, out int segmentSize);
+                    result.Segment = new TimeSeriesValuesSegment(segmentPtr, segmentSize);
+                    result.SegmentSize = segmentSize;
+                }
+
+                if (fields.Contain(TimeSeriesSegmentEntryFields.Collection))
+                    result.Collection = DocumentsStorage.TableValueToId(context, (int)TimeSeriesTable.Collection, ref reader);
+
+                result.Etag = Bits.SwapBytes(*(long*)reader.Read((int)TimeSeriesTable.Etag, out _));
+
+                return result;
+            }
 
             static LazyStringValue ToLuceneKey(JsonOperationContext context, LazyStringValue documentId, LazyStringValue name, DateTime baseline)
             {

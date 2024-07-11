@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Util;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents;
@@ -26,7 +27,7 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/bulk_insert", "POST", AuthorizationStatus.ValidUser, EndpointType.Write, DisableOnCpuCreditsExhaustion = true)]
         public async Task BulkInsert()
         {
-            var operationCancelToken = CreateOperationToken();
+            var operationCancelToken = CreateHttpRequestBoundOperationToken();
             var id = GetLongQueryString("id");
             var skipOverwriteIfUnchanged = GetBoolValueQueryString("skipOverwriteIfUnchanged", required: false) ?? false;
 
@@ -52,6 +53,12 @@ namespace Raven.Server.Documents.Handlers
                     {
                         currentCtxReset = ContextPool.AllocateOperationContext(out JsonOperationContext docsCtx);
                         var requestBodyStream = RequestBodyStream();
+
+                        if (Database.ForTestingPurposes?.BulkInsertStreamReadTimeout > 0)
+                        {
+                            var streamWithTimeout = (StreamWithTimeout)requestBodyStream;
+                            streamWithTimeout.ReadTimeout = Database.ForTestingPurposes.BulkInsertStreamReadTimeout;
+                        }
 
                         using (var parser = new BatchRequestParser.ReadMany(context, requestBodyStream, buffer, token))
                         {
@@ -89,7 +96,6 @@ namespace Raven.Server.Documents.Handlers
                                                 SkipOverwriteIfUnchanged = skipOverwriteIfUnchanged
                                             });
                                         }
-
                                         ClearStreamsTempFiles();
 
                                         progress.BatchCount++;
@@ -97,7 +103,6 @@ namespace Raven.Server.Documents.Handlers
                                         progress.LastProcessedId = array[numberOfCommands - 1].Id;
 
                                         onProgress(progress);
-
                                         previousCtxReset?.Dispose();
                                         previousCtxReset = currentCtxReset;
                                         currentCtxReset = ContextPool.AllocateOperationContext(out docsCtx);
@@ -110,6 +115,9 @@ namespace Raven.Server.Documents.Handlers
                                     var commandData = await task;
                                     if (commandData.Type == CommandType.None)
                                         break;
+
+                                    if (commandData.Type == CommandType.HeartBeat)
+                                        continue;
 
                                     if (commandData.Type == CommandType.AttachmentPUT)
                                     {

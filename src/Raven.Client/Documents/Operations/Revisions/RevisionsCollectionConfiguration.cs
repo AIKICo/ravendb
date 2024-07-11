@@ -37,7 +37,8 @@ namespace Raven.Client.Documents.Operations.Revisions
             unchecked
             {
                 var hashCode = MinimumRevisionsToKeep?.GetHashCode() ?? 0;
-                hashCode = (hashCode * 397) ^ MinimumRevisionAgeToKeep?.GetHashCode() ?? 0;
+                hashCode = (hashCode * 397) ^ (MinimumRevisionAgeToKeep?.GetHashCode() ?? 0);
+                hashCode = (hashCode * 397) ^ (MaximumRevisionsToDeleteUponDocumentUpdate?.GetHashCode() ?? 0);
                 hashCode = (hashCode * 397) ^ Disabled.GetHashCode();
                 hashCode = (hashCode * 397) ^ PurgeOnDelete.GetHashCode();
                 return hashCode;
@@ -54,6 +55,11 @@ namespace Raven.Client.Documents.Operations.Revisions
                 [nameof(PurgeOnDelete)] = PurgeOnDelete,
                 [nameof(MaximumRevisionsToDeleteUponDocumentUpdate)] = MaximumRevisionsToDeleteUponDocumentUpdate
             };
+        }
+
+        public DynamicJsonValue ToAuditJson()
+        {
+            return ToJson();
         }
     }
 }

@@ -130,10 +130,12 @@ namespace Sparrow.Server.Compression
             // Include prefixes and boundaries for every case until we hit the most frequent start key first character. 
             FillInSingleChar(0, mostFrequentSymbols[0].StartKey[0], intervalPrefixes, intervalBoundaries);
 
-            Span<byte> localAuxiliaryKey = stackalloc byte[GramSize];
+            Span<byte> auxiliaryKey = stackalloc byte[GramSize];
 
             for (int i = 0; i < mostFrequentSymbols.Count - 1; i++)
             {
+                var localAuxiliaryKey = auxiliaryKey;
+
                 var key1 = new Symbol(mostFrequentSymbols[i].StartKey);
                 var key2 = new Symbol(mostFrequentSymbols[i + 1].StartKey);
 
@@ -286,6 +288,13 @@ namespace Sparrow.Server.Compression
                 for (int j = 0; j < key.Length - GramSize + 1; j++)
                 {
                     var slice = key.Slice(j, GramSize);
+                    Debug.Assert(slice.Length == GramSize);
+
+                    // To support nulls, we need to ensure that we are not going to be counting any symbol that has nulls 
+                    // in it's content to force the frequency of such an even to go to 0. 
+                    // https://issues.hibernatingrhinos.com/issue/RavenDB-19703
+                    if (slice[0] == 0 || slice[1] == 0 || slice[2] == 0)
+                        continue;
 
                     int sliceDescriptor = slice[0] << 16 | slice[1] << 8 | slice[2];
                     if (!frequencyMap.TryGetValue(sliceDescriptor, out var frequency))

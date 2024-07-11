@@ -2,8 +2,8 @@
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Exceptions.Database;
 using Raven.Client.Exceptions.Documents.Subscriptions;
+using Raven.Client.Json.Serialization;
 using Raven.Client.ServerWide;
-using Raven.Server.Rachis;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 
@@ -26,13 +26,13 @@ namespace Raven.Server.ServerWide.Commands.Subscriptions
 
         public override string GetItemId() => SubscriptionState.GenerateSubscriptionItemKeyName(DatabaseName, SubscriptionName);
 
-        protected override BlittableJsonReaderObject GetUpdatedValue(long index, RawDatabaseRecord record, JsonOperationContext context, BlittableJsonReaderObject existingValue)
+        protected override UpdatedValue GetUpdatedValue(long index, RawDatabaseRecord record, JsonOperationContext context, BlittableJsonReaderObject existingValue)
         {
             var itemId = GetItemId();
             if (existingValue == null)
                 throw new SubscriptionDoesNotExistException($"Subscription with id '{itemId}' does not exist");
 
-            var subscription = JsonDeserializationCluster.SubscriptionState(existingValue);
+            var subscription = JsonDeserializationClient.SubscriptionState(existingValue);
 
             var topology = record.Topology;
             var lastResponsibleNode = AcknowledgeSubscriptionBatchCommand.GetLastResponsibleNode(HasHighlyAvailableTasks, topology, NodeTag);
@@ -49,7 +49,7 @@ namespace Raven.Server.ServerWide.Commands.Subscriptions
             subscription.LastClientConnectionTime = LastClientConnectionTime;
             subscription.NodeTag = NodeTag;
 
-            return context.ReadObject(subscription.ToJson(), itemId);
+            return new UpdatedValue(UpdatedValueActionType.Update, context.ReadObject(subscription.ToJson(), itemId));
         }
 
         public override void FillJson(DynamicJsonValue json)

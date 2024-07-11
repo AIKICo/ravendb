@@ -2,14 +2,13 @@
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
-using System.Data.SqlClient;
+using Microsoft.Data.SqlClient;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
-using MySql.Data.MySqlClient;
 using NpgsqlTypes;
 using Oracle.ManagedDataAccess.Client;
 using Raven.Client.Documents.Operations.ETL.SQL;
@@ -51,6 +50,16 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
             _commandBuilder = _providerFactory.InitializeCommandBuilder();
             _connection = _providerFactory.CreateConnection();
             var connectionString = etl.Configuration.Connection.ConnectionString;
+
+            if (_etl.Configuration.Connection.FactoryName == "System.Data.SqlClient" &&
+                SqlConnectionStringParser.GetConnectionStringValue(connectionString, new string[] { "Encrypt" }) == null)
+            {
+                // We want to ensure compatibility between deprecated System.Data.SqlClient (where Encrypt parameter defaults to false)
+                // and Microsoft.Data.SqlClient which defaults it to SqlConnectionEncryptOption.Mandatory. If no option is provided,
+                // we set it to SqlConnectionEncryptOption.Optional (equivalent of false).
+                connectionString = SqlConnectionStringUtil.GetConnectionStringWithOptionalEncrypt(connectionString);
+            }
+            
             _connection.ConnectionString = connectionString;
 
             OpenConnection(database, etl.Configuration.Name, etl.Configuration.ConnectionStringName);
@@ -174,6 +183,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                 sp.Restart();
 
                 using (var cmd = CreateCommand())
+                using (token.Register(cmd.Cancel))
                 {
                     token.ThrowIfCancellationRequested();
 
@@ -230,15 +240,19 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                     }
                     catch (Exception e)
                     {
-                        if (_logger.IsInfoEnabled)
+                        if (token.IsCancellationRequested == false)
                         {
-                            _logger.Info(
-                                $"Failed to replicate changes to relational database for: {_etl.Name} " +
-                                $"(doc: {itemToReplicate.DocumentId}), will continue trying. {Environment.NewLine}{cmd.CommandText}", e);
-                        }
+                            if (_logger.IsInfoEnabled)
+                            {
+                                _logger.Info(
+                                    $"Failed to replicate changes to relational database for: {_etl.Name} " +
+                                    $"(doc: {itemToReplicate.DocumentId}), will continue trying. {Environment.NewLine}{cmd.CommandText}", e);
+                            }
 
-                        _etl.Statistics.RecordLoadError($"Insert statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}. Error:{Environment.NewLine}{e}",
-                            itemToReplicate.DocumentId);
+                            _etl.Statistics.RecordLoadError(
+                                $"Insert statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}. Error:{Environment.NewLine}{e}",
+                                itemToReplicate.DocumentId);
+                        }
                     }
                     finally
                     {
@@ -246,7 +260,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
 
                         var elapsedMilliseconds = sp.ElapsedMilliseconds;
 
-                        if (_logger.IsInfoEnabled)
+                        if (_logger.IsInfoEnabled && token.IsCancellationRequested == false)
                             _logger.Info($"Insert took: {elapsedMilliseconds:#,#;;0}ms, statement: {stmt}");
 
                         var tableMetrics = _etl.SqlMetrics.GetTableMetrics(tableName);
@@ -293,6 +307,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
 
             var sp = new Stopwatch();
             using (var cmd = CreateCommand())
+            using (token.Register(cmd.Cancel))
             {
                 sp.Start();
                 token.ThrowIfCancellationRequested();
@@ -347,11 +362,15 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                     }
                     catch (Exception e)
                     {
-                        if (_logger.IsInfoEnabled)
-                            _logger.Info($"Failure to replicate deletions to relational database for: {_etl.Name}, " +
-                                         "will continue trying." + Environment.NewLine + cmd.CommandText, e);
+                        if (token.IsCancellationRequested == false)
+                        {
+                            if (_logger.IsInfoEnabled)
+                                _logger.Info($"Failure to replicate deletions to relational database for: {_etl.Name}, " +
+                                             "will continue trying." + Environment.NewLine + cmd.CommandText, e);
 
-                        _etl.Statistics.RecordLoadError($"Delete statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}Error:{Environment.NewLine}{e}", null);
+                            _etl.Statistics.RecordLoadError($"Delete statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}Error:{Environment.NewLine}{e}",
+                                null);
+                        }
                     }
                     finally
                     {
@@ -359,7 +378,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
 
                         var elapsedMilliseconds = sp.ElapsedMilliseconds;
 
-                        if (_logger.IsInfoEnabled)
+                        if (_logger.IsInfoEnabled && token.IsCancellationRequested == false)
                             _logger.Info($"Delete took: {elapsedMilliseconds:#,#;;0}ms, statement: {stmt}");
 
                         var tableMetrics = _etl.SqlMetrics.GetTableMetrics(tableName);
@@ -410,6 +429,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
             {
                 case "SqlClientFactory":
                 case "MySqlClientFactory":
+                case "MySqlConnectorFactory":
                     return "@" + paramName;
 
                 case "OracleClientFactory":
@@ -417,7 +437,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                     return ":" + paramName;
 
                 default:
-                    throw new NotImplementedException();
+                    throw new NotSupportedException($"Unhandled provider factory: {_providerFactory.GetType().Name}");
             }
         }
 
@@ -505,12 +525,12 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                                         if (colParam is Npgsql.NpgsqlParameter || colParam is SqlParameter)
                                             colParam.Value = guid;
 
-                                        if (colParam is MySqlParameter mySqlParameter)
+                                        if (colParam is MySqlConnector.MySqlParameter mySqlConnectorParameter) 
                                         {
                                             var arr = guid.ToByteArray();
-                                            mySqlParameter.Value = arr;
-                                            mySqlParameter.MySqlDbType = MySqlDbType.Binary;
-                                            mySqlParameter.Size = arr.Length;
+                                            mySqlConnectorParameter.Value = arr;
+                                            mySqlConnectorParameter.MySqlDbType = MySqlConnector.MySqlDbType.Binary;
+                                            mySqlConnectorParameter.Size = arr.Length;
                                             break;
                                         }
                                     }
@@ -534,8 +554,9 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                                             ((Npgsql.NpgsqlParameter)colParam).NpgsqlDbType = npgsqlType;
                                             break;
                                         case SqlProvider.MySqlClient:
-                                            MySqlDbType mySqlDbType = ParseProviderSpecificParameterType<MySqlDbType>(dbTypeString);
-                                            ((MySqlParameter)colParam).MySqlDbType = mySqlDbType;
+                                        case SqlProvider.MySqlConnectorFactory:
+                                            MySqlConnector.MySqlDbType mySqlConnectorDbType = ParseProviderSpecificParameterType<MySqlConnector.MySqlDbType>(dbTypeString);
+                                            ((MySqlConnector.MySqlParameter)colParam).MySqlDbType = mySqlConnectorDbType;
                                             break;
                                         case SqlProvider.OracleClient:
                                             OracleDbType oracleDbType = ParseProviderSpecificParameterType<OracleDbType>(dbTypeString);
@@ -691,15 +712,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                     {
                         if (DateTime.TryParseExact(value, DefaultFormat.OnlyDateTimeFormat, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime dateTime))
                         {
-                            switch (_providerFactory.GetType().Name)
-                            {
-                                case "MySqlClientFactory":
-                                    colParam.Value = dateTime.ToString("yyyy-MM-dd HH:mm:ss.ffffff");
-                                    break;
-                                default:
-                                    colParam.Value = dateTime;
-                                    break;
-                            }
+                            colParam.Value = dateTime;
                             return true;
                         }
                     }
@@ -712,15 +725,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                         if (DateTimeOffset.TryParseExact(value, DefaultFormat.DateTimeFormatsToRead, CultureInfo.InvariantCulture,
                             DateTimeStyles.RoundtripKind, out DateTimeOffset dateTimeOffset))
                         {
-                            switch (_providerFactory.GetType().Name)
-                            {
-                                case "MySqlClientFactory":
-                                    colParam.Value = dateTimeOffset.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss.ffffff");
-                                    break;
-                                default:
-                                    colParam.Value = dateTimeOffset;
-                                    break;
-                            }
+                            colParam.Value = dateTimeOffset;
                             return true;
                         }
                     }

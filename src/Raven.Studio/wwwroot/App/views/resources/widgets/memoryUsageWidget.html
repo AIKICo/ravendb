@@ -36,6 +36,14 @@
                                 <div class="details-item-name">Unmanaged Allocations</div>
                                 <div class="details-item-value" data-bind="text: sizeFormatter(unmanagedAllocations())"></div>
                             </div>
+                            <div class="details-item">
+                                <div class="details-item-name">Lucene Term Cache Allocations</div>
+                                <div class="details-item-value" data-bind="text: sizeFormatter(luceneManagedTermCacheAllocations())"></div>
+                            </div>
+                            <div class="details-item">
+                                <div class="details-item-name">Lucene Unmanaged Allocations</div>
+                                <div class="details-item-value" data-bind="text: sizeFormatter(luceneUnmanagedAllocations())"></div>
+                            </div>
                             <div class="details-item" data-bind="visible: showEncryptionBuffers">
                                 <div class="details-item-name">Encryption Buffers in Use</div>
                                 <div class="details-item-value" data-bind="text: sizeFormatter(encryptionBuffersInUse())"></div>
@@ -81,7 +89,11 @@
                         <div class="details-list">
                             <div class="details-item">
                                 <div class="details-item-name">Swap</div>
-                                <div class="details-item-value" data-bind="text: sizeFormatter(swap())"></div>
+                                <div class="details-item-value">
+                                    <span data-bind="text: sizeFormatter(totalSwapUsage())" title="Swap in use"></span>
+                                    /
+                                    <span data-bind="text: sizeFormatter(totalSwap())" title="Total Swap"></span>
+                                </div>
                             </div>
                             <div class="details-item">
                                 <div class="details-item-name">Available</div>

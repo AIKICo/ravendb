@@ -11,13 +11,10 @@ using Jint.Native.Object;
 using Jint.Runtime;
 using Lucene.Net.Documents;
 using Lucene.Net.Store;
-using Microsoft.Extensions.Azure;
-using Raven.Client;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Linq;
 using Raven.Client.Exceptions;
 using Raven.Server.Documents.Includes;
-using Raven.Server.Documents.Indexes;
-using Raven.Server.Documents.Indexes.Persistence.Corax;
 using Raven.Server.Documents.Indexes.Persistence.Lucene.Documents;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.Queries.AST;
@@ -30,13 +27,16 @@ using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Server.Json.Sync;
-using Voron;
 using Constants = Raven.Client.Constants;
+using IndexField = Raven.Server.Documents.Indexes.IndexField;
+using RangeType = Raven.Client.Documents.Indexes.RangeType;
 
 namespace Raven.Server.Documents.Queries.Results
 {
     public abstract class QueryResultRetrieverBase : IQueryResultRetriever
     {
+        public static readonly int LoadedDocumentsCacheSize = 16 * 1024;
+
         public static readonly Lucene.Net.Search.ScoreDoc ZeroScore = new Lucene.Net.Search.ScoreDoc(-1, 0f);
 
         public static readonly Lucene.Net.Search.ScoreDoc OneScore = new Lucene.Net.Search.ScoreDoc(-1, 1f);
@@ -49,7 +49,7 @@ namespace Raven.Server.Documents.Queries.Results
         private readonly IncludeCompareExchangeValuesCommand _includeCompareExchangeValuesCommand;
         private readonly BlittableJsonTraverser _blittableTraverser;
 
-        private Dictionary<string, Document> _loadedDocuments;
+        private LruDictionary<string, Document> _loadedDocuments;
         private Dictionary<string, Document> _loadedDocumentsByAliasName;
         private HashSet<string> _loadedDocumentIds;
 
@@ -118,7 +118,9 @@ namespace Raven.Server.Documents.Queries.Results
 
         public abstract (Document Document, List<Document> List) Get(ref RetrieverInput retrieverInput, CancellationToken token);
 
-        public abstract bool TryGetKey(ref RetrieverInput retrieverInput, out string key);
+        public abstract bool TryGetKeyLucene(ref RetrieverInput retrieverInput, out string key);
+
+        public abstract bool TryGetKeyCorax(IndexSearcher searcher, long id, out UnmanagedSpan key);
 
         public abstract Document DirectGet(ref RetrieverInput retrieverInput, string id, DocumentFields fields);
 
@@ -158,12 +160,12 @@ namespace Raven.Server.Documents.Queries.Results
 
                 Dictionary<string, FieldsToFetch.FieldToFetch> fields = null;
 
-                if (SearchEngineType == SearchEngineType.Lucene)
+               
+                if (FieldsToFetch.ExtractAllFromIndex)
                 {
-
-                    if (FieldsToFetch.ExtractAllFromIndex)
+                    if (retrieverInput.IsLuceneDocument())
                     {
-                        fields = retrieverInput.LuceneDocument.GetFields()
+                        fields = retrieverInput.LuceneDocument!.GetFields()
                             .Where(x => x.Name != Constants.Documents.Indexing.Fields.DocumentIdFieldName
                                         && x.Name != Constants.Documents.Indexing.Fields.SourceDocumentIdFieldName
                                         && x.Name != Constants.Documents.Indexing.Fields.ReduceKeyHashFieldName
@@ -173,7 +175,19 @@ namespace Raven.Server.Documents.Queries.Results
                             .Distinct(UniqueFieldNames.Instance)
                             .ToDictionary(x => x.Name, x => new FieldsToFetch.FieldToFetch(x.Name, null, null, x.IsStored, isDocumentId: false, isTimeSeries: false));
                     }
+                    else
+                    {
+                        fields = retrieverInput.KnownFields.Where(i => i.FieldNameAsString.In(
+                                Constants.Documents.Indexing.Fields.DocumentIdFieldName,
+                                Constants.Documents.Indexing.Fields.SourceDocumentIdFieldName,
+                                Constants.Documents.Indexing.Fields.ReduceKeyHashFieldName,
+                                Constants.Documents.Indexing.Fields.ReduceKeyValueFieldName,
+                                Constants.Documents.Indexing.Fields.ValueFieldName) == false)
+                            .ToDictionary(x => x.FieldNameAsString, x => new FieldsToFetch.FieldToFetch(x.FieldNameAsString, null, null, true
+                                , isDocumentId: false, isTimeSeries: false));
+                    }
                 }
+                
 
                 if (fields == null)
                 {
@@ -359,11 +373,6 @@ namespace Raven.Server.Documents.Queries.Results
                     return r;
                 foreach (Document item in r.List)
                 {
-                    // https://issues.hibernatingrhinos.com/issue/RavenDB-19350
-                    // We need to have a different instance of the strings, otherwise, they
-                    // will be disposed (but then try to be used).
-                    item.Id = doc.Id.CloneOnSameContext();
-                    item.LowerId = doc.LowerId.CloneOnSameContext();
                     FinishDocumentSetup(item, scoreDoc);
                 }
                 return r;
@@ -401,13 +410,17 @@ namespace Raven.Server.Documents.Queries.Results
                 case BlittableJsonReaderObject nested:
                     return (new Document
                     {
-                        Id = doc.Id,
+                        // https://issues.hibernatingrhinos.com/issue/RavenDB-19350
+                        // https://issues.hibernatingrhinos.com/issue/RavenDB-19127
+                        // We need to have a different instance of Id / LowerId, otherwise 
+                        // they will be disposed (but then try to be used)
+                        Id = doc.IgnoreDispose ? doc.Id?.CloneOnSameContext() : doc.Id,
                         ChangeVector = doc.ChangeVector,
                         Data = nested,
                         Etag = doc.Etag,
                         Flags = doc.Flags,
                         LastModified = doc.LastModified,
-                        LowerId = doc.LowerId,
+                        LowerId = doc.IgnoreDispose ? doc.LowerId?.CloneOnSameContext() : doc.LowerId,
                         NonPersistentFlags = doc.NonPersistentFlags,
                         StorageId = doc.StorageId,
                         TransactionMarker = doc.TransactionMarker
@@ -419,13 +432,13 @@ namespace Raven.Server.Documents.Queries.Results
                 case TimeSeriesRetriever.TimeSeriesStreamingRetrieverResult ts:
                     return (new Document
                     {
-                        Id = doc.Id,
+                        Id = doc.IgnoreDispose ? doc.Id?.CloneOnSameContext() : doc.Id,
                         ChangeVector = doc.ChangeVector,
                         Data = _context.ReadObject(ts.Metadata, "time-series-metadata"),
                         Etag = doc.Etag,
                         Flags = doc.Flags,
                         LastModified = doc.LastModified,
-                        LowerId = doc.LowerId,
+                        LowerId = doc.IgnoreDispose ? doc.LowerId?.CloneOnSameContext() : doc.LowerId,
                         NonPersistentFlags = doc.NonPersistentFlags,
                         StorageId = doc.StorageId,
                         TransactionMarker = doc.TransactionMarker,
@@ -452,14 +465,22 @@ namespace Raven.Server.Documents.Queries.Results
                 for (int i = 0; i < list.Count; i++)
                 {
                     if (list[i] is Document d)
+                    {
+                        d.EnsureDocumentId();
+
                         array.Add(d.Data);
+                    }
                     else
                         array.Add(list[i]);
                 }
                 fieldVal = array;
             }
+
             if (fieldVal is Document d2)
+            {
+                d2.EnsureDocumentId();
                 fieldVal = d2.Data;
+            }
 
             result[key] = fieldVal;
         }
@@ -494,7 +515,7 @@ namespace Raven.Server.Documents.Queries.Results
             }
             else
             {
-            doc.Data = newData;
+                doc.Data = newData;
             }
 
             if (scoreDoc != null)
@@ -539,19 +560,23 @@ namespace Raven.Server.Documents.Queries.Results
 
         private bool CoraxTryExtractValueFromIndex(FieldsToFetch.FieldToFetch fieldToFetch, ref RetrieverInput retrieverInput, DynamicJsonValue toFill)
         {
-            if (fieldToFetch.CanExtractFromIndex == false)
+            // We can always perform projection of ID from Index.
+            if (fieldToFetch.CanExtractFromIndex == false && fieldToFetch.IsDocumentId == false)
                 return false;
 
-            var name = fieldToFetch.ProjectedName ?? fieldToFetch.Name.Value;
 
-            if (FieldsToFetch.IndexFields.ContainsKey(fieldToFetch.Name.Value) == false)
+            object value = null;
+            if (retrieverInput.KnownFields.TryGetByFieldName(fieldToFetch.Name.Value, out var binding) == false)
+            {
+                if (TryGetValueFromCoraxIndex(_context, fieldToFetch.Name.Value, Corax.Constants.IndexWriter.DynamicField, ref retrieverInput, out value) == false)
+                    return false;
+            }
+            else if (TryGetValueFromCoraxIndex(_context, fieldToFetch.Name.Value, binding.FieldId, ref retrieverInput, out value) == false)
                 return false;
             
-            var id = FieldsToFetch.IndexFields[fieldToFetch.Name.Value].Id;
-            if (TryGetValueFromCoraxIndex(_context, name, id, ref retrieverInput, out var value) == false)
-                return false;
-
+            var name = fieldToFetch.ProjectedName ?? fieldToFetch.Name.Value;
             toFill[name] = value;
+            
             return true;
         }
 
@@ -608,10 +633,11 @@ namespace Raven.Server.Documents.Queries.Results
             value = null;
             switch (fieldType)
             {
-                
-            case IndexEntryFieldType.Empty:
-            case IndexEntryFieldType.Null:
-                value = fieldType == IndexEntryFieldType.Null ? null : string.Empty;;
+                case IndexEntryFieldType.Empty:
+                case IndexEntryFieldType.Null:
+                value = fieldType == IndexEntryFieldType.Null 
+                    ? null :
+                    string.Empty;
                 break;
 
             case IndexEntryFieldType.TupleListWithNulls:
@@ -669,6 +695,7 @@ namespace Raven.Server.Documents.Queries.Results
 
                 break;
 
+            case IndexEntryFieldType.ListWithEmpty:
             case IndexEntryFieldType.ListWithNulls:
             case IndexEntryFieldType.List:
                 if (fieldReader.TryReadMany(out iterator) == false)
@@ -782,7 +809,7 @@ namespace Raven.Server.Documents.Queries.Results
                     TryGetValue(fieldToFetch.FunctionArgs[i], document, ref retrieverInput, indexFields, anyDynamicIndexFields, out _, out args[i], token);
                     if (ReferenceEquals(args[i], document))
                     {
-                        args[i] = Tuple.Create(document, retrieverInput.LuceneDocument, retrieverInput.State, indexFields, anyDynamicIndexFields, FieldsToFetch.Projection);
+                        args[i] = Tuple.Create(document, retrieverInput, indexFields, anyDynamicIndexFields, FieldsToFetch.Projection);
                     }
                 }
                 value = GetFunctionValue(fieldToFetch, document.Id, args, token);
@@ -851,7 +878,7 @@ namespace Raven.Server.Documents.Queries.Results
             if (_loadedDocumentIds == null)
             {
                 _loadedDocumentIds = new HashSet<string>();
-                _loadedDocuments = new Dictionary<string, Document>();
+                _loadedDocuments = new LruDictionary<string, Document>(LoadedDocumentsCacheSize);
                 _loadedDocumentsByAliasName = new Dictionary<string, Document>();
             }
             _loadedDocumentIds.Clear();
@@ -910,7 +937,15 @@ namespace Raven.Server.Documents.Queries.Results
                             {
                                 throw new InvalidDataException($"Field {fieldToFetch.QueryField.SourceAlias} not found in index");
                             }
-                            _loadedDocumentIds.Add(fieldValue?.ToString());
+                            
+                            if (fieldValue is IEnumerable<object> enumerable)
+                            {
+                                foreach (var item in enumerable)
+                                    if (item != null)
+                                        _loadedDocumentIds.Add(item.ToString());
+                            }
+                            else
+                                _loadedDocumentIds.Add(fieldValue?.ToString());
 
                             break;
                         case SearchEngineType.None:

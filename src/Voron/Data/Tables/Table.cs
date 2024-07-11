@@ -25,6 +25,7 @@ namespace Voron.Data.Tables
         private readonly bool _forGlobalReadsOnly;
         private readonly TableSchema _schema;
         internal readonly Transaction _tx;
+        private readonly EventHandler<InvalidOperationException> _onCorruptedDataHandler;
         private readonly Tree _tableTree;
 
         private ActiveRawDataSmallSection _activeDataSmallSection;
@@ -38,9 +39,9 @@ namespace Voron.Data.Tables
         private readonly byte _tableType;
         private int? _currentCompressionDictionaryId;
 
-        public long NumberOfEntries { get; private set; }
+        public long NumberOfEntries => _stats.NumberOfEntries;
 
-        private long _overflowPageCount;
+        private readonly TableSchemaStatsReference _stats;
         private readonly NewPageAllocator _tablePageAllocator;
         private readonly NewPageAllocator _globalPageAllocator;
 
@@ -107,24 +108,19 @@ namespace Voron.Data.Tables
         /// Using this constructor WILL NOT register the Table for commit in
         /// the Transaction, and hence changes WILL NOT be committed.
         /// </summary>
-        public Table(TableSchema schema, Slice name, Transaction tx, Tree tableTree, byte tableType, bool doSchemaValidation = false)
+        public Table(TableSchema schema, Slice name, Transaction tx, Tree tableTree, TableSchemaStatsReference stats, byte tableType, bool doSchemaValidation = false)
         {
             Name = name;
 
             _schema = schema;
             _tx = tx;
             _tableType = tableType;
+            _stats = stats;
 
             _tableTree = tableTree;
             if (_tableTree == null)
                 throw new ArgumentNullException(nameof(tableTree), "Cannot open table " + Name);
 
-            var stats = (TableSchemaStats*)_tableTree.DirectRead(TableSchema.StatsSlice);
-            if (stats == null)
-                throw new InvalidDataException($"Cannot find stats value for table {name}");
-
-            NumberOfEntries = stats->NumberOfEntries;
-            _overflowPageCount = stats->OverflowPageCount;
             _tablePageAllocator = new NewPageAllocator(_tx.LowLevelTransaction, _tableTree);
             _globalPageAllocator = new NewPageAllocator(_tx.LowLevelTransaction, _tx.LowLevelTransaction.RootObjects);
 
@@ -141,12 +137,13 @@ namespace Voron.Data.Tables
         /// this overload is meant to be used for global reads only, when want to use
         /// a global index to find data, without touching the actual table.
         /// </summary>
-        public Table(TableSchema schema, Transaction tx)
+        public Table(TableSchema schema, Transaction tx, EventHandler<InvalidOperationException> onCorruptedDataHandler = null)
         {
             _schema = schema;
             _tx = tx;
             _forGlobalReadsOnly = true;
             _tableType = 0;
+            _onCorruptedDataHandler = onCorruptedDataHandler;
         }
 
         public bool ReadByKey(Slice key, out TableValueReader reader)
@@ -235,14 +232,6 @@ namespace Voron.Data.Tables
             return DirectReadDecompress(id, result, ref size);
         }
 
-        public void ForgetAboutCompressed(long id)
-        {
-            if (_tx.CachedDecompressedBuffersByStorageId.Remove(id, out var t))
-            {
-                _tx.Allocator.Release(ref t);
-            }
-        }
-
         private byte* DirectReadDecompress(long id, byte* directRead, ref int size)
         {
             if (_tx.CachedDecompressedBuffersByStorageId.TryGetValue(id, out var t))
@@ -260,7 +249,23 @@ namespace Voron.Data.Tables
             size = buffer.Length;
             return buffer.Ptr;
         }
-        
+
+        public int GetSize(long id)
+        {
+            var ptr = DirectReadRaw(id, out var size, out var compressed);
+            if (compressed == false)
+                return size;
+
+            if (_tx.CachedDecompressedBuffersByStorageId.TryGetValue(id, out var t))
+                return t.Length;
+
+            BlittableJsonReaderBase.ReadVariableSizeIntInReverse(ptr, size - 1, out var offset);
+            int length = size - offset;
+
+            int decompressedSize = GetDecompressedSize(new Span<byte>(ptr, length));
+            return decompressedSize;
+        }
+
         private static ReadOnlySpan<byte> LookupTable => new byte[] { 5, 6, 7, 9 };
         private static int GetDecompressedSize(Span<byte> buffer)
         {
@@ -305,22 +310,23 @@ namespace Voron.Data.Tables
             return internalScope;
         }
 
-        public int GetAllocatedSize(long id)
+        public (int AllocatedSize, bool IsCompressed) GetInfoFor(long id)
         {
             var posInPage = id % Constants.Storage.PageSize;
-            if (posInPage == 0) // large
+            if (posInPage == 0) // large value
             {
                 var page = _tx.LowLevelTransaction.GetPage(id / Constants.Storage.PageSize);
 
                 var allocated = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(page.OverflowSize);
 
-                return allocated * Constants.Storage.PageSize;
+                return (allocated * Constants.Storage.PageSize, page.Flags.HasFlag(PageFlags.Compressed));
             }
 
             // here we rely on the fact that RawDataSmallSection can
             // read any RawDataSmallSection piece of data, not just something that
             // it exists in its own section, but anything from other sections as well
-            return RawDataSection.GetRawDataEntrySizeFor(_tx.LowLevelTransaction, id)->AllocatedSize;
+            var sizes = RawDataSection.GetRawDataEntrySizeFor(_tx.LowLevelTransaction, id);
+            return (sizes->AllocatedSize, sizes->IsCompressed);
         }
 
         public long Update(long id, TableValueBuilder builder, bool forceUpdate = false)
@@ -388,6 +394,8 @@ namespace Voron.Data.Tables
 
                     if (builder.Compressed)
                         page.Flags |= PageFlags.Compressed;
+                    else if (page.Flags.HasFlag(PageFlags.Compressed))
+                        page.Flags &= ~PageFlags.Compressed;
 
                     builder.CopyTo(pos);
 
@@ -467,7 +475,7 @@ namespace Voron.Data.Tables
             var ptr = DirectReadRaw(id, out int size, out bool compressed);
 
             if (compressed)
-                _tx.CachedDecompressedBuffersByStorageId?.Remove(id);
+                _tx.ForgetAbout(id);
 
             ByteStringContext<ByteStringMemoryCache>.InternalScope decompressValue = default;
 
@@ -488,7 +496,7 @@ namespace Voron.Data.Tables
             {
                 var page = _tx.LowLevelTransaction.GetPage(id / Constants.Storage.PageSize);
                 var numberOfPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(page.OverflowSize);
-                _overflowPageCount -= numberOfPages;
+                _stats.OverflowPageCount -= numberOfPages;
 
                 for (var i = 0; i < numberOfPages; i++)
                 {
@@ -496,14 +504,14 @@ namespace Voron.Data.Tables
                 }
             }
 
-            NumberOfEntries--;
+            _stats.NumberOfEntries--;
 
             using (_tableTree.DirectAdd(TableSchema.StatsSlice, sizeof(TableSchemaStats), out byte* updatePtr))
             {
                 var stats = (TableSchemaStats*)updatePtr;
 
-                stats->NumberOfEntries = NumberOfEntries;
-                stats->OverflowPageCount = _overflowPageCount;
+                stats->NumberOfEntries = _stats.NumberOfEntries;
+                stats->OverflowPageCount = _stats.OverflowPageCount;
             }
 
             if (largeValue)
@@ -676,14 +684,14 @@ namespace Voron.Data.Tables
             var tvr = builder.CreateReader(pos);
             InsertIndexValuesFor(id, ref tvr);
 
-            NumberOfEntries++;
+            _stats.NumberOfEntries++;
 
             using (_tableTree.DirectAdd(TableSchema.StatsSlice, sizeof(TableSchemaStats), out byte* ptr))
             {
                 var stats = (TableSchemaStats*)ptr;
 
-                stats->NumberOfEntries = NumberOfEntries;
-                stats->OverflowPageCount = _overflowPageCount;
+                stats->NumberOfEntries = _stats.NumberOfEntries;
+                stats->OverflowPageCount = _stats.OverflowPageCount;
             }
 
             return id;
@@ -693,7 +701,7 @@ namespace Voron.Data.Tables
         {
             var numberOfOverflowPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(size);
             var page = _tx.LowLevelTransaction.AllocatePage(numberOfOverflowPages);
-            _overflowPageCount += numberOfOverflowPages;
+            _stats.OverflowPageCount += numberOfOverflowPages;
 
             page.Flags = PageFlags.Overflow | PageFlags.RawData;
             if (compressed)
@@ -735,7 +743,8 @@ namespace Voron.Data.Tables
 
         public class CompressionDictionariesHolder : IDisposable
         {
-            private readonly ConcurrentDictionary<int, ZstdLib.CompressionDictionary> _compressionDictionaries = new ConcurrentDictionary<int, ZstdLib.CompressionDictionary>();
+            private readonly ConcurrentDictionary<int, ZstdLib.CompressionDictionary> _compressionDictionaries = new();
+            public ConcurrentDictionary<int, ZstdLib.CompressionDictionary> CompressionDictionaries => _compressionDictionaries;
 
             public ZstdLib.CompressionDictionary GetCompressionDictionaryFor(Transaction tx, int id)
             {
@@ -748,6 +757,26 @@ namespace Voron.Data.Tables
                 if (result != current)
                     current.Dispose();
                 return result;
+            }
+
+            public IEnumerable<ZstdLib.CompressionDictionary> GetInStorageDictionaries(Transaction tx)
+            {
+                var tree = tx.ReadTree(TableSchema.CompressionDictionariesSlice);
+                if (tree == null)
+                    yield break;
+
+                using (var iterator = tree.Iterate(true))
+                {
+                    if (iterator.Seek(Slices.BeforeAllKeys) == false)
+                        yield break;
+
+                    do
+                    {
+                        var id = iterator.CurrentKey.CreateReader().ReadBigEndianInt32();
+                        var dict = CreateCompressionDictionary(tx, id);
+                        yield return dict;
+                    } while (iterator.MoveNext());
+                }
             }
 
             private ZstdLib.CompressionDictionary CreateCompressionDictionary(Transaction tx, int id)
@@ -778,24 +807,51 @@ namespace Voron.Data.Tables
                 return dic;
             }
 
+            private void ClearCompressionDictionaries()
+            {
+                _compressionDictionaries.Clear();
+            }
+
             public void Dispose()
             {
                 foreach (var (_, dic) in _compressionDictionaries)
                 {
                     dic.Dispose();
-
                 }
             }
 
-            public void Remove(int id)
+            public bool Remove(int id)
             {
                 // Intentionally orphaning the dictionary here, we'll let the 
                 // GC's finalizer to clear it up, this is a *very* rare operation.
-                _compressionDictionaries.TryRemove(id, out _);
+                return _compressionDictionaries.TryRemove(id, out _);
+            }
+
+            internal TestingStuff _forTestingPurposes;
+
+            internal TestingStuff ForTestingPurposesOnly()
+            {
+                if (_forTestingPurposes != null)
+                    return _forTestingPurposes;
+
+                return _forTestingPurposes = new TestingStuff(ClearCompressionDictionaries);
+            }
+
+            internal class TestingStuff
+            {
+                private readonly Action _clearCompressionDictionaries;
+
+                public TestingStuff(Action clearCompressionDictionaries)
+                {
+                    _clearCompressionDictionaries = clearCompressionDictionaries;
+                }
+
+                public void ClearCompressionDictionaries()
+                {
+                    _clearCompressionDictionaries.Invoke();
+                }
             }
         }
-
-
 
         private void UpdateValuesFromIndex(long id, ref TableValueReader oldVer, TableValueBuilder newVer, bool forceUpdate)
         {
@@ -858,8 +914,6 @@ namespace Voron.Data.Tables
 
             using var __ = Allocate(out var builder);
 
-            ByteStringContext<ByteStringMemoryCache>.ExternalScope rawCompressBufferScore = default;
-
             byte* dataPtr = reader.Pointer;
             int dataSize = reader.Size;
             bool compressed = false;
@@ -886,7 +940,7 @@ namespace Voron.Data.Tables
             {
                 var numberOfOverflowPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(dataSize);
                 var page = _tx.LowLevelTransaction.AllocatePage(numberOfOverflowPages);
-                _overflowPageCount += numberOfOverflowPages;
+                _stats.OverflowPageCount += numberOfOverflowPages;
 
                 page.Flags = PageFlags.Overflow | PageFlags.RawData;
                 page.OverflowSize = dataSize;
@@ -906,17 +960,16 @@ namespace Voron.Data.Tables
 
             InsertIndexValuesFor(id, ref reader);
 
-            NumberOfEntries++;
+            _stats.NumberOfEntries++;
 
             using (_tableTree.DirectAdd(TableSchema.StatsSlice, sizeof(TableSchemaStats), out byte* ptr))
             {
                 var stats = (TableSchemaStats*)ptr;
 
-                stats->NumberOfEntries = NumberOfEntries;
-                stats->OverflowPageCount = _overflowPageCount;
+                stats->NumberOfEntries = _stats.NumberOfEntries;
+                stats->OverflowPageCount = _stats.OverflowPageCount;
             }
 
-            rawCompressBufferScore.Dispose();
             return id;
         }
 
@@ -1241,7 +1294,7 @@ namespace Voron.Data.Tables
             return null;
         }
 
-        public IEnumerable<SeekResult> SeekBackwardFrom(TableSchema.SchemaIndexDef index, Slice prefix, Slice last, long skip)
+        public IEnumerable<SeekResult> SeekBackwardFrom(TableSchema.SchemaIndexDef index, Slice? prefix, Slice last, long skip)
         {
             var tree = GetTree(index);
             if (tree == null)
@@ -1252,11 +1305,14 @@ namespace Voron.Data.Tables
                 if (it.Seek(last) == false && it.Seek(Slices.AfterAllKeys) == false)
                     yield break;
 
-                it.SetRequiredPrefix(prefix);
-                if (SliceComparer.StartWith(it.CurrentKey, it.RequiredPrefix) == false)
+                if (prefix != null)
                 {
-                    if (it.MovePrev() == false)
-                        yield break;
+                    it.SetRequiredPrefix(prefix.Value);
+                    if (SliceComparer.StartWith(it.CurrentKey, it.RequiredPrefix) == false)
+                    {
+                        if (it.MovePrev() == false)
+                            yield break;
+                    }
                 }
 
                 do
@@ -1591,11 +1647,34 @@ namespace Voron.Data.Tables
                     yield break;
 
                 var result = new TableValueHolder();
-                do
+                if (_onCorruptedDataHandler == null)
                 {
-                    GetTableValueReader(it, out result.Reader);
-                    yield return result;
-                } while (it.MoveNext());
+                    do
+                    {
+                        GetTableValueReader(it, out result.Reader);
+                        yield return result;
+                    } while (it.MoveNext());
+                }
+                else
+                {
+                    do
+                    {
+                        bool successfully = true;
+                        try
+                        {
+                            GetTableValueReader(it, out result.Reader);
+                        }
+                        catch (InvalidOperationException e)
+                        {
+                            _onCorruptedDataHandler.Invoke(this, e);
+                            successfully = false;
+                        }
+
+                        if (successfully)
+                            yield return result;
+
+                    } while (it.MoveNext());
+                }
             }
         }
 
@@ -1744,7 +1823,6 @@ namespace Voron.Data.Tables
 
         public bool FindByIndex(TableSchema.FixedSizeSchemaIndexDef index, long value, out TableValueReader reader)
         {
-            AssertWritableTable();
             reader = default;
             var fst = GetFixedSizeTree(index);
 
@@ -2078,7 +2156,7 @@ namespace Voron.Data.Tables
         {
             generatorInstance ??= new StorageReportGenerator(_tx.LowLevelTransaction);
 
-            var overflowSize = _overflowPageCount * Constants.Storage.PageSize;
+            var overflowSize = _stats.OverflowPageCount * Constants.Storage.PageSize;
             var report = new TableReport(overflowSize, overflowSize, includeDetails, generatorInstance)
             {
                 Name = Name.ToString(),
@@ -2194,6 +2272,46 @@ namespace Voron.Data.Tables
                 if (_tx.LowLevelTransaction.Environment.WriteTransactionPool.BuilderUsages-- != 1)
                     throw new InvalidOperationException("Cannot use a cached table value builder when it is already removed");
 #endif
+            }
+        }
+
+        private TestingStuff _forTestingPurposes;
+
+        internal TestingStuff ForTestingPurposesOnly()
+        {
+            if (_forTestingPurposes != null)
+                return _forTestingPurposes;
+
+            return _forTestingPurposes = new TestingStuff(this);
+        }
+
+        internal class TestingStuff
+        {
+            private readonly Table _table;
+
+            public TestingStuff(Table table)
+            {
+                _table = table;
+            }
+
+            public bool? IsTableValueCompressed(Slice key, out bool? isLargeValue)
+            {
+                if (_table.TryFindIdFromPrimaryKey(key, out long id) == false)
+                {
+                    isLargeValue = default;
+                    return default;
+                }
+
+                isLargeValue = id % Constants.Storage.PageSize == 0;
+
+                if (isLargeValue.Value)
+                {
+                    var page = _table._tx.LowLevelTransaction.GetPage(id / Constants.Storage.PageSize);
+                    return page.Flags.HasFlag(PageFlags.Compressed);
+                }
+
+                var sizes = RawDataSection.GetRawDataEntrySizeFor(_table._tx.LowLevelTransaction, id);
+                return sizes->IsCompressed;
             }
         }
     }

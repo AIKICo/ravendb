@@ -69,6 +69,19 @@
                 </div>
             </div>
             <br/>
+            <div class="export-list" data-bind="with: filesCount">
+                <div class="export-item">
+                    <div class="name">
+                        <h3>Current File</h3>
+                    </div>
+                    <div class="progress-overall" data-bind="text: CurrentFileName"></div>
+                    <div class="progress-count">
+                        <strong data-bind="text: CurrentFile"></strong>
+                        /
+                        <span data-bind="text: FileCount"></span>
+                    </div>
+                </div>
+            </div>
             <div class="export-list" data-bind="visible: uploadItems().length">
                 <div data-bind="foreach: uploadItems">
                     <div class="export-item">
@@ -92,21 +105,55 @@
             </div>
             <div class="clearfix" data-bind="visible: !operationFailed()">
                 <div class="pull-right margin-top">
-                    <button class="btn btn-default btn-sm" data-bind="click: toggleDetails, text: detailsVisible() ? 'Hide details':'Show details', clickBubble: false">
+                    <button class="btn btn-default btn-sm" data-bind="click: toggleDetails">
+                        <i class="icon-logs"></i><span data-bind="text: detailsVisible() ? 'Hide details':'Show details', clickBubble: false"></span>
                     </button>
                 </div>
             </div>
             <div class="export-messages-container" data-bind="visible: detailsVisible">
                 <pre class="margin-top export-messages"><code data-bind="text: messagesJoined"></code></pre>
             </div>
-            <div class="toggle margin-top margin-top-sm" data-bind="visible: detailsVisible() && !operationFailed()">
-                <input id="smuggler-monitoring" type="checkbox" data-bind="checked: tail, disable: op.isCompleted">
-                <label for="smuggler-monitoring">
-                    Monitoring (tail -f)
-                </label>
+            <div class="clearfix margin-top margin-top-sm">
+                <div class="toggle pull-left" data-bind="visible: detailsVisible() && !operationFailed()">
+                    <input id="smuggler-monitoring" type="checkbox" data-bind="checked: tail, disable: op.isCompleted">
+                    <label for="smuggler-monitoring">
+                        Monitoring (tail -f)
+                    </label>
+                </div>
+                <button class="pull-right btn btn-default btn-sm" data-bind="click: copyLogs, visible: detailsVisible()">
+                    <i class="icon-copy-to-clipboard"></i> Copy details to clipboard
+                </button>
             </div>
         </div>
-        <div class="modal-footer" data-bind="compose: $root.footerPartialView">
+        <div class="modal-footer">
+            <div class="flex-horizontal">
+                <div data-bind="visible: canDelay">
+                    <div class="btn-group dropup">
+                        <button type="button" class="btn btn-danger dropdown-toggle" data-toggle="dropdown"
+                                data-bind="requiredAccess: 'Operator'">
+                            <span>Delay backup</span><span class="caret"></span>
+                        </button>
+                        <ul class="dropdown-menu">
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '01:00:00')"><span>1 hour</span></a></li>
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '03:00:00')"><span>3 hours</span></a></li>
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '06:00:00')"><span>6 hours</span></a></li>
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '1.00:00:00')"><span>1 day</span></a></li>
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '3.00:00:00')"><span>3 days</span></a></li>
+                            <li><a href="#" data-bind="click: _.partial(delayBackup, '7.00:00:00')"><span>7 days</span></a></li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="flex-separator"></div>
+                <div>
+                    <button type="button" class="btn btn-default" data-bind="click: close" title="Close this dialog">
+                        <i class="icon-cancel"></i><span>Close</span>
+                    </button>
+                    <button type="button" class="btn btn-danger" title="Abort this operation"
+                            data-bind="click: killOperation, visible: killable, css: { 'btn-spinner': spinners.kill }, disable: spinners.kill">
+                        <i class="icon-stop"></i><span>Abort</span>
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 </div>

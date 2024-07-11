@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Runtime.ExceptionServices;
+using System.Text;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Commands;
@@ -21,17 +22,21 @@ using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.CompareExchange;
 using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Operations.TimeSeries;
+using Raven.Client.Documents.Session;
 using Raven.Client.Documents.Session.Loaders;
 using Raven.Client.Exceptions;
 using Raven.Client.Http;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.Queries.Revisions;
+using Raven.Server.Documents.Replication;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.Routing;
+using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.TrafficWatch;
+using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Extensions;
 using Sparrow.Json;
@@ -94,12 +99,16 @@ namespace Raven.Server.Documents.Handlers
                     ActualSize = document.Value.ActualSize,
                     HumaneActualSize = Sizes.Humane(document.Value.ActualSize),
                     AllocatedSize = document.Value.AllocatedSize,
-                    HumaneAllocatedSize = Sizes.Humane(document.Value.AllocatedSize)
+                    HumaneAllocatedSize = Sizes.Humane(document.Value.AllocatedSize),
+                    IsCompressed = document.Value.IsCompressed
                 };
 
                 await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
                     context.Write(writer, documentSizeDetails.ToJson());
+
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Documents);
                 }
             }
         }
@@ -111,7 +120,6 @@ namespace Raven.Server.Documents.Handlers
             var metadataOnly = GetBoolValueQueryString("metadataOnly", required: false) ?? false;
 
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
-            using (context.OpenReadTransaction())
             {
                 if (ids.Count > 0)
                     await GetDocumentsByIdAsync(context, ids, metadataOnly);
@@ -140,8 +148,6 @@ namespace Raven.Server.Documents.Handlers
                     ids[i] = array.GetStringByIndex(i);
                 }
 
-                context.OpenReadTransaction();
-
                 // init here so it can be passed to TW
                 var idsStringValues = new Microsoft.Extensions.Primitives.StringValues(ids);
 
@@ -155,6 +161,7 @@ namespace Raven.Server.Documents.Handlers
         private async Task GetDocumentsAsync(DocumentsOperationContext context, bool metadataOnly)
         {
             var sw = Stopwatch.StartNew();
+            using var _ = context.OpenReadTransaction();
 
             // everything here operates on all docs
             var databaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(context);
@@ -210,19 +217,21 @@ namespace Raven.Server.Documents.Handlers
         private async Task GetDocumentsByIdAsync(DocumentsOperationContext context, Microsoft.Extensions.Primitives.StringValues ids, bool metadataOnly)
         {
             var sw = Stopwatch.StartNew();
-
             var includePaths = GetStringValuesQueryString("include", required: false);
             var documents = new List<Document>(ids.Count);
             var includes = new List<Document>(includePaths.Count * ids.Count);
             var includeDocs = new IncludeDocumentsCommand(Database.DocumentsStorage, context, includePaths, isProjection: false);
             GetCountersQueryString(Database, context, out var includeCounters);
-            
             GetRevisionsQueryString(Database, context, out var includeRevisions);
-
             GetTimeSeriesQueryString(Database, context, out var includeTimeSeries);
+            var txMode = GetStringQueryString("txMode", required: false);
+            var clusterWideTx = txMode != null && Enum.TryParse<TransactionMode>(txMode, ignoreCase: true, out var v) && v == TransactionMode.ClusterWide;
+            GetCompareExchangeValueQueryString(Database, clusterWideTx, out var includeCompareExchangeValues);
 
-            GetCompareExchangeValueQueryString(Database, out var includeCompareExchangeValues);
+            // we have to read this _before_ we open the transaction
+            long lastModifiedIndex = Database.RachisLogIndexNotifications.LastModifiedIndex;
 
+            using (context.OpenReadTransaction())
             using (includeCompareExchangeValues)
             {
                 foreach (var id in ids)
@@ -232,13 +241,37 @@ namespace Raven.Server.Documents.Handlers
                     {
                         document = Database.DocumentsStorage.Get(context, id);
                     }
-
-                    if (document == null && ids.Count == 1)
+                    
+                    if (document == null)
                     {
-                        HttpContext.Response.StatusCode = GetStringFromHeaders(Constants.Headers.IfNoneMatch) == HttpCache.NotFoundResponse
-                        ?(int)HttpStatusCode.NotModified
-                        :(int)HttpStatusCode.NotFound;
-                        return;
+                        if (clusterWideTx)
+                        {
+                            Debug.Assert(includeCompareExchangeValues != null, nameof(includeCompareExchangeValues) + " != null");
+                            includeCompareExchangeValues.AddDocument(ClusterTransactionCommand.GetAtomicGuardKey(id));
+                            continue;
+                        }
+                        if (ids.Count == 1)
+                        {
+                            HttpContext.Response.StatusCode = GetStringFromHeaders(Constants.Headers.IfNoneMatch) == HttpCache.NotFoundResponse
+                                ? (int)HttpStatusCode.NotModified
+                                : (int)HttpStatusCode.NotFound;
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        string changeVector = document.ChangeVector;
+                        if (clusterWideTx && 
+                            changeVector.Contains(Database.ClusterTransactionId) == false)
+                        {
+                            Debug.Assert(includeCompareExchangeValues != null, nameof(includeCompareExchangeValues) + " != null");
+                            if (includeCompareExchangeValues.TryGetAtomicGuard(ClusterTransactionCommand.GetAtomicGuardKey(id), lastModifiedIndex, out var guardIndex, out _))
+                            {
+                                var (isValid, cv) = ChangeVectorUtils.TryUpdateChangeVector(ChangeVectorParser.TrxnTag, Database.ClusterTransactionId, guardIndex, changeVector);
+                                Debug.Assert(isValid, "ChangeVector didn't have ClusterTransactionId tag but now does?!");
+                                document.ChangeVector = cv;
+                            }
+                        }
                     }
 
                     documents.Add(document);
@@ -250,7 +283,7 @@ namespace Raven.Server.Documents.Handlers
                 }
 
                 includeDocs.Fill(includes);
-                includeCompareExchangeValues?.Materialize();
+                includeCompareExchangeValues?.Materialize(lastModifiedIndex);
 
                 var actualEtag = ComputeHttpEtags.ComputeEtagForDocuments(documents, includes, includeCounters, includeTimeSeries, includeCompareExchangeValues);
 
@@ -261,23 +294,57 @@ namespace Raven.Server.Documents.Handlers
                     return;
                 }
 
+             
                 HttpContext.Response.Headers[Constants.Headers.Etag] = "\"" + actualEtag + "\"";
 
 
-                var (numberOfResults, totalDocumentsSizeInBytes) = await WriteDocumentsJsonAsync(context, metadataOnly, documents, includes, includeCounters?.Results, includeRevisions?.RevisionsChangeVectorResults, includeRevisions?.IdByRevisionsByDateTimeResults, includeTimeSeries?.Results,
-                    includeCompareExchangeValues?.Results);
+                var (numberOfResults, totalDocumentsSizeInBytes) = await WriteDocumentsJsonAsync(context, metadataOnly,
+                    documents, includes, includeCounters?.Results, includeRevisions?.RevisionsChangeVectorResults, 
+                    includeRevisions?.IdByRevisionsByDateTimeResults, includeTimeSeries?.Results,
+                    includeCompareExchangeValues?.Results, clusterWideTx);
 
-                AddPagingPerformanceHint(PagingOperationType.Documents, nameof(GetDocumentsByIdAsync), HttpContext.Request.QueryString.Value, numberOfResults,
-                    documents.Count, sw.ElapsedMilliseconds, totalDocumentsSizeInBytes);
+                if (ShouldAddPagingPerformanceHint(numberOfResults))
+                {
+                    var details = CreatePerformanceHintDetails();
+
+                    AddPagingPerformanceHint(PagingOperationType.Documents, nameof(GetDocumentsByIdAsync), details, numberOfResults, documents.Count, sw.ElapsedMilliseconds, totalDocumentsSizeInBytes);
+                }
+            }
+
+            string CreatePerformanceHintDetails()
+            {
+                var sb = new StringBuilder();
+                var addedIdsCount = 0;
+                var first = true;
+
+                while (sb.Length < 1024 && addedIdsCount < ids.Count)
+                {
+                    if (first == false)
+                        sb.Append(", ");
+                    else
+                        first = false;
+                    
+                    sb.Append($"{ids[addedIdsCount++]}");
+                }
+
+                var idsLeftCount = ids.Count - addedIdsCount;
+
+                if (idsLeftCount > 0)
+                {
+                    sb.Append($" ... (and {idsLeftCount} more)");
+                }
+
+                return sb.ToString();
             }
         }
 
-        private void GetCompareExchangeValueQueryString(DocumentDatabase database, out IncludeCompareExchangeValuesCommand includeCompareExchangeValues)
+        private void GetCompareExchangeValueQueryString(DocumentDatabase database, bool clusterWideTx,
+            out IncludeCompareExchangeValuesCommand includeCompareExchangeValues)
         {
             includeCompareExchangeValues = null;
 
             var compareExchangeValues = GetStringValuesQueryString("cmpxchg", required: false);
-            if (compareExchangeValues.Count == 0)
+            if (compareExchangeValues.Count == 0 && clusterWideTx == false)
                 return;
 
             includeCompareExchangeValues = IncludeCompareExchangeValuesCommand.InternalScope(database, compareExchangeValues);
@@ -299,21 +366,21 @@ namespace Raven.Server.Documents.Handlers
 
             includeCounters = new IncludeCountersCommand(database, context, counters);
         }
-        
+
         private void GetRevisionsQueryString(DocumentDatabase database, DocumentsOperationContext context, out IncludeRevisionsCommand includeRevisions)
         {
             includeRevisions = null;
-            
+
             var rif = new RevisionIncludeField();
             var revisionsByChangeVectors = GetStringValuesQueryString("revisions", required: false);
             var revisionByDateTimeBefore = GetStringValuesQueryString("revisionsBefore", required: false);
-            
+
             if (revisionsByChangeVectors.Count == 0 && revisionByDateTimeBefore.Count == 0)
                 return;
 
-            if (DateTime.TryParseExact(revisionByDateTimeBefore.ToString(), DefaultFormat.DateTimeFormatsToRead, CultureInfo.InvariantCulture,DateTimeStyles.AssumeUniversal, out var dateTime))
+            if (DateTime.TryParseExact(revisionByDateTimeBefore.ToString(), DefaultFormat.DateTimeFormatsToRead, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dateTime))
                 rif.RevisionsBeforeDateTime = dateTime.ToUniversalTime();
-            
+
             foreach (var changeVector in revisionsByChangeVectors)
                 rif.RevisionsChangeVectorsPaths.Add(changeVector);
 
@@ -410,7 +477,8 @@ namespace Raven.Server.Documents.Handlers
             Dictionary<string, List<CounterDetail>> counters, Dictionary<string, Document> revisionByChangeVectorResults,
             Dictionary<string, Dictionary<DateTime, Document>> revisionsByDateTimeResults,
             Dictionary<string, Dictionary<string, List<TimeSeriesRangeResult>>> timeseries,
-            Dictionary<string, CompareExchangeValue<BlittableJsonReaderObject>> compareExchangeValues)
+            Dictionary<string, CompareExchangeValue<BlittableJsonReaderObject>> compareExchangeValues,
+            bool clusterWideTx)
         {
             long numberOfResults;
             long totalDocumentsSizeInBytes;
@@ -443,18 +511,25 @@ namespace Raven.Server.Documents.Handlers
                     writer.WritePropertyName(nameof(GetDocumentsResult.TimeSeriesIncludes));
                     await writer.WriteTimeSeriesAsync(timeseries, Database.DatabaseShutdown);
                 }
-                if(revisionByChangeVectorResults?.Count > 0 || revisionsByDateTimeResults?.Count > 0)
+                if (revisionByChangeVectorResults?.Count > 0 || revisionsByDateTimeResults?.Count > 0)
                 {
                     writer.WriteComma();
                     writer.WritePropertyName(nameof(GetDocumentsResult.RevisionIncludes));
                     writer.WriteStartArray();
-                    await writer.WriteRevisionIncludes(context:context, revisionsByChangeVector: revisionByChangeVectorResults, revisionsByDateTime: revisionsByDateTimeResults); 
+                    await writer.WriteRevisionIncludes(context: context, revisionsByChangeVector: revisionByChangeVectorResults, revisionsByDateTime: revisionsByDateTimeResults);
                     writer.WriteEndArray();
                 }
                 if (compareExchangeValues?.Count > 0)
                 {
                     writer.WriteComma();
                     writer.WritePropertyName(nameof(GetDocumentsResult.CompareExchangeValueIncludes));
+                    if (clusterWideTx)
+                    {
+                        foreach (var (k,v) in compareExchangeValues)
+                        {
+                            v.ChangeVector = ChangeVectorUtils.NewChangeVector(ChangeVectorParser.TrxnTag,v.Index,Database.ClusterTransactionId);
+                        }
+                    }
                     await writer.WriteCompareExchangeValuesAsync(compareExchangeValues, Database.DatabaseShutdown);
                 }
 
@@ -516,6 +591,9 @@ namespace Raven.Server.Documents.Handlers
                         writer.WriteString(cmd.PutResult.ChangeVector);
 
                         writer.WriteEndObject();
+
+                        if (TrafficWatchManager.HasRegisteredClients)
+                            AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Documents);
                     }
                 }
             }
@@ -650,6 +728,9 @@ namespace Raven.Server.Documents.Handlers
                     }
 
                     writer.WriteEndObject();
+
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Documents);
                 }
             }
         }
@@ -685,6 +766,9 @@ namespace Raven.Server.Documents.Handlers
                     var codeGenerator = new JsonClassGenerator(lang);
                     var code = codeGenerator.Execute(document);
                     await writer.WriteAsync(code);
+
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Documents);
                 }
             }
         }
@@ -697,6 +781,7 @@ namespace Raven.Server.Documents.Handlers
         public string HumaneActualSize { get; set; }
         public int AllocatedSize { get; set; }
         public string HumaneAllocatedSize { get; set; }
+        public bool IsCompressed { get; set; }
 
         public virtual DynamicJsonValue ToJson()
         {
@@ -706,7 +791,8 @@ namespace Raven.Server.Documents.Handlers
                 [nameof(ActualSize)] = ActualSize,
                 [nameof(HumaneActualSize)] = HumaneActualSize,
                 [nameof(AllocatedSize)] = AllocatedSize,
-                [nameof(HumaneAllocatedSize)] = HumaneAllocatedSize
+                [nameof(HumaneAllocatedSize)] = HumaneAllocatedSize,
+                [nameof(IsCompressed)] = IsCompressed
             };
         }
     }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Database;
@@ -9,7 +10,7 @@ namespace Raven.Client.Http
 {
     public class NodeSelector : IDisposable
     {
-        private class NodeSelectorState
+        internal class NodeSelectorState
         {
             public readonly Topology Topology;
             public readonly List<ServerNode> Nodes;
@@ -28,6 +29,43 @@ namespace Raven.Client.Http
                 UnlikelyEveryoneFaultedChoiceIndex = 0;
             }
 
+            public NodeSelectorState(Topology topology, NodeSelectorState prevState) : this(topology)
+            {
+                if (prevState.Fastest < 0 || prevState.Fastest >= prevState.Nodes.Count)
+                {
+                    Debug.Assert(false, "Fastest is out of range of Nodes in NodeSelectorState");
+                    return;
+                }
+
+                var fastestNode = prevState.Nodes.ElementAt(prevState.Fastest);
+                int index = 0;
+                foreach (var node in topology.Nodes)
+                {
+                    if (node.ClusterTag == fastestNode.ClusterTag)
+                    {
+                        Fastest = index;
+                        break;
+                    }
+
+                    index++;
+                }
+                
+                // fastest node was not found in the new topology. enable speed tests
+                if (index >= topology.Nodes.Count)
+                {
+                    SpeedTestMode = 2;
+                }
+                else
+                {
+                    // we might be in the process of finding fastest node when we reorder the nodes, we don't want the tests to stop until we reach 10
+                    // otherwise, we want to stop the tests and they may be scheduled later on relevant topology change
+                    if (Fastest < prevState.FastestRecords.Length && prevState.FastestRecords[Fastest] < 10)
+                    {
+                        SpeedTestMode = prevState.SpeedTestMode;
+                    }
+                }
+            }
+
             public ValueTuple<int, ServerNode> GetNodeWhenEveryoneMarkedAsFaulted()
             {
                 int index = UnlikelyEveryoneFaultedChoiceIndex;
@@ -40,7 +78,7 @@ namespace Raven.Client.Http
 
         private Timer _updateFastestNodeTimer;
 
-        private NodeSelectorState _state;
+        internal NodeSelectorState _state;
 
         public NodeSelector(Topology topology)
         {
@@ -64,8 +102,8 @@ namespace Raven.Client.Http
             if (_state.Topology.Etag >= topology.Etag && forceUpdate == false)
                 return false;
 
-            var state = new NodeSelectorState(topology);
-
+            var state = new NodeSelectorState(topology, _state);
+            
             Interlocked.Exchange(ref _state, state);
 
             return true;
@@ -111,7 +149,7 @@ namespace Raven.Client.Http
             for (int i = 0; i < len; i++)
             {
                 Debug.Assert(string.IsNullOrEmpty(serverNodes[i].Url) == false, $"Expected serverNodes Url not null or empty but got: \'{serverNodes[i].Url}\'");
-                if (stateFailures[i] == 0)
+                if (stateFailures[i] == 0 && serverNodes[i].ServerRole == ServerNode.Role.Member)
                 {
                     return (i, serverNodes[i]);
                 }
@@ -120,13 +158,7 @@ namespace Raven.Client.Http
             return UnlikelyEveryoneFaultedChoice(state);
         }
 
-        internal (int Index, ServerNode Node, long TopologyEtag) GetPreferredNodeWithTopology()
-        {
-            var state = _state;
-            var preferredNode = GetPreferredNodeInternal(state);
-            return (preferredNode.Index, preferredNode.Node, state.Topology?.Etag??-2);
-            
-        }
+        internal int[] NodeSelectorFailures => _state.Failures;
 
         private static ValueTuple<int, ServerNode> UnlikelyEveryoneFaultedChoice(NodeSelectorState state)
         {
@@ -135,6 +167,17 @@ namespace Raven.Client.Http
             if (state.Nodes.Count == 0)
                 throw new DatabaseDoesNotExistException("There are no nodes in the topology at all");
 
+            var stateFailures = state.Failures;
+            var serverNodes = state.Nodes;
+            var len = Math.Min(serverNodes.Count, stateFailures.Length);
+            for (int i = 0; i < len; i++)
+            {
+                if (stateFailures[i] == 0)
+                {
+                    return (i, serverNodes[i]);
+                }
+            }
+            
             return state.GetNodeWhenEveryoneMarkedAsFaulted();
         }
 
@@ -168,20 +211,18 @@ namespace Raven.Client.Http
             if (state.Failures[state.Fastest] == 0 && state.Nodes[state.Fastest].ServerRole == ServerNode.Role.Member)
                 return (state.Fastest, state.Nodes[state.Fastest]);
             
-            // if the fastest node has failures, we'll immediately schedule
-            // another run of finding who the fastest node is, in the meantime
-            // we'll just use the server preferred node or failover as usual
-            
-            SwitchToSpeedTestPhase(null);
+            // until new fastest node is selected, we'll just use the server preferred node or failover as usual
+            ScheduleSpeedTest();
             return GetPreferredNode();
         }
 
-        public void RestoreNodeIndex(int nodeIndex)
+        public void RestoreNodeIndex(ServerNode node)
         {
             var state = _state;
-            if (state.Failures.Length <= nodeIndex)
-                return; // the state was changed and we no longer have it?
-
+            var nodeIndex = state.Nodes.IndexOf(node);
+            if (nodeIndex == -1)
+                return;
+            
             while (true)
             {
                 var stateFailure = state.Failures[nodeIndex];
@@ -227,6 +268,7 @@ namespace Raven.Client.Http
             if (Interlocked.Increment(ref stateFastest[index]) >= 10)
             {
                 SelectFastest(state, index);
+                return;
             }
 
             if (Interlocked.Increment(ref state.SpeedTestMode) <= state.Nodes.Count * 10)
@@ -258,17 +300,24 @@ namespace Raven.Client.Http
         {
             state.Fastest = index;
             Interlocked.Exchange(ref state.SpeedTestMode, 0);
-
-            _updateFastestNodeTimer.Change(TimeSpan.FromMinutes(1), Timeout.InfiniteTimeSpan);
+            ScheduleSpeedTest();
         }
+
+        private readonly object _timerCreationLocker = new object();
 
         public void ScheduleSpeedTest()
         {
-            if (_updateFastestNodeTimer == null)
+            if (_updateFastestNodeTimer != null)
+                return;
+
+            lock (_timerCreationLocker)
             {
-                _updateFastestNodeTimer = new Timer(SwitchToSpeedTestPhase, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                if (_updateFastestNodeTimer != null)
+                    return;
+
+                SwitchToSpeedTestPhase(null);
+                _updateFastestNodeTimer = new Timer(SwitchToSpeedTestPhase, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
             }
-            SwitchToSpeedTestPhase(null);
         }
 
         public void Dispose()

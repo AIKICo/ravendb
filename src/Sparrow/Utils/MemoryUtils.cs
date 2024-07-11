@@ -10,7 +10,8 @@ public static class MemoryUtils
     private const string GenericOutMemoryException = "Failed to generate an out of memory exception";
     private static readonly InvertedComparer InvertedComparerInstance = new InvertedComparer();
     private const int MinAllocatedThresholdInBytes = 10 * 1024 * 1024;
-    public static string GetExtendedMemoryInfo(MemoryInfoResult memoryInfo)
+
+    public static string GetExtendedMemoryInfo(MemoryInfoResult memoryInfo, DirtyMemoryState dirtyState)
     {
         try
         {
@@ -18,14 +19,15 @@ public static class MemoryUtils
             TryAppend(() => sb.Append("Commit charge: ").Append(memoryInfo.CurrentCommitCharge).Append(" / ").Append(memoryInfo.TotalCommittableMemory).Append(", "));
             TryAppend(() => sb.Append("Memory: ").Append(memoryInfo.TotalPhysicalMemory - memoryInfo.AvailableMemory).Append(" / ").Append(memoryInfo.TotalPhysicalMemory).Append(", "));
             TryAppend(() => sb.Append("Available memory for processing: ").Append(memoryInfo.AvailableMemoryForProcessing).Append(", "));
-            TryAppend(() => sb.Append("Dirty memory: ").Append(memoryInfo.TotalScratchDirtyMemory).Append(", "));
+            TryAppend(() => sb.Append("Dirty memory: ").Append(dirtyState.TotalDirty).Append(", "));
             TryAppend(() => sb.Append("Managed memory: ").Append(new Size(AbstractLowMemoryMonitor.GetManagedMemoryInBytes(), SizeUnit.Bytes)).Append(", "));
-            TryAppend(() => sb.Append("Unmanaged allocations: ").Append(new Size(AbstractLowMemoryMonitor.GetUnmanagedAllocationsInBytes(), SizeUnit.Bytes)));
-            TryAppend(() => sb.Append("Lucene unmanaged allocations: ").Append(new Size(NativeMemory.TotalAllocatedMemoryByLucene, SizeUnit.Bytes)));
+            TryAppend(() => sb.Append("Unmanaged allocations: ").Append(new Size(AbstractLowMemoryMonitor.GetUnmanagedAllocationsInBytes(), SizeUnit.Bytes)).Append(", "));
+            TryAppend(() => sb.Append("Lucene managed: ").Append(new Size(NativeMemory.TotalLuceneManagedAllocationsForTermCache, SizeUnit.Bytes)).Append(", "));
+            TryAppend(() => sb.Append("Lucene unmanaged: ").Append(new Size(NativeMemory.TotalLuceneUnmanagedAllocationsForSorting, SizeUnit.Bytes)));
 
             try
             {
-                var sorted = new SortedDictionary<long, string>(InvertedComparerInstance);
+                var sorted = new SortedDictionary<long, (string ThreadName, int ManagedThreadId)>(InvertedComparerInstance);
 
                 long totalAllocatedForUnknownThreads = 0;
                 var unknownThreadsCount = 0;
@@ -38,10 +40,10 @@ public static class MemoryUtils
                         continue;
                     }
 
-                    sorted[stats.TotalAllocated] = stats.Name;
+                    sorted[stats.TotalAllocated] = (stats.Name, stats.ManagedThreadId);
                 }
 
-                sorted[totalAllocatedForUnknownThreads] = null;
+                sorted[totalAllocatedForUnknownThreads] = (null, 0);
 
                 var count = 0;
                 var first = true;
@@ -63,9 +65,23 @@ public static class MemoryUtils
                         sb.Append(", ");
                     }
 
-                    TryAppend(() => sb.Append("name: ").Append(keyValue.Value).Append(", allocations: ").Append(new Size(keyValue.Key, SizeUnit.Bytes)));
-                    if (keyValue.Value == null)
+                    sb.Append("[#");
+                    sb.Append(count);
+                    sb.Append("] ");
+
+                    TryAppend(() => sb.Append("name: ")
+                        .Append(keyValue.Value.ThreadName).Append(", allocations: ")
+                        .Append(new Size(keyValue.Key, SizeUnit.Bytes)));
+
+                    if (keyValue.Value.ManagedThreadId != 0)
+                    {
+                        TryAppend(() => sb.Append(", managed thread id: ").Append(keyValue.Value.ManagedThreadId));
+                    }
+
+                    if (keyValue.Value.ThreadName == null)
+                    {
                         TryAppend(() => sb.Append(" (threads count: ").Append(unknownThreadsCount).Append(")"));
+                    }
                 }
             }
             catch

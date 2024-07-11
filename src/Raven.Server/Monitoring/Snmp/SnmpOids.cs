@@ -1,7 +1,6 @@
 ﻿using System;
 using System.ComponentModel;
 using System.Reflection;
-using Raven.Server.Monitoring.Snmp.Objects.Server;
 using Raven.Server.Platform.Posix;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
@@ -174,8 +173,13 @@ namespace Raven.Server.Monitoring.Snmp
             [Description("GC information for {0}. Gets the total committed MB of the managed heap.")]
             public const string GcTotalCommitted = "1.6.11.{0}.15";
 
+            [SnmpEnumIndex(typeof(GCKind))]
+            [Description("GC information for {0}. Gets the large object heap size (in MB) after the last garbage collection of given kind occurred.")]
+            public const string GcLohSize = "1.6.11.{0}.16.3";
+
             public const string MemInfoPrefix = "1.6.12.{0}";
 
+            [Description("Available memory for processing (in MB)")]
             public const string AvailableMemoryForProcessing = "1.6.13";
 
             [Description("Number of concurrent requests")]
@@ -185,7 +189,10 @@ namespace Raven.Server.Monitoring.Snmp
             public const string TotalRequests = "1.7.2";
 
             [Description("Number of requests per second (one minute rate)")]
-            public const string RequestsPerSecond = "1.7.3";
+            public const string RequestsPerSecond1M = "1.7.3";
+
+            [Description("Number of requests per second (five second rate)")]
+            public const string RequestsPerSecond5S = "1.7.3.1";
 
             [Description("Average request time in milliseconds")]
             public const string RequestAverageDuration = "1.7.4";
@@ -229,10 +236,10 @@ namespace Raven.Server.Monitoring.Snmp
             [Description("IO write operations per second")]
             public const string StorageDiskIoWriteOperations = "1.10.6";
 
-            [Description("Read throughput in kilobytes pe second")]
+            [Description("Read throughput in kilobytes per second")]
             public const string StorageDiskReadThroughput = "1.10.7";
             
-            [Description("Write throughput in kilobytes pe second")]
+            [Description("Write throughput in kilobytes per second")]
             public const string StorageDiskWriteThroughput = "1.10.8";
             
             [Description("Queue length")]
@@ -246,6 +253,9 @@ namespace Raven.Server.Monitoring.Snmp
 
             [Description("List of well known admin certificate thumbprints")]
             public const string WellKnownAdminCertificates = "1.11.3";
+
+            [Description("List of well known admin certificate issuers")]
+            public const string WellKnownAdminIssuers = "1.11.4";
 
             [Description("Number of processor on the machine")]
             public const string MachineProcessorCount = "1.12.1";
@@ -271,6 +281,11 @@ namespace Raven.Server.Monitoring.Snmp
             [Description("Indicates if any experimental features are used")]
             public const string FeatureAnyExperimental = "1.16.1";
 
+            public const string ServerLimitsPrefix = "1.17.{0}";
+
+            [Description("Monitor lock contention count")]
+            public const string MonitorLockContentionCount = "1.18.1";
+
             public static DynamicJsonArray ToJson()
             {
                 var array = new DynamicJsonArray();
@@ -292,6 +307,16 @@ namespace Raven.Server.Monitoring.Snmp
 
 
                                 array.Add(CreateJsonItem(oid, $"{name} value from '{MemInfoReader.MemInfoFileName}'"));
+                            }
+                            break;
+                        case nameof(ServerLimitsPrefix):
+                            foreach (var propertyInfo in LimitsInfo.AllProperties.Values)
+                            {
+                                var index = propertyInfo.GetCustomAttribute<SnmpIndexAttribute>().Index;
+                                var description = propertyInfo.GetCustomAttribute<DescriptionAttribute>();
+                                var oid = Root + string.Format(ServerLimitsPrefix, index);
+
+                                array.Add(CreateJsonItem(oid, description.Description));
                             }
                             break;
                         default:
@@ -620,6 +645,66 @@ namespace Raven.Server.Monitoring.Snmp
 
                 [Description("Number of faulted databases")]
                 public const string FaultedCount = "5.1.10";
+
+                [Description("Number of enabled ongoing tasks for all databases")]
+                public const string TotalNumberOfOngoingTasks = "5.1.11.1";
+
+                [Description("Number of active ongoing tasks for all databases")]
+                public const string TotalNumberOfActiveOngoingTasks = "5.1.11.2";
+
+                [Description("Number of enabled external replication tasks for all databases")]
+                public const string TotalNumberOfExternalReplicationTasks = "5.1.11.3";
+
+                [Description("Number of active external replication tasks for all databases")]
+                public const string TotalNumberOfActiveExternalReplicationTasks = "5.1.11.4";
+
+                [Description("Number of enabled RavenDB ETL tasks for all databases")]
+                public const string TotalNumberOfRavenEtlTasks = "5.1.11.5";
+
+                [Description("Number of active RavenDB ETL tasks for all databases")]
+                public const string TotalNumberOfActiveRavenEtlTasks = "5.1.11.6";
+
+                [Description("Number of enabled SQL ETL tasks for all databases")]
+                public const string TotalNumberOfSqlEtlTasks = "5.1.11.7";
+
+                [Description("Number of active SQL ETL tasks for all databases")]
+                public const string TotalNumberOfActiveSqlEtlTasks = "5.1.11.8";
+
+                [Description("Number of enabled OLAP ETL tasks for all databases")]
+                public const string TotalNumberOfOlapEtlTasks = "5.1.11.9";
+
+                [Description("Number of active OLAP ETL tasks for all databases")]
+                public const string TotalNumberOfActiveOlapEtlTasks = "5.1.11.10";
+
+                [Description("Number of enabled Elasticsearch ETL tasks for all databases")]
+                public const string TotalNumberOfElasticSearchEtlTasks = "5.1.11.11";
+
+                [Description("Number of active Elasticsearch ETL tasks for all databases")]
+                public const string TotalNumberOfActiveElasticSearchEtlTasks = "5.1.11.12";
+
+                [Description("Number of enabled Queue ETL tasks for all databases")]
+                public const string TotalNumberOfQueueEtlTasks = "5.1.11.13";
+
+                [Description("Number of active Queue ETL tasks for all databases")]
+                public const string TotalNumberOfActiveQueueEtlTasks = "5.1.11.14";
+
+                [Description("Number of enabled Backup tasks for all databases")]
+                public const string TotalNumberOfBackupTasks = "5.1.11.15";
+
+                [Description("Number of active Backup tasks for all databases")]
+                public const string TotalNumberOfActiveBackupTasks = "5.1.11.16";
+
+                [Description("Number of enabled Subscription tasks for all databases")]
+                public const string TotalNumberOfSubscriptionTasks = "5.1.11.17";
+
+                [Description("Number of active Subscription tasks for all databases")]
+                public const string TotalNumberOfActiveSubscriptionTasks = "5.1.11.18";
+
+                [Description("Number of enabled Pull Replication As Sink tasks for all databases")]
+                public const string TotalNumberOfPullReplicationAsSinkTasks = "5.1.11.19";
+
+                [Description("Number of active Pull Replication As Sink tasks for all databases")]
+                public const string TotalNumberOfActivePullReplicationAsSinkTasks = "5.1.11.20";
 
                 public static DynamicJsonArray ToJson()
                 {

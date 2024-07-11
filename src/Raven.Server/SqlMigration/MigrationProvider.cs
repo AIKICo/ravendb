@@ -1,9 +1,13 @@
-﻿namespace Raven.Server.SqlMigration
+﻿using System;
+
+namespace Raven.Server.SqlMigration
 {
     public enum MigrationProvider
     {
         MsSQL,
-        MySQL,
+        [Obsolete("Unsupported provider. Use 'MySQL_MySqlConnector' instead.")]
+        MySQL_MySql_Data,
+        MySQL_MySqlConnector,
         NpgSQL,
         Oracle
     }

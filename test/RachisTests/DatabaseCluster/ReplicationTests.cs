@@ -20,6 +20,7 @@ using Raven.Server;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Replication;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.Utils;
 using Raven.Tests.Core.Utils.Entities;
 using Sparrow.Json;
 using Tests.Infrastructure;
@@ -205,11 +206,17 @@ namespace RachisTests.DatabaseCluster
                 var update = await source.Maintenance.SendAsync(op);
                 await Cluster.WaitForRaftIndexToBeAppliedInClusterAsync(update.RaftCommandIndex);
 
-                await WaitAndAssertForValueAsync(() =>
+                await WaitAndAssertForValueAsync(async () =>
                 {
-                    return Servers.SelectMany(s =>
+                    var databases = new List<DocumentDatabase>();
+                    foreach (var s in Servers)
                     {
-                        var db = s.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(source.Database).Result;
+                        var database = await s.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(source.Database);
+                        databases.Add(database);
+                    }
+
+                    return databases.SelectMany(db =>
+                    {
                         return db.ReplicationLoader.OutgoingHandlers.Where(h => h.Destination.Database == dest.Database);
                     }).Single()._parent._server.NodeTag;
                 }, otherNodeTag);
@@ -222,6 +229,59 @@ namespace RachisTests.DatabaseCluster
 
                 WaitForDocument(dest, "foo/bar/2");
                 Assert.Equal(1, fetched);
+            }
+        }
+
+        [Fact]
+        public async Task ReplicationsGetTcpInfoRequestExecutorWillNotTryToUpdateTopology_RavenDB_21366()
+        {
+            var cluster = await CreateRaftCluster(2, watcherCluster: true);
+            using (var store = GetDocumentStore(new Options
+            {
+                Server = cluster.Leader,
+                ReplicationFactor = 1
+            }))
+            {
+                await store.Maintenance.Server.SendAsync(new AddDatabaseNodeOperation(store.Database));
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    session.Advanced.WaitForReplicationAfterSaveChanges();
+                    await session.StoreAsync(new User(), "foo/bar2");
+                    await session.SaveChangesAsync();
+                }
+
+                await WaitAndAssertForValueAsync(async () =>
+                {
+                    foreach (var server in cluster.Nodes)
+                    {
+                        var database = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                        using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                        using (context.OpenReadTransaction())
+                        {
+                            var docs = database.DocumentsStorage.GetDocuments(context, new List<string>() { "foo/bar2" }, 0, long.MaxValue).ToList();
+                            return docs.Exists(x => x.Id == "foo/bar2");
+                        }
+                    }
+
+                    return false;
+                }, true);
+
+                foreach (var server in cluster.Nodes)
+                {
+                    var database = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                    if (database.ReplicationLoader._incomingRejectionStats.Count >= 1)
+                    {
+                        var connectionErrorQueue = database.ReplicationLoader._incomingRejectionStats.First().Value;
+                        foreach (var info in connectionErrorQueue)
+                        {
+                            if (info.Reason.Contains("Cannot have replication with source and destination being the same database"))
+                            {
+                                Assert.False(true, "Cannot have replication with source and destination being the same database");
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -611,9 +671,9 @@ namespace RachisTests.DatabaseCluster
                 var topology = databaseResult.Topology;
                 Assert.Equal(clusterSize, topology.AllNodes.Count());
 
-                await WaitForValueOnGroupAsync(topology, s =>
+                await WaitForValueOnGroupAsync(topology, async s =>
                {
-                   var db = s.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+                   var db = await s.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
                    return db.ReplicationLoader?.OutgoingConnections.Count();
                }, clusterSize - 1, 60000);
 
@@ -634,9 +694,9 @@ namespace RachisTests.DatabaseCluster
                 await Task.Delay(200); // twice the heartbeat
                 await Assert.ThrowsAsync<Exception>(async () =>
                 {
-                    await WaitForValueOnGroupAsync(topology, (s) =>
+                    await WaitForValueOnGroupAsync(topology, async (s) =>
                     {
-                        var db = s.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+                        var db = await s.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
                         return db.ReplicationLoader?.OutgoingHandlers.Any(o => o.GetReplicationPerformance().Any(p => p.Network.DocumentOutputCount > 0)) ?? false;
                     }, true);
                 });
@@ -713,9 +773,9 @@ namespace RachisTests.DatabaseCluster
                 // which means that we need to wait for replication to do a full mesh propagation
                 try
                 {
-                    await WaitForValueOnGroupAsync(topology, serverStore =>
+                    await WaitForValueOnGroupAsync(topology, async serverStore =>
                     {
-                        var database = serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+                        var database = await serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
 
                         using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                         using (context.OpenReadTransaction())
@@ -732,7 +792,7 @@ namespace RachisTests.DatabaseCluster
                     foreach (var node in topology.AllNodes)
                     {
                         var serverStore = Servers.Single(s => s.ServerStore.NodeTag == node).ServerStore;
-                        var database = serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+                        var database = await serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
                         using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                         using (context.OpenReadTransaction())
                         {
@@ -994,7 +1054,7 @@ namespace RachisTests.DatabaseCluster
                 try
                 {
                     var db = await srcLeader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(srcDB);
-                    var ex = await Assert.ThrowsAsync<AggregateException>(async () =>
+                    var ex = await Assert.ThrowsAsync<TimeoutException>(async () =>
                     {
                         var wait = Task.Delay(TimeSpan.FromSeconds(30));
                         var exec = Task.Run(() =>

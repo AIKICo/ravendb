@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,7 +14,6 @@ using Raven.Client;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Documents.Session.Operations;
-using Raven.Client.Exceptions.Documents.Revisions;
 using Raven.Server.Documents.Revisions;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications.Details;
@@ -73,7 +71,7 @@ namespace Raven.Server.Documents.Handlers
                 RevisionsCollectionConfiguration revisionsForConflictsConfig;
                 using (var rawRecord = Server.ServerStore.Cluster.ReadRawDatabaseRecord(context, Database.Name))
                 {
-                    revisionsForConflictsConfig = rawRecord?.RevisionsForConflicts;
+                    revisionsForConflictsConfig = rawRecord?.RevisionsForConflicts ?? Database.DocumentsStorage?.RevisionsStorage?.ConflictConfiguration?.Default;
                 }
 
                 if (revisionsForConflictsConfig != null)
@@ -90,21 +88,25 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
+        public const string ConflictedRevisionsConfigTag = "conflicted-revisions-config";
+
         [RavenAction("/databases/*/admin/revisions/conflicts/config", "POST", AuthorizationStatus.DatabaseAdmin)]
         public Task ConfigConflictedRevisions()
         {
             return DatabaseConfigurations(
                 ServerStore.ModifyRevisionsForConflicts,
-                "conflicted-revisions-config",
+                ConflictedRevisionsConfigTag,
                 GetRaftRequestIdFromQuery());
         }
+
+        public const string ReadRevisionsConfigTag = "read-revisions-config";
 
         [RavenAction("/databases/*/admin/revisions/config", "POST", AuthorizationStatus.DatabaseAdmin)]
         public Task ConfigRevisions()
         {
             return DatabaseConfigurations(
                 ServerStore.ModifyDatabaseRevisions,
-                "read-revisions-config",
+                ReadRevisionsConfigTag,
                 GetRaftRequestIdFromQuery(),
                 beforeSetupConfiguration: (string name, ref BlittableJsonReaderObject configuration, JsonOperationContext context) =>
                 {
@@ -132,14 +134,44 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/admin/revisions/config/enforce", "POST", AuthorizationStatus.DatabaseAdmin)]
         public async Task EnforceConfigRevisions()
         {
-            var token = CreateTimeLimitedOperationToken();
+            var token = CreateTimeLimitedBackgroundOperationToken();
             var operationId = ServerStore.Operations.GetNextOperationId();
+
+            EnforceRevisionsConfigurationRequest configuration;
+            using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            {
+                var json = await context.ReadForMemoryAsync(RequestBodyStream(), "revisions/revert");
+                configuration = JsonDeserializationServer.EnforceRevisionsConfiguration(json);
+            }
+
+            HashSet<string> collections = configuration.Collections?.Length > 0 ? new HashSet<string>(configuration.Collections, StringComparer.OrdinalIgnoreCase) : null;
 
             var t = Database.Operations.AddOperation(
                 Database,
                 $"Enforce revision configuration in database '{Database.Name}'.",
                 Operations.Operations.OperationType.EnforceRevisionConfiguration,
-                onProgress => Database.DocumentsStorage.RevisionsStorage.EnforceConfiguration(onProgress, token),
+                onProgress => Database.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(onProgress, configuration.IncludeForceCreated, collections, token),
+                operationId,
+                token: token);
+
+            using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            {
+                writer.WriteOperationIdAndNodeTag(context, operationId, ServerStore.NodeTag);
+            }
+        }
+
+        [RavenAction("/databases/*/admin/revisions/orphaned/adopt", "POST", AuthorizationStatus.DatabaseAdmin)]
+        public async Task AdoptOrphans()
+        {
+            var token = CreateTimeLimitedBackgroundOperationToken();
+            var operationId = ServerStore.Operations.GetNextOperationId();
+
+            var t = Database.Operations.AddOperation(
+                Database,
+                $"Adopting orphaned revisions in database '{Database.Name}'.",
+                Operations.Operations.OperationType.AdoptOrphanedRevisions,
+                onProgress => Database.DocumentsStorage.RevisionsStorage.AdoptOrphanedAsync(onProgress, token),
                 operationId,
                 token: token);
 
@@ -165,7 +197,7 @@ namespace Raven.Server.Documents.Handlers
         {
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
-            using (var token = CreateOperationToken())
+            using (var token = CreateHttpRequestBoundOperationToken())
             {
                 var changeVectors = GetStringValuesQueryString("changeVector", required: false);
                 var metadataOnly = GetBoolValueQueryString("metadataOnly", required: false) ?? false;
@@ -191,7 +223,7 @@ namespace Raven.Server.Documents.Handlers
             
             HashSet<string> collections = configuration.Collections?.Length > 0 ? new HashSet<string>(configuration.Collections, StringComparer.OrdinalIgnoreCase) : null;
 
-            var token = CreateTimeLimitedOperationToken();
+            var token = CreateTimeLimitedBackgroundOperationToken();
             var operationId = ServerStore.Operations.GetNextOperationId();
 
             var t = Database.Operations.AddOperation(
@@ -377,7 +409,7 @@ namespace Raven.Server.Documents.Handlers
             var date = Convert.ToDateTime(since).ToUniversalTime();
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
-            using (var token = CreateOperationToken())
+            using (var token = CreateHttpRequestBoundOperationToken())
             await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
             {
                 writer.WriteStartObject();
@@ -394,28 +426,32 @@ namespace Raven.Server.Documents.Handlers
             var revisionsStorage = Database.DocumentsStorage.RevisionsStorage;
 
             var sw = Stopwatch.StartNew();
-            var etag = GetLongQueryString("etag", false) ?? long.MaxValue;
+            var etag = GetLongQueryString("etag", false) ?? 0;
             var pageSize = GetPageSize();
 
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
             {
-                revisionsStorage.GetLatestRevisionsBinEntryEtag(context, etag, out var actualChangeVector);
+                string match = null;
+                revisionsStorage.GetLatestRevisionsBinEntry(context, out var actualChangeVector);
+                
                 if (actualChangeVector != null)
                 {
-                    if (GetStringFromHeaders(Constants.Headers.IfNoneMatch) == actualChangeVector)
+                    var countRevs = revisionsStorage.GetNumberOfRevisionDocuments(context);
+                    match = $"{actualChangeVector}/{countRevs}";
+                    if (GetStringFromHeaders(Constants.Headers.IfNoneMatch) == match)
                     {
                         HttpContext.Response.StatusCode = (int)HttpStatusCode.NotModified;
                         return;
                     }
-
-                    HttpContext.Response.Headers["ETag"] = "\"" + actualChangeVector + "\"";
                 }
+
+                HttpContext.Response.Headers["ETag"] = "\"" + match + "\"";
 
                 long count;
                 long totalDocumentsSizeInBytes;
 
-                using (var token = CreateOperationToken())
+                using (var token = CreateHttpRequestBoundOperationToken())
                 await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
                     writer.WriteStartObject();

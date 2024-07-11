@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Raven.Client.Documents.Operations.ETL.Queue;
+using Raven.Server.Documents.ETL.Providers.Queue.Kafka;
+using Raven.Server.Documents.ETL.Providers.Queue.RabbitMq;
 using Raven.Server.Documents.ETL.Stats;
 using Raven.Server.Json;
 using Raven.Server.Routing;
@@ -100,23 +103,34 @@ namespace Raven.Server.Documents.ETL.Handlers
             {
                 var etls = GetProcessesToReportOn();
 
-                var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
-                var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
-
-                await using (var ms = new MemoryStream())
-                using (var collector = new LiveEtlPerformanceCollector(Database, etls))
+                try
                 {
-                    // 1. Send data to webSocket without making UI wait upon opening webSocket
-                    await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+                    var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
+                    var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
 
-                    // 2. Send data to webSocket when available
-                    while (Database.DatabaseShutdown.IsCancellationRequested == false)
+                    await using (var ms = new MemoryStream())
+                    using (var collector = new LiveEtlPerformanceCollector(Database, etls))
                     {
-                        if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                        // 1. Send data to webSocket without making UI wait upon opening webSocket
+                        await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+
+                        // 2. Send data to webSocket when available
+                        while (Database.DatabaseShutdown.IsCancellationRequested == false)
                         {
-                            break;
+                            if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                            {
+                                break;
+                            }
                         }
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    // disposing
+                }
+                catch (ObjectDisposedException)
+                {
+                    // disposing
                 }
             }
         }
@@ -132,7 +146,13 @@ namespace Raven.Server.Documents.ETL.Handlers
                 {
                     TaskName = x.Key,
                     EtlType = x.Value.First().EtlType,
-                    ProcessesProgress = x.Value.Select(y => y.GetProgress(context)).ToArray()
+                    ProcessesProgress = x.Value.Select(y => y.GetProgress(context)).ToArray(),
+                    QueueBrokerType = x.Value.First() switch
+                    {
+                        RabbitMqEtl => QueueBrokerType.RabbitMq,
+                        KafkaEtl => QueueBrokerType.Kafka,
+                        _ => null
+                    }
                 }).ToArray();
 
                 writer.WriteEtlTaskProgress(context, performance);

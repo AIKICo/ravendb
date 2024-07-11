@@ -14,15 +14,17 @@ using FastTests.Utils;
 using Newtonsoft.Json;
 using Raven.Client;
 using Raven.Client.Documents;
+using Raven.Client.Documents.Commands;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.CompareExchange;
-using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Operations.OngoingTasks;
 using Raven.Client.Documents.Operations.TimeSeries;
 using Raven.Client.Documents.Session;
 using Raven.Client.Documents.Smuggler;
+using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents;
 using Raven.Client.Http;
@@ -30,7 +32,10 @@ using Raven.Client.Json.Serialization;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
+using Raven.Server;
+using Raven.Server.Config;
 using Raven.Server.Documents;
+using Raven.Server.Documents.Operations;
 using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Documents.PeriodicBackup.Restore;
 using Raven.Server.Json;
@@ -38,20 +43,27 @@ using Raven.Server.ServerWide.Commands.PeriodicBackup;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
 using Sparrow;
+using Sparrow.Backups;
 using Sparrow.Json;
+using Sparrow.Server;
 using Sparrow.Server.Json.Sync;
 using Tests.Infrastructure;
 using Tests.Infrastructure.Entities;
 using Voron.Data.Tables;
 using Xunit;
 using Xunit.Abstractions;
+using static Raven.Server.Utils.BackupUtils;
+using BackupUtils = Raven.Client.Documents.Smuggler.BackupUtils;
 
 namespace SlowTests.Server.Documents.PeriodicBackup
 {
     public class PeriodicBackupTestsSlow : ClusterTestBase
     {
+        private readonly ITestOutputHelper _output;
+
         public PeriodicBackupTestsSlow(ITestOutputHelper output) : base(output)
         {
+            _output = output;
         }
 
         [Fact, Trait("Category", "Smuggler")]
@@ -433,26 +445,34 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var backup = await store.Maintenance.SendAsync(new UpdatePeriodicBackupOperation(config));
 
+                Backup.WaitForResponsibleNodeUpdate(Server.ServerStore, store.Database, backup.TaskId);
+
                 var documentDatabase = (await Databases.GetDocumentDatabaseInstanceFor(store));
                 var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
                 var now = DateTime.UtcNow;
-                var nextBackupDetails = documentDatabase.PeriodicBackupRunner.GetNextBackupDetails(record, record.PeriodicBackups.First(), new PeriodicBackupStatus
+                var nextBackupDetails = documentDatabase.PeriodicBackupRunner.GetNextBackupDetails(record.PeriodicBackups.First(), new PeriodicBackupStatus
                 {
                     LastFullBackupInternal = now.AddDays(-360)
-                }, Server.ServerStore.NodeTag);
+                }, out var responsibleNode);
 
+                Assert.NotNull(nextBackupDetails);
                 Assert.Equal(backup.TaskId, nextBackupDetails.TaskId);
+                Assert.Equal("A", responsibleNode);
                 Assert.Equal(TimeSpan.Zero, nextBackupDetails.TimeSpan);
                 Assert.Equal(true, nextBackupDetails.IsFull);
                 Assert.True(nextBackupDetails.DateTime >= now);
             }
         }
 
-        [Theory, Trait("Category", "Smuggler")]
-        [InlineData(CompressionLevel.Optimal)]
-        [InlineData(CompressionLevel.Fastest)]
-        [InlineData(CompressionLevel.NoCompression)]
-        public async Task can_backup_and_restore_snapshot(CompressionLevel compressionLevel)
+        [RavenTheory(RavenTestCategory.BackupExportImport), Trait("Category", "Smuggler")]
+        [InlineData(null, CompressionLevel.Optimal)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Zstd, CompressionLevel.Optimal)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.Optimal)]
+        [InlineData(null, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Zstd, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.NoCompression)]
+        public async Task can_backup_and_restore_snapshot(SnapshotBackupCompressionAlgorithm? algorithm, CompressionLevel compressionLevel)
         {
             var backupPath = NewDataPath(suffix: "BackupFolder");
             using (var store = GetDocumentStore())
@@ -480,7 +500,11 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 }
 
                 var config = Backup.CreateBackupConfiguration(backupPath, backupType: BackupType.Snapshot);
-                config.SnapshotSettings = new SnapshotSettings { CompressionLevel = compressionLevel };
+                config.SnapshotSettings = new SnapshotSettings
+                {
+                    CompressionAlgorithm = algorithm,
+                    CompressionLevel = compressionLevel
+                };
                 var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
 
                 using (var session = store.OpenAsyncSession())
@@ -614,7 +638,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
         }
 
 
-        [Theory, Trait("Category", "Smuggler")]
+        [RavenTheory(RavenTestCategory.BackupExportImport), Trait("Category", "Smuggler")]
         [InlineData(BackupType.Snapshot)]
         [InlineData(BackupType.Backup)]
         public async Task can_backup_and_restore_snapshot_with_compare_exchange(BackupType backupType)
@@ -642,7 +666,6 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             Assert.Equal(ids.Length, sourceStats.CountOfCompareExchange);
 
             var config = Backup.CreateBackupConfiguration(backupPath, backupType: backupType);
-            config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
             var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
 
             var lastEtag = store.Maintenance.Send(new GetStatisticsOperation()).LastDatabaseEtag;
@@ -733,8 +756,15 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
         }
 
-        [Fact, Trait("Category", "Smuggler")]
-        public async Task can_backup_and_restore_snapshot_with_compression()
+        [RavenTheory(RavenTestCategory.BackupExportImport), Trait("Category", "Smuggler")]
+        [InlineData(null, CompressionLevel.Optimal)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Zstd, CompressionLevel.Optimal)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.Optimal)]
+        [InlineData(null, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Zstd, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.Fastest)]
+        [InlineData(SnapshotBackupCompressionAlgorithm.Deflate, CompressionLevel.NoCompression)]
+        public async Task can_backup_and_restore_snapshot_with_compression(SnapshotBackupCompressionAlgorithm algorithm, CompressionLevel compressionLevel)
         {
             var backupPath = NewDataPath(suffix: "BackupFolder");
             using (var store = GetDocumentStore(new Options
@@ -760,7 +790,11 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 Assert.Equal(2, compressionRecovery.Length);
 
                 var config = Backup.CreateBackupConfiguration(backupPath, backupType: BackupType.Snapshot);
-                config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
+                config.SnapshotSettings = new SnapshotSettings
+                {
+                    CompressionAlgorithm = algorithm,
+                    CompressionLevel = compressionLevel
+                };
                 var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
 
                 var lastEtag = store.Maintenance.Send(new GetStatisticsOperation()).LastDocEtag;
@@ -1589,6 +1623,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 await Cluster.WaitForRaftIndexToBeAppliedInClusterAsync(periodicBackupTaskId, TimeSpan.FromSeconds(15));
 
+                Backup.WaitForResponsibleNodeUpdateInCluster(store, cluster.Nodes, periodicBackupTaskId);
                 await Backup.RunBackupInClusterAsync(store, result.TaskId, isFullBackup: true);
                 await ActionWithLeader(async x => await Cluster.WaitForRaftCommandToBeAppliedInClusterAsync(x, nameof(UpdatePeriodicBackupStatusCommand)), cluster.Nodes);
 
@@ -1821,7 +1856,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var data = new StringContent(JsonConvert.SerializeObject(localSettings), Encoding.UTF8, "application/json");
                 var response = await client.PostAsync(store.Urls.First() + "/admin/restore/points?type=Local ", data);
-                string result = response.Content.ReadAsStringAsync().Result;
+                string result = await response.Content.ReadAsStringAsync();
                 var restorePoints = JsonConvert.DeserializeObject<RestorePoints>(result);
                 Assert.Equal(1, restorePoints.List.Count);
                 var point = restorePoints.List.First();
@@ -1847,8 +1882,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                         Assert.Equal(100, val);
                     }
 
-                    var originalDatabase = Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).Result;
-                    var restoredDatabase = Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+                    var originalDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                    var restoredDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
                     using (restoredDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
                     using (ctx.OpenReadTransaction())
                     {
@@ -2047,6 +2082,50 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task CanAbortOneTimeBackupAndRestore()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using (var store = GetDocumentStore(new Options { DeleteDatabaseOnDispose = true, Path = NewDataPath() }))
+            {
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "RavenDB-20991" }, "users/1");
+                    await session.SaveChangesAsync();
+                }
+
+                var config = new BackupConfiguration
+                {
+                    BackupType = BackupType.Backup,
+                    LocalSettings = new LocalSettings
+                    {
+                        FolderPath = backupPath
+                    }
+                };
+
+                var database = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+
+                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var backupOperationId = await store.Maintenance.SendAsync(new BackupOperation(config));
+                    var operationId = backupOperationId.Id;
+                    await store.Commands().ExecuteAsync(new KillOperationCommand(operationId));
+                    tcs.TrySetResult(null);
+
+                    WaitForValue(() => database.Operations.HasActive, false);
+                    Assert.False(database.Operations.HasActive);
+
+                    var operation = database.Operations.GetOperation(operationId);
+                    Assert.True(operation.Description.TaskType is Operations.OperationType.DatabaseBackup);
+                    Assert.True(operation.Description.Description == $"Manual backup for database: {database.Name}");
+                    Assert.True(operation.State.Status is OperationStatus.Canceled);
+                    Assert.Null(operation.State.Progress);
+                    Assert.Null(operation.State.Result);
+                }, tcs);
+            }
+        }
+
         [Theory, Trait("Category", "Smuggler")]
         [InlineData(BackupType.Snapshot)]
         [InlineData(BackupType.Backup)]
@@ -2095,7 +2174,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 var client = store.GetRequestExecutor().HttpClient;
                 // one time backup always save the status under task id 0
                 var response = await client.GetAsync(store.Urls.First() + $"/periodic-backup/status?name={store.Database}&taskId=0");
-                string result = response.Content.ReadAsStringAsync().Result;
+                string result = await response.Content.ReadAsStringAsync();
                 using (var ctx = JsonOperationContext.ShortTermSingleUse())
                 {
                     using var bjro = ctx.Sync.ReadForMemory(result, "test");
@@ -2224,7 +2303,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var client = store.GetRequestExecutor().HttpClient;
                 var response = await client.GetAsync(store.Urls.First() + $"/databases?name={store.Database}");
-                string result = response.Content.ReadAsStringAsync().Result;
+                string result = await response.Content.ReadAsStringAsync();
                 using (var ctx = JsonOperationContext.ShortTermSingleUse())
                 {
                     using var bjro = ctx.Sync.ReadForMemory(result, "test");
@@ -2299,8 +2378,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 }
 
                 var config = Backup.CreateBackupConfiguration(backupPath, incrementalBackupFrequency: "* * * * *");
-                var backupTaskId = await Backup.CreateAndRunBackupInClusterAsync(config, store);
-                var responsibleNode = await Backup.GetBackupResponsibleNode(cluster.Leader, backupTaskId, databaseName, keepTaskOnOriginalMemberNode: true);
+                var backupTaskId = await Backup.CreateAndRunBackupInClusterAsync(config, store, cluster.Nodes);
+                var responsibleNode = Backup.GetBackupResponsibleNode(cluster.Leader, backupTaskId, databaseName, keepTaskOnOriginalMemberNode: true);
 
                 store.Maintenance.Server.Send(new DeleteDatabasesOperation(databaseName, hardDelete: true, fromNode: responsibleNode, timeToWaitForConfirmation: TimeSpan.FromSeconds(30)));
                 await WaitForDatabaseToBeDeleted(store, TimeSpan.FromSeconds(30));
@@ -2308,8 +2387,9 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 var server = cluster.Nodes.FirstOrDefault(x => x.ServerStore.NodeTag == responsibleNode == false);
                 server.ServerStore.LicenseManager.LicenseStatus.Attributes["highlyAvailableTasks"] = false;
 
-                var newResponsibleNode = await Backup.GetBackupResponsibleNode(server, backupTaskId, databaseName, keepTaskOnOriginalMemberNode: true);
+                Backup.WaitForResponsibleNodeUpdate(server.ServerStore, databaseName, backupTaskId, responsibleNode);
 
+                var newResponsibleNode = Backup.GetBackupResponsibleNode(server, backupTaskId, databaseName, keepTaskOnOriginalMemberNode: true);
                 Assert.Equal(server.ServerStore.NodeTag, newResponsibleNode);
                 Assert.NotEqual(responsibleNode, newResponsibleNode);
             }
@@ -2331,7 +2411,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                         }
                         continue;
                     }
-                    var dbRecord = dbTask.Result;
+                    var dbRecord = await dbTask;
                     if (dbRecord == null || dbRecord.DeletionInProgress == null || dbRecord.DeletionInProgress.Count == 0)
                     {
                         return true;
@@ -2756,9 +2836,9 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var documentDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
                 Assert.NotNull(documentDatabase);
-                var tcs = new TaskCompletionSource<object>();
-                documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = tcs;
-                try
+
+                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
                 {
                     var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(server, config, store, opStatus: OperationStatus.InProgress);
                     var record1 = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
@@ -2772,8 +2852,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     Assert.Equal(server.ServerStore.NodeTag, tag);
 
                     responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().SimulateActiveByOtherNodeStatus_UpdateConfigurations = true;
-                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1);
-                    tcs.SetResult(null);
+                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1.PeriodicBackups);
+                    tcs.TrySetResult(null);
 
                     responsibleDatabase.PeriodicBackupRunner._forTestingPurposes = null;
                     var getPeriodicBackupStatus = new GetPeriodicBackupStatusOperation(taskId);
@@ -2786,20 +2866,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     Assert.NotNull(status);
                     Assert.Null(status.Error);
                     Assert.True(val, "Failed to complete the backup in time");
-                }
-                finally
-                {
-                    try
-                    {
-                        tcs.TrySetResult(null);
-                    }
-                    catch
-                    {
-                        // ignored
-                    }
-
-                    documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = null;
-                }
+                }, tcs);
             }
         }
 
@@ -2824,9 +2891,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var documentDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
                 Assert.NotNull(documentDatabase);
-                var tcs = new TaskCompletionSource<object>();
-                documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = tcs;
-                try
+                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
                 {
                     var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(server, config, store, opStatus: OperationStatus.InProgress);
                     var record1 = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
@@ -2840,38 +2906,609 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     Assert.Equal(server.ServerStore.NodeTag, tag);
 
                     responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().SimulateDisableNodeStatus_UpdateConfigurations = true;
-                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1);
-                    tcs.SetResult(null);
+                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1.PeriodicBackups);
+                    tcs.TrySetResult(null);
 
                     responsibleDatabase.PeriodicBackupRunner._forTestingPurposes = null;
-                    var getPeriodicBackupStatus = new GetPeriodicBackupStatusOperation(taskId);
                     var val = WaitForValue(() =>
                     {
-                        var status = store.Maintenance.Send(getPeriodicBackupStatus).Status;
-                        if (status == null)
+                        var ongoingTaskBackup = store.Maintenance.Send(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                        if (ongoingTaskBackup == null)
                             return false;
 
-                        if (status.LocalBackup == null)
-                            return false;
-                        if (string.IsNullOrEmpty(status.LocalBackup.Exception))
+                        if (ongoingTaskBackup.BackupDestinations.Count != 1 &&
+                            ongoingTaskBackup.BackupDestinations[0] != nameof(BackupConfiguration.BackupDestination.Local))
                             return false;
 
-                        return true;
+                        return ongoingTaskBackup.OnGoingBackup == null;
                     }, true, timeout: 66666, interval: 444);
                     Assert.True(val, "Failed to complete the backup in time");
-                }
-                finally
+                }, tcs);
+            }
+        }
+
+        // Performing backup Delay to the time:
+        [InlineData(1)] // until the next scheduled backup time.
+        [InlineData(5)] // after the next scheduled backup.
+        [Theory, Trait("Category", "Smuggler")]
+        public async Task ShouldProperlyPlaceOriginalBackupTimePropertyWithDelay(int delayDurationInMinutes)
+        {
+            const string fullBackupFrequency = "*/2 * * * *";
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+
+            using (var server = GetNewServer())
+            using (var store = GetDocumentStore(new Options { Server = server }))
+            {
+                using (var session = store.OpenAsyncSession())
+                    await Backup.FillDatabaseWithRandomDataAsync(databaseSizeInMb: 1, session);
+
+                var database = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                Assert.NotNull(database);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
                 {
-                    try
+                    WaitForValue(() =>
                     {
+                        var now = DateTime.Now;
+                        return now.Minute % 2 == 0 && now.Second <= 10;
+                    },
+                       expectedVal: true,
+                       timeout: (int)TimeSpan.FromMinutes(2).TotalMilliseconds,
+                       interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds
+                   );
+
+                    var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: fullBackupFrequency);
+                    var taskId = await Backup.UpdateConfigAndRunBackupAsync(server, config, store, opStatus: OperationStatus.InProgress);
+                    // Let's delay the backup task
+                    var taskBackupInfo = await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                    Assert.NotNull(taskBackupInfo);
+                    Assert.NotNull(taskBackupInfo.OnGoingBackup);
+                    Assert.NotNull(taskBackupInfo.OnGoingBackup.StartTime);
+
+                    var delayDuration = TimeSpan.FromMinutes(delayDurationInMinutes);
+                    var delayUntil = DateTime.Now + delayDuration;
+                    await store.Maintenance.SendAsync(new DelayBackupOperation(taskBackupInfo.OnGoingBackup.RunningBackupTaskId, delayDuration));
+
+                    // There should be no OnGoingBackup operation in the OngoingTaskBackup
+                    await WaitForValueAsync(async () =>
+                    {
+                        var afterDelayTaskBackupInfo = await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                        return afterDelayTaskBackupInfo is { OnGoingBackup: null };
+                    }, true);
+
+                    var backupStatus = (await store.Maintenance.SendAsync(new GetPeriodicBackupStatusOperation(taskId))).Status;
+                    Assert.NotNull(backupStatus);
+                    Assert.NotNull(backupStatus.DelayUntil);
+                    Assert.NotNull(backupStatus.OriginalBackupTime);
+
+                    var nextFullBackup = GetNextBackupOccurrence(new NextBackupOccurrenceParameters
+                    {
+                        BackupFrequency = fullBackupFrequency,
+                        Configuration = config,
+                        LastBackupUtc = taskBackupInfo.OnGoingBackup.StartTime.Value
+                    });
+                    Assert.NotNull(nextFullBackup);
+
+                    Assert.Equal(backupStatus.OriginalBackupTime,
+                        delayUntil < nextFullBackup
+                            ? taskBackupInfo.OnGoingBackup.StartTime    // until the next scheduled backup time.
+                            : nextFullBackup.Value.ToUniversalTime());  // after the next scheduled backup.
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task ShouldHaveFailoverForFirstBackupInNewBackupTask()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+
+            using (var server = GetNewServer())
+            using (var store = GetDocumentStore(new Options { Server = server }))
+            {
+                using (var session = store.OpenAsyncSession())
+                    await Backup.FillDatabaseWithRandomDataAsync(databaseSizeInMb: 10, session);
+
+                var database = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                Assert.NotNull(database);
+
+                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *");
+                    var updatePeriodicBackupOperation = await store.Maintenance.SendAsync(new UpdatePeriodicBackupOperation(config));
+                    var taskId = updatePeriodicBackupOperation.TaskId;
+
+                    OngoingTaskBackup taskBackupInfo = null;
+                    using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(server.WebUrl, null, DocumentConventions.DefaultForServer))
+                    using (requestExecutor.ContextPool.AllocateOperationContext(out var ctx))
+                    {
+                        await WaitForValueAsync(async () =>
+                        {
+                            taskBackupInfo = await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                            return taskBackupInfo?.OnGoingBackup != null;
+                        },
+                            expectedVal: true,
+                            timeout: (int)TimeSpan.FromMinutes(2).TotalMilliseconds,
+                            interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
+                        Assert.NotNull(taskBackupInfo);
+                        Assert.Null(taskBackupInfo.LastFullBackup);
+                        Assert.NotNull(taskBackupInfo.OnGoingBackup);
+
+                        await store.GetRequestExecutor(store.Database)
+                            .ExecuteAsync(new KillOperationCommand(taskBackupInfo.OnGoingBackup.RunningBackupTaskId, server.ServerStore.NodeTag), ctx);
+
                         tcs.TrySetResult(null);
                     }
-                    catch
+
+                    PeriodicBackupStatus backupStatus = null;
+                    await WaitForValueAsync(async () =>
                     {
-                        // ignored
+                        backupStatus = (await store.Maintenance.SendAsync(new GetPeriodicBackupStatusOperation(taskId))).Status;
+                        return backupStatus != null;
+                    }, true);
+
+                    Assert.True(backupStatus != null,
+                        $"The cluster did not display data about the successful completion of at least one backup at the designated time. The {nameof(backupStatus)} is null.");
+                    Assert.True(backupStatus.LastOperationId > taskBackupInfo.OnGoingBackup.RunningBackupTaskId,
+                        "The first backup operation unexpectedly completed successfully. " +
+                        "We were testing failover behavior and expected the first operation to be cancelled, followed by successful completion of the second operation. " +
+                        "This scenario should never occur.");
+                }, tcs);
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task CanDelayBackupTask()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using (var server = GetNewServer())
+            using (var store = GetDocumentStore(new Options { Server = server }))
+            {
+                using (var session = store.OpenAsyncSession())
+                    await Backup.FillDatabaseWithRandomDataAsync(databaseSizeInMb: 10, session);
+
+                var database = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                Assert.NotNull(database);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var config = Backup.CreateBackupConfiguration(backupPath);
+                    var taskId = await Backup.UpdateConfigAndRunBackupAsync(server, config, store, opStatus: OperationStatus.InProgress);
+
+                    // The backup task is running, and the next backup should be scheduled for the 1 January next year (local time)
+                    var taskBackupInfo =
+                        await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+
+                    Assert.NotNull(taskBackupInfo);
+                    Assert.NotNull(taskBackupInfo.OnGoingBackup);
+
+                    var expectedNextBackupDateTime = new DateTime(DateTime.Now.Year + 1, 1, 1, 0, 0, 0, DateTimeKind.Local).ToUniversalTime();
+                    Assert.Equal(expectedNextBackupDateTime, taskBackupInfo.NextBackup.DateTime);
+
+                    // Let's delay the backup task to next occurence + 1 hour
+                    var delayDuration = expectedNextBackupDateTime - DateTime.UtcNow + TimeSpan.FromHours(1);
+                    var sw = Stopwatch.StartNew();
+                    await store.Maintenance.SendAsync(new DelayBackupOperation(taskBackupInfo.OnGoingBackup.RunningBackupTaskId, delayDuration));
+
+                    // There should be no OnGoingBackup operation in the OngoingTaskBackup
+                    // The next backup should be scheduled in delayDuration
+                    OngoingTaskBackup afterDelayTaskBackupInfo = null;
+                    var expectedAfterDelay = expectedNextBackupDateTime.AddHours(1);
+
+                    Assert.True(await WaitForValueAsync(async () =>
+                    {
+                        afterDelayTaskBackupInfo =
+                            await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+
+                        return afterDelayTaskBackupInfo != null && afterDelayTaskBackupInfo.OnGoingBackup == null
+                                                                && afterDelayTaskBackupInfo.NextBackup.DateTime.Year == expectedAfterDelay.Year
+                                                                && afterDelayTaskBackupInfo.NextBackup.DateTime.Month == expectedAfterDelay.Month
+                                                                && afterDelayTaskBackupInfo.NextBackup.DateTime.Hour == expectedAfterDelay.Hour
+                                                                && afterDelayTaskBackupInfo.NextBackup.DateTime.Minute == expectedAfterDelay.Minute
+                                                                && afterDelayTaskBackupInfo.NextBackup.DateTime.Second == expectedAfterDelay.Second;
+                    }, true), $"NextBackup in: `{afterDelayTaskBackupInfo.NextBackup.TimeSpan}`, delayDuration with tolerance: `{delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000))}`, " +
+                              $"delayDuration: `{delayDuration}`");
+
+
+                    Assert.Null(afterDelayTaskBackupInfo.LastFullBackup);
+
+                    // DelayUntil value in backup status and the time of scheduled next backup should be equal
+                    var backupStatus = (await store.Maintenance.SendAsync(new GetPeriodicBackupStatusOperation(taskId))).Status;
+                    Assert.NotNull(backupStatus);
+                    Assert.NotNull(backupStatus.DelayUntil);
+                    Assert.Equal(backupStatus.DelayUntil, afterDelayTaskBackupInfo.NextBackup.DateTime);
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task ShouldDelayBackupOnNotResponsibleNode()
+        {
+            const int clusterSize = 3;
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            var databaseName = GetDatabaseName();
+
+            var (nodes, leaderServer) = await CreateRaftCluster(clusterSize);
+            await CreateDatabaseInCluster(databaseName, clusterSize, leaderServer.WebUrl);
+
+            using (var leaderStore = new DocumentStore
+            {
+                Urls = new[] { leaderServer.WebUrl },
+                Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                Database = databaseName
+            })
+            {
+                leaderStore.Initialize();
+                await Backup.FillClusterDatabaseWithRandomDataAsync(databaseSizeInMb: 10, leaderStore, clusterSize);
+
+                var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *", mentorNode: leaderServer.ServerStore.NodeTag);
+                var taskId = await Backup.UpdateConfigAndRunBackupAsync(leaderServer, config, leaderStore);
+
+                var responsibleDatabase = await leaderServer.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(leaderStore.Database).ConfigureAwait(false);
+                Assert.NotNull(responsibleDatabase);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var now = DateTime.UtcNow;
+                    var expectedNextBackupDateTime = now.Date
+                        .AddHours(now.Hour)
+                        .AddMinutes(now.Minute + 1);
+
+                    await Backup.RunBackupInClusterAsync(leaderStore, taskId, opStatus: OperationStatus.InProgress);
+
+                    // Just to be sure, the DelayUntil value was not set before the task delaying
+                    var backupStatus = (await leaderStore.Maintenance.SendAsync(new GetPeriodicBackupStatusOperation(taskId))).Status;
+                    Assert.NotNull(backupStatus);
+                    Assert.Null(backupStatus.DelayUntil);
+
+                    // The backup task is running on the mentor node, and the next backup should be scheduled for the next minute (based on the backup configuration) without any errors
+                    OngoingTaskBackup onGoingTaskInfo = null;
+                    await WaitForValueAsync(async () =>
+                    {
+                        onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+
+                        return onGoingTaskInfo != null &&
+                               leaderServer.ServerStore.NodeTag == onGoingTaskInfo.MentorNode &&
+                               onGoingTaskInfo.Error == null &&
+                               expectedNextBackupDateTime == onGoingTaskInfo.NextBackup.DateTime &&
+                               onGoingTaskInfo.OnGoingBackup != null &&
+                               onGoingTaskInfo.TaskConnectionStatus == OngoingTaskConnectionStatus.Active;
+                    }, expectedVal: true,
+                        timeout: (int)TimeSpan.FromMinutes(5).TotalMilliseconds,
+                        interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
+                    Assert.NotNull(onGoingTaskInfo);
+                    Assert.True(leaderServer.ServerStore.NodeTag == onGoingTaskInfo.MentorNode, userMessage: $"The value of 'leaderServer.ServerStore.NodeTag': {leaderServer.ServerStore.NodeTag} is not equal to 'onGoingTaskInfo.MentorNode': {onGoingTaskInfo.MentorNode}.");
+                    Assert.True(onGoingTaskInfo.Error == null, userMessage: $"The onGoingTaskInfo.Error is not null: {onGoingTaskInfo.Error}.");
+                    Assert.True(expectedNextBackupDateTime == onGoingTaskInfo.NextBackup.DateTime, userMessage: $"The 'expectedNextBackupDateTime': {expectedNextBackupDateTime} is not equal to 'onGoingTaskInfo.NextBackup.DateTime': {onGoingTaskInfo.NextBackup.DateTime}.");
+                    Assert.NotNull(onGoingTaskInfo.OnGoingBackup);
+                    Assert.True(onGoingTaskInfo.TaskConnectionStatus == OngoingTaskConnectionStatus.Active, userMessage: $"The onGoingTaskInfo.TaskConnectionStatus is {onGoingTaskInfo.TaskConnectionStatus}, which is not {nameof(OngoingTaskConnectionStatus.Active)} as expected.");
+
+                    // Let's delay the backup task to 1 hour
+                    var delayDuration = TimeSpan.FromHours(1);
+                    var sw = Stopwatch.StartNew();
+                    var runningBackupTaskId = onGoingTaskInfo.OnGoingBackup.RunningBackupTaskId;
+                    await leaderStore.Maintenance.SendAsync(new DelayBackupOperation(runningBackupTaskId, delayDuration));
+
+                    // The next backup should be scheduled in almost 1 hour on the current periodic backup task
+                    Raven.Server.Documents.PeriodicBackup.PeriodicBackup periodicBackup = null;
+                    TimeSpan nextBackup = default;
+                    WaitForValue(() =>
+                    {
+                        periodicBackup = responsibleDatabase.PeriodicBackupRunner.PeriodicBackups.Single(x => x.BackupStatus.TaskId == taskId);
+                        nextBackup = periodicBackup.GetNextBackup().TimeSpan;
+
+                        return periodicBackup is { RunningTask: null, RunningBackupStatus: null } &&
+                               nextBackup > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) && nextBackup <= delayDuration;
+                    }, expectedVal: true,
+                         timeout: (int)TimeSpan.FromMinutes(5).TotalMilliseconds,
+                         interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
+                    Assert.NotNull(periodicBackup);
+                    Assert.Null(periodicBackup.RunningTask);
+                    Assert.Null(periodicBackup.RunningBackupStatus);
+                    Assert.True(nextBackup > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) && nextBackup <= delayDuration,
+                        $"The NextBackup is set for: {nextBackup}, the delay duration with tolerance is: {delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000))}, and the actual delay duration is: {delayDuration}.");
+
+                    await WaitForValueAsync(async () =>
+                    {
+                        onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+
+                        return onGoingTaskInfo != null &&
+                               onGoingTaskInfo.ResponsibleNode.NodeTag == leaderServer.ServerStore.NodeTag;
+                    }, expectedVal: true,
+                        timeout: (int)TimeSpan.FromMinutes(5).TotalMilliseconds,
+                        interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
+                    Assert.NotNull(onGoingTaskInfo);
+                    Assert.Equal(onGoingTaskInfo.ResponsibleNode.NodeTag, leaderServer.ServerStore.NodeTag);
+
+                    // We'll check another (not leader) nodes in cluster
+                    foreach (var server in nodes.Where(node => node != leaderServer))
+                    {
+                        await AssertNextBackupSchedule(server, delayDuration, databaseName, taskId, sw);
                     }
-                    documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = null;
-                }
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task ShouldScheduleNextBackupAfterServerRestartCorrectly()
+        {
+            const int clusterSize = 3;
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            var databaseName = GetDatabaseName();
+
+            var (nodes, leaderServer) = await CreateRaftCluster(clusterSize);
+            await CreateDatabaseInCluster(databaseName, clusterSize, leaderServer.WebUrl);
+            var notLeaderServer = nodes.First(x => x != leaderServer);
+
+            using (var leaderStore = new DocumentStore
+            {
+                Urls = new[] { leaderServer.WebUrl },
+                Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                Database = databaseName
+            })
+            {
+                leaderStore.Initialize();
+                await Backup.FillClusterDatabaseWithRandomDataAsync(databaseSizeInMb: 10, leaderStore, clusterSize);
+
+                var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *", mentorNode: leaderServer.ServerStore.NodeTag);
+                var taskId = await Backup.UpdateConfigAndRunBackupAsync(leaderServer, config, leaderStore);
+
+                var database = await leaderServer.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(leaderStore.Database).ConfigureAwait(false);
+                Assert.NotNull(database);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    await Backup.RunBackupAsync(leaderServer, taskId, leaderStore, opStatus: OperationStatus.InProgress);
+
+                    // Let's delay the backup task to 1 hour
+                    var delayDuration = TimeSpan.FromHours(1);
+                    var sw = Stopwatch.StartNew();
+                    var onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                    Assert.NotNull(onGoingTaskInfo);
+                    var runningBackupTaskId = onGoingTaskInfo.OnGoingBackup.RunningBackupTaskId;
+                    await leaderStore.Maintenance.SendAsync(new DelayBackupOperation(runningBackupTaskId, delayDuration));
+
+                    var disposingResult = await DisposeServerAndWaitForFinishOfDisposalAsync(notLeaderServer);
+                    using var newServer = GetNewServer(new ServerCreationOptions
+                    {
+                        DeletePrevious = false,
+                        RunInMemory = false,
+                        DataDirectory = disposingResult.DataDirectory,
+                        CustomSettings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = disposingResult.Url }
+                    });
+                    Assert.NotNull(newServer);
+
+                    await AssertNextBackupSchedule(serverToObserve: newServer, delayDuration, databaseName, taskId, sw);
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        private static async Task AssertNextBackupSchedule(RavenServer serverToObserve, TimeSpan delayDuration, string databaseName, long taskId, Stopwatch sw)
+        {
+            using (var store = new DocumentStore
+            {
+                Urls = new[] { serverToObserve.WebUrl },
+                Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                Database = databaseName
+            })
+            {
+                store.Initialize();
+
+                OngoingTaskBackup onGoingTaskBackup = null;
+                PeriodicBackupStatus backupStatus = null;
+                await WaitForValueAsync(async () =>
+                {
+                    onGoingTaskBackup = await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+
+                    if (onGoingTaskBackup?.NextBackup == null ||
+                        onGoingTaskBackup.OnGoingBackup != null ||
+                        (onGoingTaskBackup.NextBackup.TimeSpan > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) &&
+                        onGoingTaskBackup.NextBackup.TimeSpan <= delayDuration) == false)
+                        return false;
+
+                    backupStatus = (await store.Maintenance.SendAsync(new GetPeriodicBackupStatusOperation(onGoingTaskBackup.TaskId))).Status;
+                    return backupStatus is { DelayUntil: { } } &&
+                           backupStatus.DelayUntil == onGoingTaskBackup.NextBackup.DateTime;
+                }, true,
+                    timeout: (int)TimeSpan.FromMinutes(5).TotalMilliseconds,
+                    interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
+                Assert.NotNull(onGoingTaskBackup.NextBackup);
+                Assert.Null(onGoingTaskBackup.OnGoingBackup);
+                Assert.True(onGoingTaskBackup.ResponsibleNode.NodeTag != serverToObserve.ServerStore.NodeTag, userMessage: $"The strings 'onGoingTaskBackup.ResponsibleNode.NodeTag' and 'serverToObserve.ServerStore.NodeTag' are equal, with the value '{onGoingTaskBackup.ResponsibleNode.NodeTag}', but they should be different.");
+                Assert.True(onGoingTaskBackup.NextBackup.TimeSpan > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) && onGoingTaskBackup.NextBackup.TimeSpan <= delayDuration,
+                    $"The NextBackup is set for: {onGoingTaskBackup.NextBackup.TimeSpan}, the delay duration with tolerance is: {delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000))}, and the actual delay duration is: {delayDuration}.");
+
+                // DelayUntil value in backup status and the time of scheduled next backup should be equal
+                Assert.NotNull(backupStatus);
+                Assert.NotNull(backupStatus.DelayUntil);
+                Assert.True(backupStatus.DelayUntil == onGoingTaskBackup.NextBackup.DateTime, userMessage: $"The value of 'backupStatus.DelayUntil' is {backupStatus.DelayUntil}, whereas the value of 'onGoingTaskBackup.NextBackup.DateTime' is {onGoingTaskBackup.NextBackup.DateTime}. They are not equal, but they should be.");
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task EveryNodeHasDelayInMemory()
+        {
+            const int clusterSize = 3;
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            var databaseName = GetDatabaseName();
+
+            var (nodes, leaderServer) = await CreateRaftCluster(clusterSize);
+            await CreateDatabaseInCluster(databaseName, clusterSize, leaderServer.WebUrl);
+            var notLeaderServer = nodes.First(x => x != leaderServer);
+
+            using (var leaderStore = new DocumentStore
+            {
+                Urls = new[] { leaderServer.WebUrl },
+                Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                Database = databaseName
+            })
+            {
+                leaderStore.Initialize();
+
+                await Backup.FillClusterDatabaseWithRandomDataAsync(databaseSizeInMb: 10, leaderStore, clusterSize);
+
+                var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *", mentorNode: leaderServer.ServerStore.NodeTag);
+                var taskId = await Backup.UpdateConfigAndRunBackupAsync(leaderServer, config, leaderStore);
+
+                var responsibleDatabase = await leaderServer.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(leaderStore.Database).ConfigureAwait(false);
+                Assert.NotNull(responsibleDatabase);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    await Backup.RunBackupInClusterAsync(leaderStore, taskId, opStatus: OperationStatus.InProgress);
+
+                    // Let's delay the backup task to 1 hour
+                    var delayDuration = TimeSpan.FromHours(1);
+                    var sw = Stopwatch.StartNew();
+                    var onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                    Assert.NotNull(onGoingTaskInfo);
+                    var runningBackupTaskId = onGoingTaskInfo.OnGoingBackup.RunningBackupTaskId;
+                    await leaderStore.Maintenance.SendAsync(new DelayBackupOperation(runningBackupTaskId, delayDuration));
+
+                    // We'll check another (not leader) nodes in cluster
+                    foreach (var server in nodes.Where(node => node != leaderServer))
+                    {
+                        using (var store = new DocumentStore
+                        {
+                            Urls = new[] { server.WebUrl },
+                            Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                            Database = databaseName
+                        })
+                        {
+                            store.Initialize();
+
+                            var documentDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                            documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().BackupStatusFromMemoryOnly = true;
+
+                            PeriodicBackupStatus inMemoryStatus = null;
+                            WaitForValue(() =>
+                            {
+                                inMemoryStatus = documentDatabase.PeriodicBackupRunner.GetBackupStatus(taskId);
+                                return inMemoryStatus != null;
+                            }, true);
+
+                            var nextBackupTimeSpan = inMemoryStatus.DelayUntil - DateTime.UtcNow;
+                            Assert.True(nextBackupTimeSpan > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) &&
+                                        nextBackupTimeSpan <= delayDuration,
+                                $"NextBackup in: `{nextBackupTimeSpan}`, delayDuration with tolerance: `{delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000))}`, " +
+                                $"delayDuration: `{delayDuration}`");
+                        }
+                    }
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task ShouldDelayOnCurrentNodeIfClusterDown()
+        {
+            const int clusterSize = 3;
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            var databaseName = GetDatabaseName();
+
+            var (nodes, leaderServer) = await CreateRaftCluster(clusterSize);
+            await CreateDatabaseInCluster(databaseName, clusterSize, leaderServer.WebUrl);
+
+            using (var leaderStore = new DocumentStore
+            {
+                Urls = new[] { leaderServer.WebUrl },
+                Conventions = new DocumentConventions { DisableTopologyUpdates = true },
+                Database = databaseName
+            })
+            {
+                leaderStore.Initialize();
+                await Backup.FillClusterDatabaseWithRandomDataAsync(databaseSizeInMb: 10, leaderStore, clusterSize);
+
+                var responsibleDatabase = await leaderServer.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(leaderStore.Database).ConfigureAwait(false);
+                Assert.NotNull(responsibleDatabase);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *", mentorNode: leaderServer.ServerStore.NodeTag);
+                    var taskId = await Backup.UpdateConfigAndRunBackupAsync(leaderServer, config, leaderStore, opStatus: OperationStatus.InProgress);
+
+                    // Simulate Cluster Down state
+                    foreach (var node in nodes.Where(x => x != leaderServer))
+                    {
+                        await DisposeAndRemoveServer(node);
+                    }
+
+                    // Let's delay the backup task to 1 hour
+                    var onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                    Assert.NotNull(onGoingTaskInfo);
+                    var delayDuration = TimeSpan.FromHours(1);
+                    var sw = Stopwatch.StartNew();
+                    var runningBackupTaskId = onGoingTaskInfo.OnGoingBackup.RunningBackupTaskId;
+                    await leaderStore.Maintenance.SendAsync(new DelayBackupOperation(runningBackupTaskId, delayDuration));
+
+                    // Check that there is no ongoing backup and new task scheduled properly
+                    onGoingTaskInfo = null;
+                    await WaitForValueAsync(async () =>
+                    {
+                        onGoingTaskInfo = await leaderStore.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                        return onGoingTaskInfo is { OnGoingBackup: null };
+                    }, true);
+                    Assert.Null(onGoingTaskInfo.LastFullBackup);
+                    Assert.True(onGoingTaskInfo.NextBackup.TimeSpan > delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000)) &&
+                                onGoingTaskInfo.NextBackup.TimeSpan <= delayDuration,
+                        $"NextBackup in: `{onGoingTaskInfo.NextBackup.TimeSpan}`, delayDuration with tolerance: `{delayDuration.Subtract(TimeSpan.FromMilliseconds(sw.ElapsedMilliseconds + 1_000))}`, " +
+                        $"delayDuration: `{delayDuration}`");
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
+            }
+        }
+
+        [Fact, Trait("Category", "Smuggler")]
+        public async Task NumberOfCurrentlyRunningBackupsShouldBeCorrectAfterBackupTaskDelay()
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenAsyncSession())
+                    await Backup.FillDatabaseWithRandomDataAsync(databaseSizeInMb: 1, session);
+
+                var database = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                Assert.NotNull(database);
+
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(database.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
+                {
+                    var config = Backup.CreateBackupConfiguration(backupPath, fullBackupFrequency: "* * * * *");
+                    var taskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store, opStatus: OperationStatus.InProgress);
+
+                    // The backup task is running, and the next backup should be scheduled for the next minute (based on the backup configuration)
+                    var taskBackupInfo = await store.Maintenance.SendAsync(new GetOngoingTaskInfoOperation(taskId, OngoingTaskType.Backup)) as OngoingTaskBackup;
+                    Assert.NotNull(taskBackupInfo);
+                    Assert.NotNull(taskBackupInfo.OnGoingBackup);
+
+                    using (Server.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                    using (context.OpenReadTransaction())
+                    {
+                        AssertNumberOfConcurrentBackups(expectedNumber: 1);
+
+                        // Let's delay the backup task to 1 hour
+                        var delayDuration = TimeSpan.FromHours(1);
+                        await store.Maintenance.SendAsync(new DelayBackupOperation(taskBackupInfo.OnGoingBackup.RunningBackupTaskId, delayDuration));
+
+                        AssertNumberOfConcurrentBackups(expectedNumber: 0);
+
+                        void AssertNumberOfConcurrentBackups(int expectedNumber)
+                        {
+                            int concurrentBackups = WaitForValue(() => Server.ServerStore.ConcurrentBackupsCounter.CurrentNumberOfRunningBackups,
+                                expectedVal: expectedNumber,
+                                timeout: Convert.ToInt32(TimeSpan.FromMinutes(1).TotalMilliseconds),
+                                interval: Convert.ToInt32(TimeSpan.FromSeconds(1).TotalMilliseconds));
+
+                            Assert.Equal(expectedNumber, concurrentBackups);
+                        }
+                    }
+                }, tcs: new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
             }
         }
 
@@ -2896,30 +3533,35 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 var documentDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
                 Assert.NotNull(documentDatabase);
-                var tcs = new TaskCompletionSource<object>();
-                documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = tcs;
-                try
+
+                var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                await Backup.HoldBackupExecutionIfNeededAndInvoke(documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly(), async () =>
                 {
+                    var responsibleDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
+                    Assert.NotNull(responsibleDatabase);
+                    
                     var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(server, config, store, opStatus: OperationStatus.InProgress);
+                    var pb = responsibleDatabase.PeriodicBackupRunner.PeriodicBackups.FirstOrDefault();
+                    Assert.NotNull(pb);
+                    Assert.True(pb.HasScheduledBackup(), "Backup is not scheduled");
+                    
                     var record1 = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
                     var backups1 = record1.PeriodicBackups;
                     Assert.Equal(1, backups1.Count);
+                    Assert.Equal(backupTaskId, backups1.First().TaskId);
 
-                    var taskId = backups1.First().TaskId;
-                    var responsibleDatabase = await server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database).ConfigureAwait(false);
-                    Assert.NotNull(responsibleDatabase);
-                    var tag = responsibleDatabase.PeriodicBackupRunner.WhoseTaskIsIt(taskId);
+                    var tag = responsibleDatabase.PeriodicBackupRunner.WhoseTaskIsIt(backupTaskId);
                     Assert.Equal(server.ServerStore.NodeTag, tag);
 
                     responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().SimulateActiveByOtherNodeStatus_UpdateConfigurations = true;
-                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1);
+                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1.PeriodicBackups);
                     responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().SimulateActiveByOtherNodeStatus_UpdateConfigurations = false;
                     responsibleDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().SimulateActiveByCurrentNode_UpdateConfigurations = true;
-                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1);
-                    tcs.SetResult(null);
+                    responsibleDatabase.PeriodicBackupRunner.UpdateConfigurations(record1.PeriodicBackups);
+                    tcs.TrySetResult(null);
 
                     responsibleDatabase.PeriodicBackupRunner._forTestingPurposes = null;
-                    var getPeriodicBackupStatus = new GetPeriodicBackupStatusOperation(taskId);
+                    var getPeriodicBackupStatus = new GetPeriodicBackupStatusOperation(backupTaskId);
                     PeriodicBackupStatus status = null;
                     var val = WaitForValue(() =>
                     {
@@ -2930,23 +3572,10 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     Assert.Null(status.Error);
                     Assert.True(val, "Failed to complete the backup in time");
 
-                    var pb2 = responsibleDatabase.PeriodicBackupRunner.PeriodicBackups.FirstOrDefault();
-                    Assert.NotNull(pb2);
-                    Assert.True(pb2.HasScheduledBackup(), "Completed backup didn't schedule next one.");
-                }
-                finally
-                {
-                    try
-                    {
-                        tcs.TrySetResult(null);
-                    }
-                    catch
-                    {
-                        // ignored
-                    }
-
-                    documentDatabase.PeriodicBackupRunner.ForTestingPurposesOnly().OnBackupTaskRunHoldBackupExecution = null;
-                }
+                    pb = responsibleDatabase.PeriodicBackupRunner.PeriodicBackups.FirstOrDefault();
+                    Assert.NotNull(pb);
+                    Assert.True(pb.HasScheduledBackup(), "Completed backup didn't schedule next one.");
+                }, tcs);
             }
         }
 
@@ -3052,6 +3681,645 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                         Assert.NotNull(address);
                         Assert.Equal(country, address.Country);
                     }
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.BackupExportImport)]
+        [InlineData(BackupType.Snapshot)]
+        [InlineData(BackupType.Backup)]
+        public async Task can_backup_incremental_and_restore_with_subscription(BackupType backupType)
+        {
+            var ids = Enumerable.Range(1, 5).Select(i => "users/" + i).ToArray();
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using var store = GetDocumentStore();
+
+            using (var session = store.OpenAsyncSession())
+            {
+                foreach (var id in ids.Take(ids.Length - 1))
+                    await session.StoreAsync(new User(), id);
+
+                await session.SaveChangesAsync();
+            }
+
+            var subscriptionCreationParams = new SubscriptionCreationOptions { Query = "from People" };
+            var name1 = await store.Subscriptions.CreateAsync(subscriptionCreationParams);
+
+            var subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(1, subscriptionsConfig.Count);
+
+            await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<Order>
+            {
+                Name = "sub2"
+            });
+
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(2, subscriptionsConfig.Count);
+
+            var config = Backup.CreateBackupConfiguration(backupPath, backupType: backupType);
+            config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
+            var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+            using (var session = store.OpenAsyncSession())
+            {
+                await session.StoreAsync(new User(), ids[^1]);
+                await session.SaveChangesAsync();
+            }
+
+            await store.Subscriptions.DeleteAsync(name1, store.Database);
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(1, subscriptionsConfig.Count);
+
+            await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<Order>
+            {
+                Name = "sub3"
+            });
+
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(2, subscriptionsConfig.Count);
+
+            await Backup.RunBackupAndReturnStatusAsync(Server, backupTaskId, store, isFullBackup: false);
+
+            // restore the database with a different name
+            string restoredDatabaseName = GetDatabaseName();
+            var backupLocation = Directory.GetDirectories(backupPath).First();
+
+            using (ReadOnly(backupLocation))
+            using (Backup.RestoreDatabase(store, new RestoreBackupConfiguration { BackupLocation = backupLocation, DatabaseName = restoredDatabaseName }))
+            {
+                using var destination = new DocumentStore
+                {
+                    Urls = store.Urls,
+                    Database = restoredDatabaseName
+                }.Initialize();
+
+                using (var session = destination.OpenAsyncSession())
+                {
+                    var users = await session.LoadAsync<User>(ids);
+                    Assert.All(users.Values, Assert.NotNull);
+                }
+                subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                Assert.Equal(2, subscriptionsConfig.Count);
+            }
+        }
+
+        private readonly TimeSpan _reasonableWaitTime = Debugger.IsAttached ? TimeSpan.FromMinutes(5) : TimeSpan.FromSeconds(60);
+
+        [RavenTheory(RavenTestCategory.BackupExportImport)]
+        [InlineData(BackupType.Snapshot)]
+        public async Task can_incremental_snapshot_and_restore_with_subscription(BackupType backupType)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using var store = GetDocumentStore();
+            using (var session = store.OpenSession())
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    session.Store(new Company());
+                    session.Store(new User());
+                }
+                session.SaveChanges();
+            }
+
+            var lastCv = "";
+            var subscriptionName = store.Subscriptions.Create(new SubscriptionCreationOptions<User>());
+
+            using (var subscription = store.Subscriptions.GetSubscriptionWorker(new SubscriptionWorkerOptions(subscriptionName)
+            {
+                MaxDocsPerBatch = 5,
+                TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+            }))
+            {
+                var mre = new AsyncManualResetEvent();
+                var task = subscription.Run(batch =>
+                {
+                    foreach (var b in batch.Items)
+                    {
+                        lastCv = b.ChangeVector;
+                    }
+                    mre.Set();
+                });
+
+                await mre.WaitAsync(_reasonableWaitTime);
+                mre.Reset();
+                List<SubscriptionState> subscriptionsConfig;
+                await WaitForValueAsync(async () =>
+                {
+                    subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                    return subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint;
+                }, lastCv);
+
+                subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                Assert.Equal(1, subscriptionsConfig.Count);
+                Assert.Equal(lastCv, subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint);
+                var snapshotCv = lastCv;
+
+                var config = Backup.CreateBackupConfiguration(backupPath, backupType: backupType);
+                config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenSession())
+                {
+                    for (int i = 0; i < 10; i++)
+                    {
+                        session.Store(new Company());
+                        session.Store(new User());
+                    }
+
+                    session.SaveChanges();
+                }
+                await mre.WaitAsync(_reasonableWaitTime);
+
+                subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                Assert.Equal(1, subscriptionsConfig.Count);
+                Assert.NotEqual(lastCv, snapshotCv);
+
+                var ongoingTask = (OngoingTaskSubscription)store.Maintenance.Send(new GetOngoingTaskInfoOperation(subscriptionName, OngoingTaskType.Subscription));
+                store.Maintenance.Send(new ToggleOngoingTaskStateOperation(ongoingTask.TaskId, OngoingTaskType.Subscription, true));
+                subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                Assert.Equal(true, subscriptionsConfig[0].Disabled);
+
+                await Backup.RunBackupAndReturnStatusAsync(Server, backupTaskId, store, isFullBackup: false);
+
+                // restore the database with a different name
+                string restoredDatabaseName = GetDatabaseName();
+                var backupLocation = Directory.GetDirectories(backupPath).First();
+
+                using (ReadOnly(backupLocation))
+                using (Backup.RestoreDatabase(store, new RestoreBackupConfiguration { BackupLocation = backupLocation, DatabaseName = restoredDatabaseName }))
+                {
+                    using var destination = new DocumentStore
+                    {
+                        Urls = store.Urls,
+                        Database = restoredDatabaseName
+                    }.Initialize();
+
+                    subscriptionsConfig = await destination.Subscriptions.GetSubscriptionsAsync(0, 10);
+                    Assert.Equal(1, subscriptionsConfig.Count);
+                    Assert.Equal(snapshotCv.Split("-")[0], subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint.Split("-")[0]);
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.BackupExportImport)]
+        [InlineData(BackupType.Snapshot)]
+        public async Task can_snapshot_and_restore_with_subscription(BackupType backupType)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using var store = GetDocumentStore();
+            using (var session = store.OpenSession())
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    session.Store(new Company());
+                    session.Store(new User());
+                }
+                session.SaveChanges();
+            }
+
+            var lastCv = "";
+            var subscriptionName = store.Subscriptions.Create(new SubscriptionCreationOptions<User>());
+
+            using (var subscription = store.Subscriptions.GetSubscriptionWorker(new SubscriptionWorkerOptions(subscriptionName)
+            {
+                MaxDocsPerBatch = 5,
+                TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+            }))
+            {
+                var mre = new AsyncManualResetEvent();
+                var task = subscription.Run(batch =>
+                {
+                    foreach (var b in batch.Items)
+                    {
+                        lastCv = b.ChangeVector;
+                    }
+                    mre.Set();
+                });
+
+                await mre.WaitAsync(_reasonableWaitTime);
+
+                var subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+
+                await WaitForValueAsync(async () =>
+                {
+                    subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                    return subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint;
+                }, lastCv);
+
+                Assert.Equal(1, subscriptionsConfig.Count);
+                Assert.Equal(lastCv, subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint);
+                var snapshotCv = lastCv;
+
+                var config = Backup.CreateBackupConfiguration(backupPath, backupType: backupType);
+                config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                // restore the database with a different name
+                string restoredDatabaseName = GetDatabaseName();
+                var backupLocation = Directory.GetDirectories(backupPath).First();
+
+                using (ReadOnly(backupLocation))
+                using (Backup.RestoreDatabase(store, new RestoreBackupConfiguration { BackupLocation = backupLocation, DatabaseName = restoredDatabaseName }))
+                {
+                    using var destination = new DocumentStore
+                    {
+                        Urls = store.Urls,
+                        Database = restoredDatabaseName
+                    }.Initialize();
+
+                    subscriptionsConfig = await destination.Subscriptions.GetSubscriptionsAsync(0, 10);
+
+                    Assert.Equal(1, subscriptionsConfig.Count);
+                    Assert.Equal(snapshotCv.Split("-")[0], subscriptionsConfig[0].ChangeVectorForNextBatchStartingPoint.Split("-")[0]);
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.BackupExportImport)]
+        [InlineData(BackupType.Snapshot)]
+        [InlineData(BackupType.Backup)]
+        public async Task can_backup_and_restore_with_subscription(BackupType backupType)
+        {
+            var ids = Enumerable.Range(1, 5).Select(i => "users/" + i).ToArray();
+
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            using var store = GetDocumentStore();
+
+            using (var session = store.OpenAsyncSession())
+            {
+                foreach (var id in ids.Take(ids.Length - 1))
+                    await session.StoreAsync(new User(), id);
+
+                await session.SaveChangesAsync();
+            }
+
+            var subscriptionCreationParams = new SubscriptionCreationOptions { Query = "from People" };
+            var name1 = await store.Subscriptions.CreateAsync(subscriptionCreationParams);
+
+            var subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(1, subscriptionsConfig.Count);
+
+            await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<Order>
+            {
+                Name = "sub2"
+            });
+
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(2, subscriptionsConfig.Count);
+
+            using (var session = store.OpenAsyncSession())
+            {
+                await session.StoreAsync(new User(), ids[^1]);
+                await session.SaveChangesAsync();
+            }
+
+            await store.Subscriptions.DeleteAsync(name1, store.Database);
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(1, subscriptionsConfig.Count);
+
+            await store.Subscriptions.CreateAsync(new SubscriptionCreationOptions<Order>
+            {
+                Name = "sub3"
+            });
+
+            subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+            Assert.Equal(2, subscriptionsConfig.Count);
+
+            var config = Backup.CreateBackupConfiguration(backupPath, backupType: backupType);
+            config.SnapshotSettings = new SnapshotSettings { CompressionLevel = CompressionLevel.NoCompression };
+            var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+            // restore the database with a different name
+            string restoredDatabaseName = GetDatabaseName();
+            var backupLocation = Directory.GetDirectories(backupPath).First();
+
+            using (ReadOnly(backupLocation))
+            using (Backup.RestoreDatabase(store, new RestoreBackupConfiguration { BackupLocation = backupLocation, DatabaseName = restoredDatabaseName }))
+            {
+                using var destination = new DocumentStore
+                {
+                    Urls = store.Urls,
+                    Database = restoredDatabaseName
+                }.Initialize();
+
+                using (var session = destination.OpenAsyncSession())
+                {
+                    var users = await session.LoadAsync<User>(ids);
+                    Assert.All(users.Values, Assert.NotNull);
+                }
+                subscriptionsConfig = await store.Subscriptions.GetSubscriptionsAsync(0, 10);
+                Assert.Equal(2, subscriptionsConfig.Count);
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.Smuggler | RavenTestCategory.BackupExportImport | RavenTestCategory.TimeSeries)]
+        [RavenData(DatabaseMode = RavenDatabaseMode.All)]
+        public async Task can_backup_and_restore_with_deleted_timeseries_ranges(Options options)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            const string id = "users/1";
+
+            using (var store = GetDocumentStore(options))
+            {
+                var baseline = DateTime.UtcNow;
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "fitzchak" }, id);
+
+                    var tsf = session.TimeSeriesFor(id, "heartrate");
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tsf.Append(baseline.AddHours(i), i);
+                    }
+
+                    await session.SaveChangesAsync();
+                }
+
+                var config = Backup.CreateBackupConfiguration(backupPath);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    session.Delete(id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "aviv" }, id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Null(ts);
+                }
+
+                await Backup.RunBackupAsync(Server, backupTaskId, store, isFullBackup: false);
+
+                Assert.True(WaitForValue(() =>
+                {
+                    var dir = Directory.GetDirectories(backupPath).First();
+                    var files = Directory.GetFiles(dir);
+                    return files.Length == 2;
+                }, expectedVal: true));
+            }
+
+            using (var store = GetDocumentStore(options))
+            {
+                await store.Smuggler.ImportIncrementalAsync(new DatabaseSmugglerImportOptions(),
+                    Directory.GetDirectories(backupPath).First());
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var user = await session.LoadAsync<User>(id);
+                    Assert.Equal("aviv", user.Name);
+
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Null(ts); // fails, we get 10 entries
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.Smuggler | RavenTestCategory.BackupExportImport | RavenTestCategory.TimeSeries)]
+        [RavenData(DatabaseMode = RavenDatabaseMode.All)]
+        public async Task deleted_ranges_should_be_processed_before_timeseries(Options options)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            const string id = "users/1";
+
+            using (var store = GetDocumentStore(options))
+            {
+                var baseline = DateTime.UtcNow;
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "fitzchak" }, id);
+
+                    var tsf = session.TimeSeriesFor(id, "heartrate");
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tsf.Append(baseline.AddHours(i), i);
+                    }
+
+                    await session.SaveChangesAsync();
+                }
+
+                var config = Backup.CreateBackupConfiguration(backupPath);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // delete the document to create a timeseries deleted range 
+                    session.Delete(id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // recreate the document and time series, and append a new entry to the series
+                    // importing the deleted range should not delete this new entry
+
+                    await session.StoreAsync(new User { Name = "aviv" }, id);
+                    session.TimeSeriesFor(id, "heartrate").Append(baseline.AddYears(1), 100);
+
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Equal(1, ts.Length);
+                }
+
+                await Backup.RunBackupAsync(Server, backupTaskId, store, isFullBackup: false);
+
+                Assert.True(WaitForValue(() =>
+                {
+                    var dir = Directory.GetDirectories(backupPath).First();
+                    var files = Directory.GetFiles(dir);
+                    return files.Length == 2;
+                }, expectedVal: true));
+            }
+
+            using (var store = GetDocumentStore(options))
+            {
+                await store.Smuggler.ImportIncrementalAsync(new DatabaseSmugglerImportOptions(),
+                    Directory.GetDirectories(backupPath).First());
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var user = await session.LoadAsync<User>(id);
+                    Assert.Equal("aviv", user.Name);
+
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Equal(1, ts.Length);
+                    Assert.Equal(100, ts[0].Value);
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.Smuggler | RavenTestCategory.BackupExportImport | RavenTestCategory.TimeSeries)]
+        [RavenData(DatabaseMode = RavenDatabaseMode.All)]
+        public async Task deleted_ranges_should_be_processed_before_timeseries2(Options options)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            const string id = "users/1";
+
+            using (var store = GetDocumentStore(options))
+            {
+                var baseline = DateTime.UtcNow;
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "fitzchak" }, id);
+
+                    var tsf = session.TimeSeriesFor(id, "heartrate");
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tsf.Append(baseline.AddHours(i), i);
+                    }
+
+                    await session.SaveChangesAsync();
+                }
+
+                var config = Backup.CreateBackupConfiguration(backupPath);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // delete the document to create a timeseries deleted range 
+                    session.Delete(id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // recreate the document and time series, and append a new entry to the series
+
+                    await session.StoreAsync(new User { Name = "aviv" }, id);
+                    session.TimeSeriesFor(id, "heartrate").Append(baseline.AddYears(1), 100);
+
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // delete the document once again to create another deleted range
+                    // after importing this deleted range we should end up without timeseries
+
+                    session.Delete(id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // recreate the document so that we won't have a tombstone to backup
+                    await session.StoreAsync(new User { Name = "egor" }, id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Null(ts);
+                }
+
+                await Backup.RunBackupAsync(Server, backupTaskId, store, isFullBackup: false);
+
+                Assert.True(WaitForValue(() =>
+                {
+                    var dir = Directory.GetDirectories(backupPath).First();
+                    var files = Directory.GetFiles(dir);
+                    return files.Length == 2;
+                }, expectedVal: true));
+            }
+
+            using (var store = GetDocumentStore(options))
+            {
+                await store.Smuggler.ImportIncrementalAsync(new DatabaseSmugglerImportOptions(),
+                    Directory.GetDirectories(backupPath).First());
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var user = await session.LoadAsync<User>(id);
+                    Assert.Equal("egor", user.Name);
+
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Null(ts);
+                }
+            }
+        }
+
+        [RavenTheory(RavenTestCategory.Smuggler | RavenTestCategory.BackupExportImport | RavenTestCategory.TimeSeries)]
+        [RavenData(DatabaseMode = RavenDatabaseMode.All)]
+        public async Task can_skip_deleted_timeseries_ranges_on_import(Options options)
+        {
+            var backupPath = NewDataPath(suffix: "BackupFolder");
+            const string id = "users/1";
+
+            using (var store = GetDocumentStore())
+            {
+                var baseline = DateTime.UtcNow;
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "fitzchak" }, id);
+
+                    var tsf = session.TimeSeriesFor(id, "heartrate");
+                    for (int i = 0; i < 10; i++)
+                    {
+                        tsf.Append(baseline.AddHours(i), i);
+                    }
+
+                    await session.SaveChangesAsync();
+                }
+
+                var config = Backup.CreateBackupConfiguration(backupPath);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    session.Delete(id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new User { Name = "aviv" }, id);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Null(ts);
+                }
+
+                await Backup.RunBackupAsync(Server, backupTaskId, store, isFullBackup: false);
+
+                Assert.True(WaitForValue(() =>
+                {
+                    var dir = Directory.GetDirectories(backupPath).First();
+                    var files = Directory.GetFiles(dir);
+                    return files.Length == 2;
+                }, expectedVal: true));
+            }
+
+            using (var store = GetDocumentStore(options))
+            {
+                // skip deleted ranges on import
+                var importOptions = new DatabaseSmugglerImportOptions();
+                importOptions.OperateOnTypes &= ~DatabaseItemType.TimeSeriesDeletedRanges;
+
+                await store.Smuggler.ImportIncrementalAsync(importOptions,
+                    Directory.GetDirectories(backupPath).First());
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var user = await session.LoadAsync<User>(id);
+                    Assert.Equal("aviv", user.Name);
+
+                    var ts = await session.TimeSeriesFor(id, "heartrate").GetAsync();
+                    Assert.Equal(10, ts.Length);
                 }
             }
         }

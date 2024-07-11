@@ -50,7 +50,15 @@
             </div>
             <div class="col-sm-6 col-lg-4 col-xl-3">
                 <div class="stats-item js-cv-tooltip">
-                    <div class="name"><i class="icon-vector"></i><span>Database Change Vector</span></div>
+                    <div class="name">
+                        <i class="icon-vector"></i><span>Database Change Vector</span>
+                        <button
+                            class="btn btn-default btn-xs margin-left"
+                            data-bind="click: $root.copyChangeVectorToClipboard"
+                            title="Copy to clipboard">
+                                <i class="icon-copy-to-clipboard"></i>
+                        </button>
+                    </div>
                     <div class="value">
                         <span data-bind="foreach: databaseChangeVector">
                             <span class="badge badge-default" data-bind="text: shortFormat"></span>
@@ -214,6 +222,12 @@
                     <div class="stats-item" data-bind="visible: isReduceIndex && (reducedPerSecondRate > 1), if: isReduceIndex && (reducedPerSecondRate > 1)">
                         <div class="name">Reduced Per Second Rate:</div>
                         <div class="value" data-bind="text: reducedPerSecondRateStr"></div>
+                    </div>
+                    <div class="stats-item" data-bind="visible: referencedCollections.length">
+                        <div class="name">Referenced Collections:</div>
+                        <span class="value" data-bind="foreach: referencedCollections">
+                            <span data-bind="text: $data"></span>
+                        </span>
                     </div>
                 </div>
             </div>

@@ -5,10 +5,12 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client;
+using Raven.Client.ServerWide.Operations.OngoingTasks;
 using Raven.Client.Util;
 using Raven.Server.Background;
+using Raven.Server.NotificationCenter;
+using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.ServerWide.Context;
-using Sparrow.Json;
 using Sparrow.Logging;
 
 namespace Raven.Server.Documents
@@ -118,6 +120,74 @@ namespace Raven.Server.Documents
             return numberOfTombstonesDeleted;
         }
 
+        private void RaiseBlockingTombstonesNotificationIfNecessary(TombstonesState tombstoneCollections)
+        {
+            var detailsSet = new List<BlockingTombstoneDetails>();
+            var tombstonesCountsPerCollection = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            var tombstonesSizePerCollection = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+            using (_documentDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+            using (context.OpenReadTransaction())
+            {
+                foreach (var disabledSubscribers in _subscriptions
+                             .Select(x => x.GetDisabledSubscribersCollections(tombstoneCollections.Tombstones.Keys.ToHashSet())))
+                {
+                    FillDetailsSet(detailsSet, disabledSubscribers, tombstonesCountsPerCollection, tombstonesSizePerCollection, context);
+                }
+            }
+
+            UpdateNotifications(detailsSet);
+        }
+
+        private void FillDetailsSet(
+            List<BlockingTombstoneDetails> detailsSet,
+            Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> disabledSubscribers,
+            IDictionary<string, long> tombstonesCountsPerCollection,
+            IDictionary<string, long> tombstonesSizePerCollection,
+            DocumentsOperationContext context)
+        {
+            foreach ((TombstoneDeletionBlockageSource source, HashSet<string> collections) in disabledSubscribers)
+            {
+                detailsSet.AddRange(
+                    from collectionName in collections
+                    let tombstonesCount = GetTombstoneDataForCollection(tombstonesCountsPerCollection, collectionName, context, _documentDatabase.DocumentsStorage.TombstonesCountForCollection)
+                    let tombstonesSizeInBytes = GetTombstoneDataForCollection(tombstonesSizePerCollection, collectionName, context, _documentDatabase.DocumentsStorage.TombstonesSizeForCollectionInBytes)
+                    where tombstonesCount > 0
+                    select new BlockingTombstoneDetails
+                    {
+                        Source = source.Name,
+                        BlockerType = source.Type,
+                        BlockerTaskId = source.TaskId,
+                        Collection = collectionName,
+                        NumberOfTombstones = tombstonesCount,
+                        SizeOfTombstonesInBytes = tombstonesSizeInBytes
+                    });
+            }
+        }
+
+        private static long GetTombstoneDataForCollection(
+            IDictionary<string, long> dataPerCollection,
+            string collectionName,
+            DocumentsOperationContext context,
+            Func<DocumentsOperationContext, string, long> retrieveDataFunc)
+        {
+            if (dataPerCollection.TryGetValue(collectionName, out var data))
+                return data;
+
+            data = retrieveDataFunc(context, collectionName);
+            dataPerCollection[collectionName] = data;
+
+            return data;
+        }
+
+        private void UpdateNotifications(List<BlockingTombstoneDetails> detailsSet)
+        {
+            if (detailsSet.Count > 0)
+                _documentDatabase.NotificationCenter.TombstoneNotifications.Add(detailsSet);
+            else
+                _documentDatabase.NotificationCenter.Dismiss(AlertRaised.GetKey(AlertType.BlockingTombstones, nameof(AlertType.BlockingTombstones)));
+        }
+
         internal TombstonesState GetState(bool addInfoForDebug = false)
         {
             var result = new TombstonesState();
@@ -132,7 +202,9 @@ namespace Raven.Server.Documents
             using (var tx = storageEnvironment.ReadTransaction())
             {
                 foreach (var tombstoneCollection in _documentDatabase.DocumentsStorage.GetTombstoneCollections(tx))
+                {
                     result.Tombstones[tombstoneCollection] = new StateHolder();
+                }
             }
 
             if (result.Tombstones.Count == 0)
@@ -155,7 +227,7 @@ namespace Raven.Server.Documents
                         foreach (var tombstone in subscriptionTombstones)
                         {
                             if (addInfoForDebug)
-                                result.AddPerSubscriptionInfo(subscription.TombstoneCleanerIdentifier, tombstoneType, tombstone.Key, tombstone.Value);
+                                result.AddPerSubscriptionInfo(subscription.TombstoneCleanerIdentifier, tombstoneType, collection: tombstone.Key, etag: tombstone.Value);
 
                             if (tombstone.Key == Constants.Documents.Collections.AllDocumentsCollection)
                             {
@@ -183,6 +255,16 @@ namespace Raven.Server.Documents
                             }
                         }
                     }
+                }
+
+                try
+                {
+                    RaiseBlockingTombstonesNotificationIfNecessary(result);
+                }
+                catch (Exception e)
+                {
+                    if (Logger.IsOperationsEnabled)
+                        Logger.Operations($"Failed to notify of blockage in tombstone deletion detected in database '{_documentDatabase.Name}'", e);
                 }
             }
             finally
@@ -432,11 +514,28 @@ namespace Raven.Server.Documents
 
         Dictionary<string, long> GetLastProcessedTombstonesPerCollection(TombstoneType type);
 
+        Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> GetDisabledSubscribersCollections(HashSet<string> tombstoneCollections);
+
         public enum TombstoneType
         {
             Documents,
             TimeSeries,
             Counters
+        }
+
+        public enum TombstoneDeletionBlockerType
+        {
+            ExternalReplication,
+            InternalReplication,
+            RavenEtl,
+            SqlEtl,
+            OlapEtl,
+            ElasticSearchEtl,
+            QueueEtl,
+            Backup,
+            PullReplicationAsHub,
+            PullReplicationAsSink,
+            Index
         }
     }
 }

@@ -127,7 +127,8 @@ namespace Raven.Server.Documents.Queries
                         debugMode: false,
                         isTest: false,
                         collectResultsNeeded: true,
-                        returnDocument: false);
+                        returnDocument: false,
+                        ignoreMaxStepsForScript: options.IgnoreMaxStepsForScript);
 
                     return new BulkOperationCommand<PatchDocumentCommand>(command, retrieveDetails,
                         x => new BulkOperationResult.PatchDetails
@@ -198,7 +199,6 @@ namespace Raven.Server.Documents.Queries
 
                         return subCommand;
                     }, rateGate, token,
-                        maxTransactionSize: 16 * Constants.Size.Megabyte,
                         batchSize: batchSize);
 
                     await Database.TxMerger.Enqueue(command);

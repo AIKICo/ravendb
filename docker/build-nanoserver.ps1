@@ -2,13 +2,14 @@ param(
     $Repo = "ravendb/ravendb",
     $ArtifactsDir = "..\artifacts",
     $RavenDockerSettingsPath = "..\src\Raven.Server\Properties\Settings\settings.docker.windows.json",
+    $WinVer = "1809",
     $DockerfileDir = "./ravendb-nanoserver")
 
 $ErrorActionPreference = "Stop"
 
 . ".\common.ps1"
 
-function BuildWindowsDockerImage ($version) {
+function BuildWindowsDockerImage ($version, $WinVer) {
     $packageFileName = "RavenDB-$version-windows-x64.zip"
     $artifactsPackagePath = Join-Path -Path $ArtifactsDir -ChildPath $packageFileName
 
@@ -27,12 +28,13 @@ function BuildWindowsDockerImage ($version) {
 
 
     write-host "Build docker image: $version"
-    $tags = GetWindowsImageTags $repo $version
+    $tags = GetWindowsImageTags $repo $version $WinVer
     $fullNameTag = $tags[0]
     
     write-host "Tags: $tags"
 
-    docker build $DockerfileDir -t $fullNameTag
+    docker build -t $fullNameTag -f "$DockerfileDir/Dockerfile.$WinVer" "$DockerfileDir"
+    CheckLastExitCode
 
     foreach ($tag in $tags[1..$tags.Length]) {
         write-host "Tag $fullNameTag as $tag"
@@ -44,4 +46,4 @@ function BuildWindowsDockerImage ($version) {
 }
 
 
-BuildWindowsDockerImage $(GetVersionFromArtifactName)
+BuildWindowsDockerImage $(GetVersionFromArtifactName) $WinVer

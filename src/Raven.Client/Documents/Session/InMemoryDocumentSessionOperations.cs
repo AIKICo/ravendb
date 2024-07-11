@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Generic;
 using System.Dynamic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -16,7 +15,6 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Lambda2Js;
-using Raven.Client.Documents;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Conventions;
@@ -37,7 +35,6 @@ using Raven.Client.Http;
 using Raven.Client.Json;
 using Raven.Client.Json.Serialization;
 using Raven.Client.Util;
-using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 
@@ -117,17 +114,17 @@ namespace Raven.Client.Documents.Session
         /// Translate between an ID and its associated entity
         /// </summary>
         internal readonly Dictionary<string, DocumentInfo> IncludedDocumentsById = new Dictionary<string, DocumentInfo>(StringComparer.OrdinalIgnoreCase);
-        
+
         /// <summary>
         /// Translate between an CV and its associated entity
         /// </summary>
         internal Dictionary<string, DocumentInfo> IncludeRevisionsByChangeVector;
-        
+
         /// <summary>
         /// Translate between an ID and its associated entity
         /// </summary>
         internal Dictionary<string, Dictionary<DateTime, DocumentInfo>> IncludeRevisionsIdByDateTimeBefore;
-        
+
         /// <summary>
         /// hold the data required to manage the data for RavenDB's Unit of Work
         /// </summary>
@@ -150,9 +147,9 @@ namespace Raven.Client.Documents.Session
             _timeSeriesByDocId ?? (_timeSeriesByDocId = new Dictionary<string, Dictionary<string, List<TimeSeriesRangeResult>>>(StringComparer.OrdinalIgnoreCase));
 
         private Dictionary<string, Dictionary<string, List<TimeSeriesRangeResult>>> _timeSeriesByDocId;
-        
+
         protected readonly DocumentStoreBase _documentStore;
-        
+
         public string DatabaseName { get; }
 
         ///<summary>
@@ -692,7 +689,7 @@ more responsive application.
             if (DocumentsByEntity.TryGetValue(entity, out var value))
             {
                 if (id != null && value.Id.Equals(id, StringComparison.OrdinalIgnoreCase) == false)
-                    throw new InvalidOperationException($"Cannot store the same entity (id: {value.Id}) with a different id ({id})"); 
+                    throw new InvalidOperationException($"Cannot store the same entity (id: {value.Id}) with a different id ({id})");
 
                 value.ChangeVector = changeVector ?? value.ChangeVector;
                 value.ConcurrencyCheckMode = forceConcurrencyCheck;
@@ -815,6 +812,14 @@ more responsive application.
         {
             if (id != null)
                 _knownMissingIds.Remove(id);
+
+            if (TransactionMode == TransactionMode.ClusterWide)
+            {
+                if (changeVector == null)
+                {
+                    GetClusterSession().TryGetMissingAtomicGuardFor(id, out changeVector);
+                }
+            }
 
             var documentInfo = new DocumentInfo
             {
@@ -968,7 +973,7 @@ more responsive application.
             foreach (var item in md)
             {
                 var v = item.Value;
-                if(v is IMetadataDictionary nested)
+                if (v is IMetadataDictionary nested)
                 {
                     RuntimeHelpers.EnsureSufficientExecutionStack();
                     v = HandleDictionaryObject(nested);
@@ -1036,7 +1041,7 @@ more responsive application.
 
                         if (UseOptimisticConcurrency == false)
                             changeVector = null;
-                       
+
                         if (deletedEntity.ExecuteOnBeforeDelete)
                         {
                             OnBeforeDeleteInvoke(new BeforeDeleteEventArgs(this, documentInfo.Id, documentInfo.Entity));
@@ -1186,6 +1191,41 @@ more responsive application.
             GetAllEntitiesChanges(changes);
             PrepareForEntitiesDeletion(null, changes);
             return changes;
+        }
+
+        /// <summary>
+        /// Returns all changes for the specified entity. Including name of the field/property that changed, its old and new value and change type.
+        /// </summary>
+        public DocumentsChanges[] WhatChangedFor(object entity)
+        {
+            if (DocumentsByEntity.TryGetValue(entity, out var documentInfo) == false)
+                return Array.Empty<DocumentsChanges>();
+
+            if (DeletedEntities.Contains(entity))
+                return new[]
+                {
+                    new DocumentsChanges
+                    {
+                        FieldNewValue = string.Empty,
+                        FieldOldValue = string.Empty,
+                        Change = DocumentsChanges.ChangeType.DocumentDeleted
+                    }
+                };
+
+            UpdateMetadataModifications(documentInfo.MetadataInstance, documentInfo.Metadata);
+
+            var document = JsonConverter.ToBlittable(entity, documentInfo);
+
+            var changes = new Dictionary<string, DocumentsChanges[]>();
+
+            if (EntityChanged(document, documentInfo, changes) == false)
+            {
+                document.Dispose();
+                return Array.Empty<DocumentsChanges>();
+            }
+
+            // we cannot dispose the document, some of the changes are linked to the blittable json
+            return changes[documentInfo.Id];
         }
 
         public IDictionary<string, EntityInfo> GetTrackedEntities()
@@ -1487,9 +1527,9 @@ more responsive application.
             {
                 includes.GetPropertyByIndex(i, ref propertyDetails);
 
-                if (propertyDetails.Value is not BlittableJsonReaderObject json) 
+                if (propertyDetails.Value is not BlittableJsonReaderObject json)
                     continue;
-                
+
                 var newDocumentInfo = DocumentInfo.GetNewDocumentInfo(json);
                 if (newDocumentInfo.Metadata.TryGetConflict(out var conflict) && conflict)
                     continue;
@@ -1497,7 +1537,7 @@ more responsive application.
                 IncludedDocumentsById[newDocumentInfo.Id] = newDocumentInfo;
             }
         }
-        
+
         internal void RegisterRevisionIncludes(BlittableJsonReaderArray revisionIncludes)
         {
             if (NoTracking)
@@ -1505,12 +1545,12 @@ more responsive application.
 
             if (revisionIncludes == null)
                 return;
-            
+
             IncludeRevisionsByChangeVector ??= new Dictionary<string, DocumentInfo>(StringComparer.OrdinalIgnoreCase);
             IncludeRevisionsIdByDateTimeBefore ??= new Dictionary<string, Dictionary<DateTime, DocumentInfo>>(StringComparer.OrdinalIgnoreCase);
             foreach (var obj in revisionIncludes)
             {
-                if (obj is not BlittableJsonReaderObject json) 
+                if (obj is not BlittableJsonReaderObject json)
                     continue;
                 json = ((BlittableJsonReaderObject)obj);
                 json.TryGet(nameof(RevisionIncludeResult.Id), out string id);
@@ -1524,7 +1564,7 @@ more responsive application.
                 {
                     IncludeRevisionsIdByDateTimeBefore[id] = new Dictionary<DateTime, DocumentInfo>
                     {
-                        [dateTime] = new() {Document = revision}
+                        [dateTime] = new() { Document = revision }
                     };
                 }
             }
@@ -2183,21 +2223,21 @@ more responsive application.
             OnAfterConversionToEntityInvoke(id, document, entity);
             return entity;
         }
-        
+
         internal bool CheckIfAllChangeVectorsAreAlreadyIncluded(IEnumerable<string> changeVectors)
         {
-            if (IncludeRevisionsByChangeVector is null) 
-                 return false;
-            
+            if (IncludeRevisionsByChangeVector is null)
+                return false;
+
             foreach (var cv in changeVectors)
             {
-                if (IncludeRevisionsByChangeVector.ContainsKey(cv)  == false )
+                if (IncludeRevisionsByChangeVector.ContainsKey(cv) == false)
                     return false;
             }
 
             return true;
         }
-        
+
         internal bool CheckIfRevisionByDateTimeBeforeAlreadyIncluded(string id, DateTime dateTime)
         {
             if (IncludeRevisionsIdByDateTimeBefore is null)
@@ -2211,7 +2251,7 @@ more responsive application.
 
             return false;
         }
-        
+
         public bool CheckIfIdAlreadyIncluded(string[] ids, IEnumerable<string> includes)
         {
             foreach (var id in ids)
@@ -2243,9 +2283,59 @@ more responsive application.
             return true;
         }
 
-        protected void RefreshInternal<T>(T entity, RavenCommand<GetDocumentsResult> cmd, DocumentInfo documentInfo)
+        protected void BuildEntityDocInfoByIdHolder<T>(
+            IEnumerable<T> entities,
+            out Dictionary<string, (object Entity, DocumentInfo Info)> idsEntitiesPairs
+        )
         {
-            var document = (BlittableJsonReaderObject)cmd.Result.Results[0];
+            idsEntitiesPairs = new();
+            foreach (var entity in entities)
+            {
+                if (DocumentsByEntity.TryGetValue(entity, out var docInfo) == false)
+                    ThrowCouldNotRefreshDocument("Cannot refresh a transient instance");
+                idsEntitiesPairs[docInfo.Id] = (entity, docInfo);
+            }
+        }
+
+        protected void RefreshEntities(
+            GetDocumentsCommand command,
+            Dictionary<string, (object Entity, DocumentInfo Info)> idsEntitiesPairs
+        )
+        {
+            List<(object Entity, DocumentInfo Info, BlittableJsonReaderObject Result)> list = new();
+            var hasDeleted = false;
+            var resultsCollection = command.Result.Results;
+
+            foreach (BlittableJsonReaderObject result in resultsCollection)
+            {
+                if (result == null)
+                {
+                    hasDeleted = true;
+                    break;
+                }
+                var id = result.GetMetadata().GetId();
+                if (idsEntitiesPairs.TryGetValue(id, out var tuple) == false)
+                    ThrowCouldNotRefreshDocument($"Could not refresh an entity, the server returned an invalid id: '{id}'. Should not happen!");
+                list.Add((tuple.Entity, tuple.Info, result));
+            }
+
+            if (hasDeleted)
+                ThrowCouldNotRefreshDocument("Some of the requested documents are no longer exists and were probably deleted");
+
+            foreach (var tuple in list)
+            {
+                RefreshInternal(tuple.Entity, tuple.Result, tuple.Info);
+            }
+        }
+
+        internal static void ThrowCouldNotRefreshDocument(string msg)
+        {
+            throw new InvalidOperationException(msg);
+        }
+
+        protected void RefreshInternal<T>(T entity, BlittableJsonReaderObject cmdResult, DocumentInfo documentInfo)
+        {
+            var document = cmdResult;
             if (document == null)
                 throw new InvalidOperationException("Document '" + documentInfo.Id +
                                                     "' no longer exists and was probably deleted");
@@ -2490,9 +2580,12 @@ more responsive application.
             bool isProjectInto)
         {
             var metadata = json.GetMetadata();
-            var changeVector = metadata.GetChangeVector();
-            //MapReduce indexes return reduce results that don't have @id property
-            metadata.TryGetId(out string id);
+
+            string changeVector = null;
+
+            //MapReduce indexes return reduce results that don't have @id property and @change-vector
+            if (metadata.TryGetId(out string id))
+                changeVector = metadata.GetChangeVector();
 
             return new StreamResult<T>
             {
@@ -2507,9 +2600,12 @@ more responsive application.
         {
             var json = enumerator.Current;
             var metadata = json.GetMetadata();
-            var changeVector = metadata.GetChangeVector();
-            //MapReduce indexes return reduce results that don't have @id property
-            metadata.TryGetId(out string id);
+
+            string changeVector = null;
+
+            //MapReduce indexes return reduce results that don't have @id property and @change-vector
+            if (metadata.TryGetId(out string id))
+                changeVector = metadata.GetChangeVector();
 
             var result = new TimeSeriesStreamResult<T>
             {

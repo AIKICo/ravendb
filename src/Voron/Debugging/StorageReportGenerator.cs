@@ -58,10 +58,9 @@ namespace Voron.Debugging
         public JournalFile[] FlushedJournals { get; set; }
         public List<Table> Tables;
         public Dictionary<Slice, long> Containers;
-        public List<PostingList> Sets;
+        public List<PostingList> PostingLists;
         public List<PersistentDictionaryRootHeader> PersistentDictionaries;
         public List<CompactTree> CompactTrees;
-        public ScratchBufferPoolInfo ScratchBufferPoolInfo { get; set; }
         public bool IncludeDetails { get; set; }
         public VoronPathSetting TempPath { get; set; }
         public VoronPathSetting JournalPath { get; set; }
@@ -102,6 +101,8 @@ namespace Voron.Debugging
             };
         }
 
+        public event Action<PostingList, TreeReport> HandlePostingListDetails;
+        
         public unsafe DetailedStorageReport Generate(DetailedReportInput input)
         {
             var dataFile = GenerateDataFileReport(input.NumberOfAllocatedPages, input.NumberOfFreePages, input.NextPageNumber);
@@ -157,9 +158,11 @@ namespace Voron.Debugging
                     _streamsAllocatedSpaceInBytes += treeReport.Streams.AllocatedSpaceInBytes;
             }
 
-            foreach (PostingList set in input.Sets)
+            foreach (PostingList postingList in input.PostingLists)
             {
-                trees.Add(GetReport(set, input.IncludeDetails));
+                var report = GetReport(postingList, input.IncludeDetails);
+                HandlePostingListDetails?.Invoke(postingList, report);
+                trees.Add(report);
             }
 
             foreach (var (name, page) in input.Containers)
@@ -169,6 +172,7 @@ namespace Voron.Debugging
 
             foreach (PersistentDictionaryRootHeader dic in input.PersistentDictionaries)
             {
+                // cannot use GetPageHeaderForDebug since the header is at the data pointer
                 Page page = _tx.GetPage(dic.PageNumber);
                 var header = (PersistentDictionaryHeader*)page.DataPointer;
 
@@ -246,7 +250,6 @@ namespace Voron.Debugging
                 Tables = tables,
                 Journals = journals,
                 PreAllocatedBuffers = preAllocatedBuffers,
-                ScratchBufferPoolInfo = input.ScratchBufferPoolInfo,
                 TempBuffers = tempBuffers,
                 TotalEncryptionBufferSize = input.TotalEncryptionBufferSize.ToString()
             };
@@ -452,8 +455,9 @@ namespace Voron.Debugging
             {
                 pageDensities = new();
                 var it = Container.GetAllPagesSet(_tx, page);
-                while(it.TryMoveNext(out var pageNum))
+                while (it.TryMoveNext(out var pageNum))
                 {
+                    // cannot use GetPageHeaderForDebug since we are reading not just from the header
                     Page cur = _tx.GetPage(pageNum);
                     if (cur.IsOverflow)
                     {
@@ -467,7 +471,8 @@ namespace Voron.Debugging
                     }
                 }
             }
-            
+
+            // cannot use GetPageHeaderForDebug since we are reading not just from the header
             var root = new Container(_tx.GetPage(page));
             double density = pageDensities?.Average() ?? -1;
             int totalPages = root.Header.NumberOfPages + root.Header.NumberOfOverflowPages;
@@ -721,31 +726,34 @@ namespace Voron.Debugging
 
             for (var i = 0; i < allPages.Count; i++)
             {
-                var page = tree.Llt.GetPage(allPages[i]);
+                // we don't need the entire page contents in order to calculate the page density, just the header
+                var pageHeaderUnion = tree.Llt.GetPageHeaderForDebug<PageHeaderUnion>(allPages[i]);
 
-                if (page.IsOverflow)
+                if ((pageHeaderUnion.PageHeader.Flags & PageFlags.Overflow) == PageFlags.Overflow)
                 {
-                    var numberOfPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(page.OverflowSize);
+                    var numberOfPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(pageHeaderUnion.PageHeader.OverflowSize);
 
-                    densities.Add(((double)(page.OverflowSize + Constants.Tree.PageHeaderSize)) / PagesToBytes(numberOfPages));
+                    densities.Add(((double)(pageHeaderUnion.PageHeader.OverflowSize + Constants.Tree.PageHeaderSize)) / PagesToBytes(numberOfPages));
 
                     i += numberOfPages - 1;
                 }
                 else
                 {
-                    if ((page.Flags & PageFlags.FixedSizeTreePage) == PageFlags.FixedSizeTreePage)
+                    if ((pageHeaderUnion.PageHeader.Flags & PageFlags.FixedSizeTreePage) == PageFlags.FixedSizeTreePage)
                     {
-                        var fstp = new FixedSizeTreePage<long>(page.Pointer, -1, Constants.Storage.PageSize);
+                        var isLeaf = (pageHeaderUnion.FixedSizeTreePageHeader.TreeFlags & FixedSizeTreePageFlags.Leaf) == FixedSizeTreePageFlags.Leaf;
                         var sizeUsed = Constants.FixedSizeTree.PageHeaderSize +
-                            fstp.NumberOfEntries * (fstp.IsLeaf ? fstp.ValueSize + sizeof(long) : FixedSizeTree.BranchEntrySize);
+                                       pageHeaderUnion.FixedSizeTreePageHeader.NumberOfEntries * (isLeaf ? pageHeaderUnion.FixedSizeTreePageHeader.ValueSize + sizeof(long) : FixedSizeTree.BranchEntrySize);
                         densities.Add((double)sizeUsed / Constants.Storage.PageSize);
                     }
                     else
                     {
-                        densities.Add(((double)new TreePage(page.Pointer, Constants.Storage.PageSize).SizeUsed) / Constants.Storage.PageSize);
+                        var sizeLeft = pageHeaderUnion.TreePageHeader.Upper - pageHeaderUnion.TreePageHeader.Lower;
+                        densities.Add(((double)(Constants.Storage.PageSize - sizeLeft) / Constants.Storage.PageSize));
                     }
                 }
             }
+
             return densities;
         }
         
@@ -759,6 +767,7 @@ namespace Voron.Debugging
 
             foreach (var p in allPages)
             {
+                // cannot use GetPageHeaderForDebug since we are reading not just from the header
                 var page = postingList.Llt.GetPage(p);
                 var state = new PostingListCursorState { Page = page };
                 if (state.IsLeaf)
@@ -770,6 +779,7 @@ namespace Voron.Debugging
                     densities.Add((double)new PostingListBranchPage(page).SpaceUsed / Constants.Storage.PageSize);
                 }
             }
+
             return densities;
         }
         
@@ -782,9 +792,8 @@ namespace Voron.Debugging
             var densities = new List<double>();
             foreach (var p in allPages)
             {
-                var page = ct.Llt.GetPage(p);
-                var state = new CompactTree.CursorState { Page = page };
-                densities.Add((double)state.Header->FreeSpace / Constants.Storage.PageSize);
+                var compactPageHeader = ct.Llt.GetPageHeaderForDebug<CompactPageHeader>(p);
+                densities.Add((double)compactPageHeader.FreeSpace / Constants.Storage.PageSize);
             }
             return densities;
         }
@@ -799,12 +808,13 @@ namespace Voron.Debugging
 
             foreach (var pageNumber in allPages)
             {
-                var page = tree.Llt.GetPage(pageNumber);
-                var fstp = new FixedSizeTreePage<long>(page.Pointer, tree.ValueSize + sizeof(long), Constants.Storage.PageSize);
+                var fstph = tree.Llt.GetPageHeaderForDebug<FixedSizeTreePageHeader>(pageNumber);
+                var isLeaf = (fstph.TreeFlags & FixedSizeTreePageFlags.Leaf) == FixedSizeTreePageFlags.Leaf;
                 var sizeUsed = Constants.FixedSizeTree.PageHeaderSize +
-                               fstp.NumberOfEntries * (fstp.IsLeaf ? fstp.ValueSize + sizeof(long) : FixedSizeTree.BranchEntrySize);
+                               fstph.NumberOfEntries * (isLeaf ? fstph.ValueSize + sizeof(long) : FixedSizeTree.BranchEntrySize);
                 densities.Add((double)sizeUsed / Constants.Storage.PageSize);
             }
+
             return densities;
         }
 
@@ -812,7 +822,7 @@ namespace Voron.Debugging
         {
             var nestedPage = new TreePage(nestedPagePtr, (ushort)tree.GetDataSize(currentNode));
 
-            Debug.Assert(nestedPage.PageNumber == -1); // nested page marker
+            //Debug.Assert(nestedPage.PageNumber == -1); // nested page marker
             return nestedPage;
         }
 

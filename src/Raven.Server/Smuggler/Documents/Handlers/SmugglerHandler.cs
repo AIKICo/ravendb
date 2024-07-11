@@ -40,14 +40,16 @@ using Raven.Server.Smuggler.Migration;
 using Raven.Server.Utils;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Logging;
 using Sparrow.Platform;
 using Sparrow.Utils;
+using BackupUtils = Raven.Server.Utils.BackupUtils;
 
 namespace Raven.Server.Smuggler.Documents.Handlers
 {
     public class SmugglerHandler : DatabaseRequestHandler
     {
-        private static readonly HttpClient HttpClient = new HttpClient();
+        private static readonly RavenHttpClient HttpClient = new();
 
         [RavenAction("/databases/*/smuggler/validate-options", "POST", AuthorizationStatus.ValidUser, EndpointType.Read)]
         public async Task PostValidateOptions()
@@ -125,7 +127,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
 
                 ApplyBackwardCompatibility(options);
 
-                var token = CreateOperationToken();
+                var token = CreateHttpRequestBoundOperationToken();
 
                 var fileName = options.FileName;
                 if (string.IsNullOrEmpty(fileName))
@@ -149,6 +151,8 @@ namespace Raven.Server.Smuggler.Documents.Handlers
                 {
                     HttpContext.Abort();
                 }
+                
+                LogTaskToAudit(Operations.OperationType.DatabaseExport.ToString(), operationId, configuration: null);
             }
         }
 
@@ -165,6 +169,13 @@ namespace Raven.Server.Smuggler.Documents.Handlers
 
             if (RequestRouter.TryGetClientVersion(HttpContext, out var version) == false)
                 return;
+            
+            if (version.Major == 5 && (version.Minor < 4  || version.Minor == 4 && version.Build < 200) && 
+                options.OperateOnTypes.HasFlag(DatabaseItemType.TimeSeries))
+            {
+                // version is older than 5.4.200
+                options.OperateOnTypes |= DatabaseItemType.TimeSeriesDeletedRanges;
+            }
 
             if (version.Major != RavenVersionAttribute.Instance.MajorVersion)
                 return;
@@ -195,29 +206,38 @@ namespace Raven.Server.Smuggler.Documents.Handlers
             using (token)
             {
                 var source = new DatabaseSource(Database, startDocumentEtag, startRaftIndex, Logger);
-                await using (var outputStream = GetOutputStream(ResponseBodyStream(), options))
+                await using (var outputStream = await GetOutputStreamAsync(ResponseBodyStream(), options))
                 {
-                    var destination = new StreamDestination(outputStream, context, source);
+                    var destination = new StreamDestination(outputStream, context, source, options.CompressionAlgorithm ?? Database.Configuration.ExportImport.CompressionAlgorithm, options.CompressionLevel ?? Database.Configuration.ExportImport.CompressionLevel);
                     var smuggler = new DatabaseSmuggler(Database, source, destination, Database.Time, options, onProgress: onProgress, token: token.Token);
                     return await smuggler.ExecuteAsync();
                 }
             }
         }
 
-        private Stream GetOutputStream(Stream fileStream, DatabaseSmugglerOptionsServerSide options)
+        private async Task<Stream> GetOutputStreamAsync(Stream fileStream, DatabaseSmugglerOptionsServerSide options)
         {
             if (options.EncryptionKey == null)
                 return fileStream;
 
             var key = options?.EncryptionKey;
-            return new EncryptingXChaCha20Poly1305Stream(fileStream,
-                Convert.FromBase64String(key));
+            var encryptingStream = new EncryptingXChaCha20Poly1305Stream(fileStream, Convert.FromBase64String(key));
+
+            await encryptingStream.InitializeAsync();
+
+            return encryptingStream;
         }
 
-        private Stream GetInputStream(Stream fileStream, DatabaseSmugglerOptionsServerSide options)
+        private async Task<Stream> GetInputStreamAsync(Stream fileStream, DatabaseSmugglerOptionsServerSide options)
         {
             if (options.EncryptionKey != null)
-                return new DecryptingXChaCha20Oly1305Stream(fileStream, Convert.FromBase64String(options.EncryptionKey));
+            {
+                var decryptingStream = new DecryptingXChaCha20Oly1305Stream(fileStream, Convert.FromBase64String(options.EncryptionKey));
+
+                await decryptingStream.InitializeAsync();
+
+                return decryptingStream;
+            }
 
             return fileStream;
         }
@@ -235,8 +255,8 @@ namespace Raven.Server.Smuggler.Documents.Handlers
             {
                 var options = DatabaseSmugglerOptionsServerSide.Create(HttpContext);
 
-                await using (var stream = new GZipStream(new BufferedStream(await GetImportStream(), 128 * Voron.Global.Constants.Size.Kilobyte), CompressionMode.Decompress))
-                using (var token = CreateOperationToken())
+                await using (var stream = await BackupUtils.GetDecompressionStreamAsync(new BufferedStream(await GetImportStream(), 128 * Voron.Global.Constants.Size.Kilobyte)))
+                using (var token = CreateHttpRequestBoundOperationToken())
                 using (var source = new StreamSource(stream, context, Database))
                 {
                     var destination = new DatabaseDestination(Database);
@@ -314,7 +334,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
 
                         using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                         await using (var file = await getFile())
-                        await using (var stream = new GZipStream(new BufferedStream(file, 128 * Voron.Global.Constants.Size.Kilobyte), CompressionMode.Decompress))
+                        await using (var stream = await BackupUtils.GetDecompressionStreamAsync(new BufferedStream(file, 128 * Voron.Global.Constants.Size.Kilobyte)))
                         using (var source = new StreamSource(stream, context, Database))
                         {
                             var destination = new DatabaseDestination(Database);
@@ -558,7 +578,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
                 }
 
                 var operationId = GetLongQueryString("operationId", false) ?? Database.Operations.GetNextOperationId();
-                var token = CreateOperationToken();
+                var token = CreateBackgroundOperationToken();
                 var transformScript = migrationConfiguration.TransformScript;
 
                 var t = Database.Operations.AddOperation(Database, $"Migration from: {migrationConfiguration.DatabaseTypeName}",
@@ -659,7 +679,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
                 }
 
                 var operationId = GetLongQueryString("operationId", false) ?? Database.Operations.GetNextOperationId();
-                var token = CreateOperationToken();
+                var token = CreateHttpRequestBoundOperationToken();
 
                 var result = new SmugglerResult();
                 await Database.Operations.AddOperation(Database, "Import to: " + Database.Name,
@@ -715,8 +735,8 @@ namespace Raven.Server.Smuggler.Documents.Handlers
 
                                     ApplyBackwardCompatibility(options);
 
-                                    var inputStream = GetInputStream(section.Body, options);
-                                    var stream = new GZipStream(inputStream, CompressionMode.Decompress);
+                                    var inputStream = await GetInputStreamAsync(section.Body, options);
+                                    var stream = await BackupUtils.GetDecompressionStreamAsync(inputStream);
                                     await DoImportInternalAsync(context, stream, options, result, onProgress, token);
                                 }
                             }
@@ -732,6 +752,8 @@ namespace Raven.Server.Smuggler.Documents.Handlers
                     }, operationId, token: token).ConfigureAwait(false);
 
                 await WriteImportResultAsync(context, result, ResponseBodyStream());
+                
+                LogTaskToAudit(Operations.OperationType.DatabaseImport.ToString(), operationId, configuration: null);
             }
         }
 
@@ -740,7 +762,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
             DynamicJsonValue djv = null;
 
             if (blittableJson.TryGet(nameof(DatabaseSmugglerOptions.OperateOnTypes), out string operateOnTypes) &&
-                operateOnTypes != null && 
+                operateOnTypes != null &&
                 Enum.TryParse(typeof(DatabaseItemType), operateOnTypes, out _) == false)
             {
                 CheckClientVersion(operateOnTypes, nameof(DatabaseSmugglerOptions.OperateOnTypes));
@@ -763,7 +785,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
             }
 
             if (blittableJson.TryGet(nameof(DatabaseSmugglerOptions.OperateOnDatabaseRecordTypes), out string operateOnDatabaseRecordTypes) &&
-                operateOnDatabaseRecordTypes != null && 
+                operateOnDatabaseRecordTypes != null &&
                 Enum.TryParse(typeof(DatabaseRecordItemType), operateOnDatabaseRecordTypes, out _) == false)
             {
                 CheckClientVersion(operateOnDatabaseRecordTypes, nameof(DatabaseSmugglerOptions.OperateOnDatabaseRecordTypes));
@@ -821,7 +843,7 @@ namespace Raven.Server.Smuggler.Documents.Handlers
                     }
                 }
 
-                var token = CreateOperationToken();
+                var token = CreateHttpRequestBoundOperationToken();
                 var result = new SmugglerResult();
                 var operationId = GetLongQueryString("operationId", false) ?? Database.Operations.GetNextOperationId();
                 var collection = GetStringQueryString("collection", false);

@@ -2,14 +2,19 @@
 using System.Net;
 using System.Threading.Tasks;
 using Raven.Client;
-using Raven.Client.Documents.Changes;
+using Raven.Client.Documents.Operations.ConnectionStrings;
+using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Exceptions;
+using Raven.Client.Json.Serialization;
 using Raven.Client.ServerWide;
 using Raven.Client.Util;
+using Raven.Server.Documents.Handlers;
+using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Web;
+using Raven.Server.Web.System;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
@@ -24,17 +29,18 @@ namespace Raven.Server.Documents
 
         public override void Init(RequestHandlerContext context)
         {
-            base.Init(context);
-
             Database = context.Database;
             ContextPool = Database.DocumentsStorage.ContextPool;
             Logger = LoggingSource.Instance.GetLogger(Database.Name, GetType().FullName);
 
-            context.HttpContext.Response.OnStarting(() => CheckForChanges(context));
+            base.Init(context);
         }
 
-        public Task CheckForChanges(RequestHandlerContext context)
+        public override Task CheckForChanges(RequestHandlerContext context)
         {
+            if (context.CheckForChanges == false)
+                return Task.CompletedTask;
+
             var topologyEtag = GetLongFromHeaders(Constants.Headers.TopologyEtag);
             if (topologyEtag.HasValue && Database.HasTopologyChanged(topologyEtag.Value))
                 context.HttpContext.Response.Headers[Constants.Headers.RefreshTopology] = "true";
@@ -76,6 +82,8 @@ namespace Raven.Server.Documents
                     fillJson?.Invoke(json, result.Configuration, result.Index);
                     context.Write(writer, json);
                 }
+
+                LogTaskToAudit(debug, result.Index, result.Configuration);
             }
         }
 
@@ -117,45 +125,44 @@ namespace Raven.Server.Documents
             }
         }
 
-        /// <summary>
-        /// puts the given string in TrafficWatch property of HttpContext.Items
-        /// puts the given type in TrafficWatchChangeType property of HttpContext.Items
-        /// </summary>
-        /// <param name="str"></param>
-        /// <param name="type"></param>
-        public void AddStringToHttpContext(string str, TrafficWatchChangeType type)
+        protected OperationCancelToken CreateHttpRequestBoundTimeLimitedOperationToken()
         {
-            HttpContext.Items["TrafficWatch"] = (str, type);
+            return CreateHttpRequestBoundTimeLimitedOperationToken(Database.Configuration.Databases.OperationTimeout.AsTimeSpan);
         }
 
-        protected OperationCancelToken CreateTimeLimitedOperationToken()
+        protected OperationCancelToken CreateHttpRequestBoundTimeLimitedOperationTokenForQuery()
         {
-            return new OperationCancelToken(Database.Configuration.Databases.OperationTimeout.AsTimeSpan, Database.DatabaseShutdown, HttpContext.RequestAborted);
+            return CreateHttpRequestBoundTimeLimitedOperationToken(Database.Configuration.Databases.QueryTimeout.AsTimeSpan);
         }
 
-        protected OperationCancelToken CreateTimeLimitedQueryToken()
+        protected override OperationCancelToken CreateHttpRequestBoundTimeLimitedOperationToken(TimeSpan cancelAfter)
         {
-            return new OperationCancelToken(Database.Configuration.Databases.QueryTimeout.AsTimeSpan, Database.DatabaseShutdown, HttpContext.RequestAborted);
+            return new OperationCancelToken(cancelAfter, Database.DatabaseShutdown, HttpContext.RequestAborted);
         }
 
-        protected OperationCancelToken CreateTimeLimitedCollectionOperationToken()
-        {
-            return new OperationCancelToken(Database.Configuration.Databases.CollectionOperationTimeout.AsTimeSpan, Database.DatabaseShutdown, HttpContext.RequestAborted);
-        }
-
-        protected OperationCancelToken CreateTimeLimitedQueryOperationToken()
-        {
-            return new OperationCancelToken(Database.Configuration.Databases.QueryOperationTimeout.AsTimeSpan, Database.DatabaseShutdown, HttpContext.RequestAborted);
-        }
-
-        protected override OperationCancelToken CreateOperationToken()
+        protected override OperationCancelToken CreateHttpRequestBoundOperationToken()
         {
             return new OperationCancelToken(Database.DatabaseShutdown, HttpContext.RequestAborted);
         }
 
-        protected override OperationCancelToken CreateOperationToken(TimeSpan cancelAfter)
+        protected OperationCancelToken CreateTimeLimitedBackgroundOperationTokenForQueryOperation()
         {
-            return new OperationCancelToken(cancelAfter, Database.DatabaseShutdown, HttpContext.RequestAborted);
+            return new OperationCancelToken(Database.Configuration.Databases.QueryOperationTimeout.AsTimeSpan, Database.DatabaseShutdown);
+        }
+
+        protected OperationCancelToken CreateTimeLimitedBackgroundOperationTokenForCollectionOperation()
+        {
+            return new OperationCancelToken(Database.Configuration.Databases.CollectionOperationTimeout.AsTimeSpan, Database.DatabaseShutdown);
+        }
+
+        protected OperationCancelToken CreateTimeLimitedBackgroundOperationToken()
+        {
+            return new OperationCancelToken(Database.Configuration.Databases.OperationTimeout.AsTimeSpan, Database.DatabaseShutdown);
+        }
+        
+        protected override OperationCancelToken CreateBackgroundOperationToken()
+        {
+            return new OperationCancelToken(Database.DatabaseShutdown);
         }
 
         protected bool ShouldAddPagingPerformanceHint(long numberOfResults)
@@ -167,6 +174,111 @@ namespace Raven.Server.Documents
         {
             if(ShouldAddPagingPerformanceHint(numberOfResults))
                 Database.NotificationCenter.Paging.Add(operation, action, details, numberOfResults, pageSize, duration, totalDocumentsSizeInBytes);
+        }
+
+        private DynamicJsonValue GetCustomConfigurationAuditJson(string name, BlittableJsonReaderObject configuration)
+        {
+            switch (name)
+            {
+                case RevisionsHandler.ReadRevisionsConfigTag:
+                    return JsonDeserializationServer.RevisionsConfiguration(configuration).ToAuditJson();
+
+                case RevisionsHandler.ConflictedRevisionsConfigTag:
+                    return JsonDeserializationServer.RevisionsCollectionConfiguration(configuration).ToAuditJson();
+
+                case OngoingTasksHandler.BackupDatabaseOnceTag:
+                    return JsonDeserializationServer.BackupConfiguration(configuration).ToAuditJson();
+
+                case OngoingTasksHandler.UpdatePeriodicBackupDebugTag:
+                    return JsonDeserializationClient.PeriodicBackupConfiguration(configuration).ToAuditJson();
+
+                case OngoingTasksHandler.UpdateExternalReplicationDebugTag:
+                    return JsonDeserializationClient.ExternalReplication(configuration).ToAuditJson();
+
+                case PullReplicationHandler.DefineHubDebugTag:
+                    return JsonDeserializationClient.PullReplicationDefinition(configuration).ToAuditJson();
+
+                case PullReplicationHandler.UpdatePullReplicationOnSinkNodeDebugTag:
+                    return JsonDeserializationClient.PullReplicationAsSink(configuration).ToAuditJson();
+
+                case OngoingTasksHandler.AddEtlDebugTag:
+                    return GetEtlConfigurationAuditJson(configuration);
+
+                case OngoingTasksHandler.PutConnectionStringDebugTag:
+                    return GetConnectionStringConfigurationAuditJson(configuration);
+            }
+            return null;
+        }
+
+        private DynamicJsonValue GetEtlConfigurationAuditJson(BlittableJsonReaderObject configuration)
+        {
+            var etlType = EtlConfiguration<ConnectionString>.GetEtlType(configuration);
+
+            switch (etlType)
+            {
+                case EtlType.Raven:
+                    return JsonDeserializationClient.RavenEtlConfiguration(configuration).ToAuditJson();
+
+                case EtlType.ElasticSearch:
+                    return JsonDeserializationClient.ElasticSearchEtlConfiguration(configuration).ToAuditJson();
+
+                case EtlType.Queue:
+                    return JsonDeserializationClient.QueueEtlConfiguration(configuration).ToAuditJson();
+
+                case EtlType.Sql:
+                    return JsonDeserializationClient.SqlEtlConfiguration(configuration).ToAuditJson();
+
+                case EtlType.Olap:
+                    return JsonDeserializationClient.OlapEtlConfiguration(configuration).ToAuditJson();
+            }
+
+            return null;
+        }
+
+        private DynamicJsonValue GetConnectionStringConfigurationAuditJson(BlittableJsonReaderObject configuration)
+        {
+            var connectionStringType = ConnectionString.GetConnectionStringType(configuration);
+            switch (connectionStringType)
+            {
+                case ConnectionStringType.Raven:
+                    return JsonDeserializationClient.RavenConnectionString(configuration).ToAuditJson();
+                
+                case ConnectionStringType.ElasticSearch:
+                    return JsonDeserializationClient.ElasticSearchConnectionString(configuration).ToAuditJson();
+
+                case ConnectionStringType.Queue:
+                    return JsonDeserializationClient.QueueConnectionString(configuration).ToAuditJson();
+
+                case ConnectionStringType.Sql:
+                    return JsonDeserializationClient.SqlConnectionString(configuration).ToAuditJson();
+
+                case ConnectionStringType.Olap:
+                    return JsonDeserializationClient.OlapConnectionString(configuration).ToAuditJson();
+            }
+
+            return null;
+        }
+
+        protected void LogTaskToAudit(string description, long id, BlittableJsonReaderObject configuration)
+        {
+            if (LoggingSource.AuditLog.IsInfoEnabled)
+            {
+                DynamicJsonValue conf = GetCustomConfigurationAuditJson(description, configuration);
+                var line = $"'{description}' with taskId: '{id}'";
+
+                if (conf != null)
+                {
+                    string confString;
+                    using (ContextPool.AllocateOperationContext(out JsonOperationContext ctx))
+                    {
+                        confString = ctx.ReadObject(conf, "conf").ToString();
+                    }
+
+                    line += ($" Configuration: {confString}");
+                }
+
+                LogAuditFor(Database.Name, "TASK", line);
+            }
         }
     }
 }

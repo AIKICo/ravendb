@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Linq;
-using FastTests;
 using FastTests.Server.Replication;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Documents.Queries.TimeSeries;
 using Raven.Tests.Core.Utils.Entities;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -16,10 +16,11 @@ namespace SlowTests.Client.TimeSeries.Issues
         {
         }
 
-        [Fact]
-        public void CanSelectAverageWithInterpolationInTimeSeriesQuery()
+        [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.TimeSeries)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+        public void CanSelectAverageWithInterpolationInTimeSeriesQuery(Options options)
         {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             {
                 var baseline = RavenTestHelper.UtcToday;
                 var id = "people/1";

@@ -13,7 +13,7 @@ using Sparrow.Json.Parsing;
 
 namespace Raven.Server.Web.Studio
 {
-    public class LicenseHandler : RequestHandler
+    public class LicenseHandler : ServerRequestHandler
     {
         [RavenAction("/license/eula", "GET", AuthorizationStatus.ValidUser, EndpointType.Read)]
         public async Task Eula()
@@ -98,9 +98,12 @@ namespace Raven.Server.Web.Studio
                 return;
             }
 
-            await ServerStore.LicenseManager.LeaseLicense(GetRaftRequestIdFromQuery(), throwOnError: true);
-
-            NoContentStatus();
+            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            {
+                var licenseLeaseResult = await ServerStore.LicenseManager.LeaseLicense(GetRaftRequestIdFromQuery(), throwOnError: true);
+                context.Write(writer, licenseLeaseResult.ToJson());
+            }
         }
 
         [RavenAction("/license/support", "GET", AuthorizationStatus.ValidUser, EndpointType.Read)]

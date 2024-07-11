@@ -51,7 +51,31 @@ namespace Raven.Client.Http
 
         public string LastServerVersion { get; private set; }
 
-        internal bool SupportsAtomicClusterWrites { get; set; }
+        public string ServerVersion
+        {
+            get
+            {
+                return LastServerVersion;
+            }
+            private set
+            {
+                UpdateServerVersion(value);
+            }
+        }
+
+        private bool? _supportsAtomicClusterWrites;
+
+        internal bool SupportsAtomicClusterWrites
+        {
+            get
+            {
+                if (_supportsAtomicClusterWrites.HasValue)
+                    return _supportsAtomicClusterWrites.Value;
+
+                UpdateServerVersion(LastServerVersion);
+                return _supportsAtomicClusterWrites.Value;
+            }
+        }
 
         public bool ShouldUpdateServerVersion()
         {
@@ -69,12 +93,12 @@ namespace Raven.Client.Http
             if (serverVersion != null && Version.TryParse(serverVersion, out var ver))
             {
                 // 5.2 or higher
-                SupportsAtomicClusterWrites = ver.Major == 5 && ver.Minor >= 2 ||
-                                              ver.Major > 5;
+                _supportsAtomicClusterWrites = ver.Major == 5 && ver.Minor >= 2 ||
+                                               ver.Major > 5;
             }
             else
             {
-                SupportsAtomicClusterWrites = false;
+                _supportsAtomicClusterWrites = false;
             }
         }
 
@@ -95,7 +119,8 @@ namespace Raven.Client.Http
                 nodes.Add(new ServerNode
                 {
                     Url = member.Value,
-                    ClusterTag = member.Key
+                    ClusterTag = member.Key,
+                    ServerRole = Role.Member
                 });
             }
 
@@ -104,11 +129,17 @@ namespace Raven.Client.Http
                 nodes.Add(new ServerNode
                 {
                     Url = watcher.Value,
-                    ClusterTag = watcher.Key
+                    ClusterTag = watcher.Key,
+                    ServerRole = Role.Member
                 });
             }
 
             return nodes;
+        }
+
+        public override string ToString()
+        {
+            return $"{{Url: {Url}, Database: {Database}, ClusterTag: {ClusterTag}, ServerRole: {ServerRole}}}";
         }
     }
 }

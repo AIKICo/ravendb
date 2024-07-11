@@ -6,17 +6,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using MySqlX.XDevAPI;
 using Raven.Server.Routing;
 using Raven.Server.Utils;
 using Raven.Server.Web;
-using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.LowMemory;
 using Sparrow.Platform;
 using Sparrow.Platform.Posix;
-using Sparrow.Server;
 using Sparrow.Server.Platform.Win32;
 using Sparrow.Utils;
 using Voron.Impl;
@@ -24,7 +21,7 @@ using Size = Raven.Client.Util.Size;
 
 namespace Raven.Server.Documents.Handlers.Debugging
 {
-    public class MemoryDebugHandler : RequestHandler
+    public class MemoryDebugHandler : ServerRequestHandler
     {
         [RavenAction("/admin/debug/memory/gc", "GET", AuthorizationStatus.Operator, IsDebugInformationEndpoint = true)]
         public async Task GcInfo()
@@ -55,17 +52,27 @@ namespace Raven.Server.Documents.Handlers.Debugging
                     [nameof(info.FragmentedBytes)] = info.FragmentedBytes,
                     ["FragmentedHumane"] = Size.Humane(info.FragmentedBytes),
                     [nameof(info.Generation)] = info.Generation,
-                    [nameof(info.GenerationInfo)] = new DynamicJsonArray(info.GenerationInfo.ToArray().Select(x => new DynamicJsonValue
-                    {
-                        [nameof(x.FragmentationAfterBytes)] = x.FragmentationAfterBytes,
-                        ["FragmentationAfterHumane"] = Size.Humane(x.FragmentationAfterBytes),
-                        [nameof(x.FragmentationBeforeBytes)] = x.FragmentationBeforeBytes,
-                        ["FragmentationBeforeHumane"] = Size.Humane(x.FragmentationBeforeBytes),
-                        [nameof(x.SizeAfterBytes)] = x.SizeAfterBytes,
-                        ["SizeAfterHumane"] = Size.Humane(x.SizeAfterBytes),
-                        [nameof(x.SizeBeforeBytes)] = x.SizeBeforeBytes,
-                        ["SizeBeforeHumane"] = Size.Humane(x.SizeBeforeBytes)
-                    })),
+                    [nameof(info.GenerationInfo)] = new DynamicJsonArray(
+                        info.GenerationInfo.ToArray().Select((x, index) => new DynamicJsonValue
+                        {
+                            ["GenerationName"] = index switch
+                                {
+                                    0 => "Heap Generation 0",
+                                    1 => "Heap Generation 1",
+                                    2 => "Heap Generation 2",
+                                    3 => "Large Object Heap",
+                                    4 => "Pinned Object Heap",
+                                    _ => "Unknown Generation"
+                                },
+                            [nameof(x.FragmentationAfterBytes)] = x.FragmentationAfterBytes,
+                            ["FragmentationAfterHumane"] = Size.Humane(x.FragmentationAfterBytes),
+                            [nameof(x.FragmentationBeforeBytes)] = x.FragmentationBeforeBytes,
+                            ["FragmentationBeforeHumane"] = Size.Humane(x.FragmentationBeforeBytes),
+                            [nameof(x.SizeAfterBytes)] = x.SizeAfterBytes,
+                            ["SizeAfterHumane"] = Size.Humane(x.SizeAfterBytes),
+                            [nameof(x.SizeBeforeBytes)] = x.SizeBeforeBytes,
+                            ["SizeBeforeHumane"] = Size.Humane(x.SizeBeforeBytes)
+                        })),
                     [nameof(info.HeapSizeBytes)] = info.HeapSizeBytes,
                     ["HeapSizeHumane"] = Size.Humane(info.HeapSizeBytes),
                     [nameof(info.HighMemoryLoadThresholdBytes)] = info.HighMemoryLoadThresholdBytes,
@@ -285,10 +292,8 @@ namespace Raven.Server.Documents.Handlers.Debugging
             var memInfo = MemoryInformation.GetMemoryInformationUsingOneTimeSmapsReader();
             long managedMemoryInBytes = AbstractLowMemoryMonitor.GetManagedMemoryInBytes();
             long totalUnmanagedAllocations = NativeMemory.TotalAllocatedMemory;
-            long totalLuceneUnmanagedAllocations = NativeMemory.TotalAllocatedMemoryByLucene;
             var encryptionBuffers = EncryptionBuffersPool.Instance.GetStats();
             var dirtyMemoryState = MemoryInformation.GetDirtyMemoryState();
-            var memoryUsageRecords = MemoryInformation.GetMemoryUsageRecords();
 
             long totalMapping = 0;
             var fileMappingByDir = new Dictionary<string, Dictionary<string, ConcurrentDictionary<IntPtr, long>>>();
@@ -318,22 +323,16 @@ namespace Raven.Server.Documents.Handlers.Debugging
                 [nameof(MemoryInfo.WorkingSet)] = memInfo.WorkingSet.ToString(),
                 [nameof(MemoryInfo.ManagedAllocations)] = Size.Humane(managedMemoryInBytes),
                 [nameof(MemoryInfo.UnmanagedAllocations)] = Size.Humane(totalUnmanagedAllocations),
-                [nameof(MemoryInfo.LuceneUnmanagedAllocations)] = Size.Humane(totalLuceneUnmanagedAllocations),
+                [nameof(MemoryInfo.LuceneManagedAllocationsForTermCache)] = Size.Humane(NativeMemory.TotalLuceneManagedAllocationsForTermCache),
+                [nameof(MemoryInfo.LuceneUnmanagedAllocationsForSorting)] = Size.Humane(NativeMemory.TotalLuceneUnmanagedAllocationsForSorting),
                 [nameof(MemoryInfo.EncryptionBuffersInUse)] = Size.Humane(encryptionBuffers.CurrentlyInUseSize),
                 [nameof(MemoryInfo.EncryptionBuffersPool)] = Size.Humane(encryptionBuffers.TotalPoolSize),
                 [nameof(MemoryInfo.EncryptionLockedMemory)] = Size.Humane(Sodium.LockedBytes),
                 [nameof(MemoryInfo.MemoryMapped)] = Size.Humane(totalMapping),
-                [nameof(MemoryInfo.ScratchDirtyMemory)] = memInfo.TotalScratchDirtyMemory.ToString(),
                 [nameof(MemoryInfo.IsHighDirty)] = dirtyMemoryState.IsHighDirty,
-                [nameof(MemoryInfo.DirtyMemory)] = Size.Humane(dirtyMemoryState.TotalDirtyInBytes),
-                [nameof(MemoryInfo.AvailableMemory)] = Size.Humane(memInfo.AvailableMemory.GetValue(SizeUnit.Bytes)),
+                [nameof(MemoryInfo.DirtyMemory)] = dirtyMemoryState.TotalDirty.ToString(),
+                [nameof(MemoryInfo.AvailableMemory)] = memInfo.AvailableMemory.ToString(),
                 [nameof(MemoryInfo.AvailableMemoryForProcessing)] = memInfo.AvailableMemoryForProcessing.ToString(),
-                [nameof(MemoryInfo.HighMemLastOneMinute)] = memoryUsageRecords.High.LastOneMinute.ToString(),
-                [nameof(MemoryInfo.LowMemLastOneMinute)] = memoryUsageRecords.Low.LastOneMinute.ToString(),
-                [nameof(MemoryInfo.HighMemLastFiveMinute)] = memoryUsageRecords.High.LastFiveMinutes.ToString(),
-                [nameof(MemoryInfo.LowMemLastFiveMinute)] = memoryUsageRecords.Low.LastFiveMinutes.ToString(),
-                [nameof(MemoryInfo.HighMemSinceStartup)] = memoryUsageRecords.High.SinceStartup.ToString(),
-                [nameof(MemoryInfo.LowMemSinceStartup)] = memoryUsageRecords.Low.SinceStartup.ToString(),
             };
             if (memInfo.Remarks != null)
             {
@@ -529,7 +528,8 @@ namespace Raven.Server.Documents.Handlers.Debugging
             public string Remarks { get; set; }
             public string ManagedAllocations { get; set; }
             public string UnmanagedAllocations { get; set; }
-            public string LuceneUnmanagedAllocations { get; set; }
+            public string LuceneManagedAllocationsForTermCache { get; set; }
+            public string LuceneUnmanagedAllocationsForSorting { get; set; }
             public string EncryptionBuffersInUse { get; set; }
             public string EncryptionBuffersPool { get; set; }
             public string EncryptionLockedMemory { get; set; }
@@ -539,12 +539,6 @@ namespace Raven.Server.Documents.Handlers.Debugging
             public string DirtyMemory { get; set; }
             public string AvailableMemory { get; set; }
             public string AvailableMemoryForProcessing { get; set; }
-            public string HighMemLastOneMinute { get; set; }
-            public string LowMemLastOneMinute { get; set; }
-            public string HighMemLastFiveMinute { get; set; }
-            public string LowMemLastFiveMinute { get; set; }
-            public string HighMemSinceStartup { get; set; }
-            public string LowMemSinceStartup { get; set; }
             public MemoryInfoMappingItem[] Mappings { get; set; }
         }
 

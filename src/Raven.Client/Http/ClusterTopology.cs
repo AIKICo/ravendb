@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using Newtonsoft.Json;
+using Sparrow.Json;
 using Sparrow.Json.Parsing;
 
 namespace Raven.Client.Http
@@ -43,6 +45,16 @@ namespace Raven.Client.Http
                 }
             }
             
+        }
+
+        internal ServerNode.Role GetServerRoleForTag(string nodeTag)
+        {
+            if (Members.ContainsKey(nodeTag) || Watchers.ContainsKey(nodeTag))
+                return ServerNode.Role.Member;
+            if (Promotables.ContainsKey(nodeTag))
+                return ServerNode.Role.Promotable;
+            
+            return ServerNode.Role.None;
         }
 
         public bool Contains(string node)
@@ -173,6 +185,14 @@ namespace Raven.Client.Http
             }
         }
 
+        public override string ToString()
+        {
+            using (var ctx = JsonOperationContext.ShortTermSingleUse())
+            {
+                return ctx.ReadObject(ToJson(), "cluster-topology").ToString();
+            }
+        }
+
         public string LastNodeId { get; protected set; }
         public string TopologyId { get; protected set; }
         public long Etag { get; protected set; }
@@ -180,6 +200,9 @@ namespace Raven.Client.Http
         public Dictionary<string, string> Members { get; protected set; }
         public Dictionary<string, string> Promotables { get; protected set; }
         public Dictionary<string, string> Watchers { get; protected set; }
+
+        [JsonIgnore]
+        internal int Count => Members.Count + Promotables.Count + Watchers.Count;
     }
 
     public class NodeStatus : IDynamicJson

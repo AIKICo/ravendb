@@ -202,7 +202,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
                 await session.SaveChangesAsync();
             }
 
-            var database = GetDatabase(src.Database).Result;
+            var database = await GetDatabase(src.Database);
             using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             {
                 var testRavenEtlScript = new TestRavenEtlScript
@@ -304,7 +304,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
             const string tsName = Constants.Headers.IncrementalTimeSeriesPrefix + "HeartRate";
             var baseline = DateTime.UtcNow;
 
-            var (src, dest, _) = CreateSrcDestAndAddEtl(collections: new []{ "Users" }, script : null);
+            var (src, dest, _) = CreateSrcDestAndAddEtl(collections: new[] { "Users" }, script: null);
 
             var etlDone = WaitForEtl(src, (s, statistics) => statistics.LastProcessedEtag > 21);
 
@@ -326,7 +326,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
                     await session.SaveChangesAsync();
                 }
             }
-            
+
 
             Assert.True(etlDone.Wait(TimeSpan.FromSeconds(30)));
 
@@ -344,7 +344,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
             const string tsName = Constants.Headers.IncrementalTimeSeriesPrefix + "HeartRate";
             var baseline = DateTime.UtcNow;
 
-            var (src, dest, _) = CreateSrcDestAndAddEtl(collections: new []{ "Users" }, script : null);
+            var (src, dest, _) = CreateSrcDestAndAddEtl(collections: new[] { "Users" }, script: null);
 
             using (var session = src.OpenAsyncSession())
             {
@@ -1517,7 +1517,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
             var url = $"{src.Urls.First()}/databases/{src.Database}/etl/progress";
             var response = (await client.GetAsync(url));
             response.EnsureSuccessStatusCode();
-            var strResult = response.Content.ReadAsStringAsync().Result;
+            var strResult = await response.Content.ReadAsStringAsync();
             var etlProgressResult = JsonConvert.DeserializeObject<EtlProgressResult>(strResult);
             var processesProgress = etlProgressResult.Results.First().ProcessesProgress.First();
             return processesProgress;
@@ -1683,7 +1683,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
             }, interval: _waitInterval);
         }
 
-        [Theory]
+        [MultiplatformTheory(RavenArchitecture.AllX64)]
         [ClassData(typeof(TestDataForDocAndTimeSeriesChangeTracking<TestDataType>))]
         [ClassData(typeof(TestDataForDocChangeTracking<TestDataType>))]
         public async Task RavenEtlWithTimeSeries_WhenStoreDocumentAndMultipleSegmentOfTimeSeriesInSameSession_ShouldDestBeAsSrc(
@@ -1740,7 +1740,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
             }
         }
 
-        [Theory]
+        [MultiplatformTheory(RavenArchitecture.AllX64)]
         [ClassData(typeof(TestDataForDocAndTimeSeriesChangeTracking<TestDataType>))]
         public async Task RavenEtlWithTimeSeries_WhenStoreDocumentAndMultipleSegmentOfTimeSeriesInAnotherSession_ShouldDestBeAsSrc(
             string justForXUint,
@@ -1840,7 +1840,7 @@ function loadTimeSeriesOfUsersBehavior(doc, ts)
 
             var (src, dest, _) = CreateSrcDestAndAddEtl(collections, script, collections.Length == 0, srcOptions: _options);
 
-            var database = GetDatabase(src.Database).Result;
+            var database = await GetDatabase(src.Database);
             using (var context = DocumentsOperationContext.ShortTermSingleUse(database))
             using (var tr = context.OpenWriteTransaction())
             {
@@ -2004,7 +2004,7 @@ function loadTimeSeriesOfUsersBehavior(docId, counter)
                 var actualUsers = await session.Query<User>().ToArrayAsync();
                 foreach (var user in actualUsers)
                 {
-                    var ts = session.TimeSeriesFor(user.Id, timeSeriesName).GetAsync(DateTime.MinValue, DateTime.MaxValue);
+                    var ts = await session.TimeSeriesFor(user.Id, timeSeriesName).GetAsync(DateTime.MinValue, DateTime.MaxValue);
                     Assert.True(user.Age < 18 ^ ts != null);
                 }
             }

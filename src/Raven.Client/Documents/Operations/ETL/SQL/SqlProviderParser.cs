@@ -9,6 +9,7 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
             switch (factoryName)
             {
                 case "System.Data.SqlClient":
+                case "Microsoft.Data.SqlClient":
                     return SqlProvider.SqlClient;
                 case "Npgsql":
                     return SqlProvider.Npgsql;
@@ -21,7 +22,8 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
                 case "Oracle.ManagedDataAccess.Client":
                     return SqlProvider.OracleClient;
                 case "MySql.Data.MySqlClient":
-                    return SqlProvider.MySqlClient;
+                case "MySqlConnector.MySqlConnectorFactory":
+                    return SqlProvider.MySqlConnectorFactory;
                 case "System.Data.SqlServerCe.3.5":
                     throw new NotImplementedException($"Factory '{factoryName}' is not implemented yet");
                     //return SqlProvider.SqlServerCe_3_5;

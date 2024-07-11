@@ -17,6 +17,7 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
+using Raven.Server.Commercial;
 using Raven.Server.Config;
 using Raven.Server.Documents;
 using Raven.Server.Documents.PeriodicBackup;
@@ -35,7 +36,7 @@ using Constants = Raven.Client.Constants;
 
 namespace Raven.Server.Web.System
 {
-    public sealed class DatabasesHandler : RequestHandler
+    public sealed class DatabasesHandler : ServerRequestHandler
     {
         private static readonly Logger Logger = LoggingSource.Instance.GetLogger<DatabasesHandler>("Server");
 
@@ -115,12 +116,9 @@ namespace Raven.Server.Web.System
 
                 if (LoggingSource.AuditLog.IsInfoEnabled)
                 {
-                    var clientCert = GetCurrentCertificate();
-
-                    var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
-                    auditLog.Info($"Database \'{dbName}\' topology is being modified by {clientCert?.Subject} ({clientCert?.Thumbprint})," +
-                                  $"Old topology: {databaseRecord.Topology} " +
-                                  $"New topology: {databaseTopology}.");
+                    LogAuditFor("DbMgmt", "CHANGE", $"Database '{dbName}' topology. " +
+                                          $"Old topology: {databaseRecord.Topology} " +
+                                          $"New topology: {databaseTopology}.");
                 }
 
                 // Validate Topology
@@ -132,7 +130,7 @@ namespace Raven.Server.Web.System
 
                     if (databaseRecord.Topology.RelevantFor(node) == false)
                     {
-                        ValidateNodeForAddingToDb(dbName, node, databaseRecord, clusterTopology, baseMessage: $"Can't modify database {dbName} topology");
+                        ValidateNodeForAddingToDb(dbName, node, databaseRecord, clusterTopology, Server, baseMessage: $"Can't modify database {dbName} topology");
                     }
                 }
                 databaseTopology.ReplicationFactor = Math.Min(databaseTopology.Count, clusterTopology.AllNodes.Count);
@@ -156,7 +154,7 @@ namespace Raven.Server.Web.System
             }
         }
 
-        [RavenAction("/topology", "GET", AuthorizationStatus.ValidUser, EndpointType.Read)]
+        [RavenAction("/topology", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, CheckForChanges = false)]
         public async Task GetTopology()
         {
             var name = GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
@@ -219,33 +217,57 @@ namespace Raven.Server.Web.System
                     }
 
                     clusterTopology.ReplaceCurrentNodeUrlWithClientRequestedNodeUrlIfNecessary(ServerStore, HttpContext);
-
+                    var license = ServerStore.LoadLicenseLimits();
+                    var dbNodes = GetNodes(rawRecord.Topology.Members, ServerNode.Role.Member, license).Concat(GetNodes(rawRecord.Topology.Rehabs, ServerNode.Role.Rehab, license));
                     await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
                     {
-                        context.Write(writer, new DynamicJsonValue
+                        context.Write(writer,
+                            new DynamicJsonValue
+                            {
+                                [nameof(Topology.Nodes)] = new DynamicJsonArray(dbNodes),
+                                [nameof(Topology.Etag)] = rawRecord.Topology.Stamp?.Index ?? -1
+                            });
+                    }
+
+
+
+                    IEnumerable<DynamicJsonValue> GetNodes(List<string> nodes, ServerNode.Role serverRole, LicenseLimits license)
+                    {
+                        foreach (var node in nodes)
                         {
-                            [nameof(Topology.Nodes)] = new DynamicJsonArray(
-                                rawRecord.Topology.Members.Select(x => new DynamicJsonValue
-                                {
-                                    [nameof(ServerNode.Url)] = GetUrl(x, clusterTopology),
-                                    [nameof(ServerNode.ClusterTag)] = x,
-                                    [nameof(ServerNode.ServerRole)] = ServerNode.Role.Member,
-                                    [nameof(ServerNode.Database)] = rawRecord.DatabaseName
-                                })
-                                .Concat(rawRecord.Topology.Rehabs.Select(x => new DynamicJsonValue
-                                {
-                                    [nameof(ServerNode.Url)] = GetUrl(x, clusterTopology),
-                                    [nameof(ServerNode.ClusterTag)] = x,
-                                    [nameof(ServerNode.Database)] = rawRecord.DatabaseName,
-                                    [nameof(ServerNode.ServerRole)] = ServerNode.Role.Rehab
-                                })
-                                )
-                            ),
-                            [nameof(Topology.Etag)] = rawRecord.Topology.Stamp?.Index ?? -1
-                        });
+                            var url = GetUrl(node, clusterTopology);
+                            if (url == null)
+                                continue;
+
+                            if (license == null || license.NodeLicenseDetails.TryGetValue(node, out DetailsPerNode nodeDetails)==false)
+                            {
+                                nodeDetails = null;
+                            }
+
+                            yield return TopologyNodeToJson(node, url, name, serverRole, nodeDetails);
+                        }
                     }
                 }
             }
+        }
+
+        private DynamicJsonValue TopologyNodeToJson(string tag, string url, string name, ServerNode.Role role, DetailsPerNode details)
+        {
+            var json = new DynamicJsonValue
+            {
+                [nameof(ServerNode.Url)] = url,
+                [nameof(ServerNode.ClusterTag)] = tag,
+                [nameof(ServerNode.ServerRole)] = role,
+                [nameof(ServerNode.Database)] = name
+            };
+
+            if(details != null)
+            {
+                json[nameof(ServerNode.ServerVersion)] =
+                    details.BuildInfo.AssemblyVersion ?? details.BuildInfo.ProductVersion;
+            }
+
+            return json;
         }
 
         private void AlertIfDocumentStoreCreationRateIsNotReasonable(string applicationIdentifier, string name)

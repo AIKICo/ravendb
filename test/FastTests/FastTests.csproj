@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
-    <RuntimeFrameworkVersion>7.0.1</RuntimeFrameworkVersion>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeFrameworkVersion>8.0.7</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>FastTests</AssemblyName>
     <PackageId>FastTests</PackageId>
@@ -21,7 +21,12 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Blittable\BlittableJsonWriterTests\Jsons\*.json" />
+    <None Remove="Corax\Bugs\access_violation.json.gz" />
     <None Remove="Corax\Bugs\Corax.Set.Adds.txt" />
+    <None Remove="Voron\CompactTrees\RavenDB-19703.replay" />
+    <None Remove="Voron\CompactTrees\RavenDB-19937.replay" />
+    <None Remove="Voron\CompactTrees\RavenDB-19956.replay" />
+    <EmbeddedResource Include="Corax\Bugs\access_violation.json.gz" />
     <EmbeddedResource Include="Corax\Bugs\Corax.Set.Adds.txt">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </EmbeddedResource>
@@ -58,8 +63,9 @@
   </ItemGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.4.1" />
-    <PackageReference Include="NodaTime" Version="3.1.6" />
+    <PackageReference Include="Hl7.Fhir.R4" Version="5.8.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.10.0" />
+    <PackageReference Include="NodaTime" Version="3.1.11" />
     <PackageReference Include="Spatial4n" Version="0.4.1.1" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.4.5">
       <PrivateAssets>all</PrivateAssets>
@@ -70,6 +76,9 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Data\RavenDB_17185\memInfo.txt" />
+    <EmbeddedResource Include="Voron\CompactTrees\RavenDB-19703.replay" />
+    <EmbeddedResource Include="Voron\CompactTrees\RavenDB-19937.replay" />
+    <EmbeddedResource Include="Voron\CompactTrees\RavenDB-19956.replay" />
   </ItemGroup>
   <ItemGroup>
     <Service Include="{82a7f48d-3b50-4b1e-b82e-3ada8210c358}" />
@@ -81,5 +90,11 @@
     <None Update="Issues\RavenDB-13499.ravendbdump">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+  <ItemGroup>
+    <None Remove="Corax\Bugs\Corax.PostingList.RemBiggerThanInt" />
+    <EmbeddedResource Include="Corax\Bugs\Corax.PostingList.RemBiggerThanInt.txt" />
+    <None Remove="Corax\Bugs\Corax.PostingList.AddsBiggerThanInt" />
+    <EmbeddedResource Include="Corax\Bugs\Corax.PostingList.AddsBiggerThanInt.txt" />
   </ItemGroup>
 </Project>

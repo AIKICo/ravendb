@@ -1,8 +1,11 @@
 ﻿using System;
+using System.Globalization;
 using System.IO;
+using Raven.Client;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 using Sparrow.Server;
 using Voron;
 
@@ -15,9 +18,18 @@ namespace Raven.Server.Documents.Replication.ReplicationItems
         public LazyStringValue Id;
         public DocumentFlags Flags;
 
-        public static DocumentReplicationItem From(Document doc)
+        public override DynamicJsonValue ToDebugJson()
         {
-            return new DocumentReplicationItem
+            var djv = base.ToDebugJson();
+            djv[nameof(Collection)] = Collection?.ToString(CultureInfo.InvariantCulture) ?? Constants.Documents.Collections.EmptyCollection;
+            djv[nameof(Id)] = Id.ToString(CultureInfo.InvariantCulture);
+            djv[nameof(Flags)] = Flags;
+            return djv;
+        }
+
+        public static DocumentReplicationItem From(Document doc, DocumentsOperationContext context)
+        {
+            var result = new DocumentReplicationItem
             {
                 Type = ReplicationItemType.Document,
                 Etag = doc.Etag,
@@ -26,8 +38,12 @@ namespace Raven.Server.Documents.Replication.ReplicationItems
                 Id = doc.Id,
                 Flags = doc.Flags,
                 TransactionMarker = doc.TransactionMarker,
-                LastModifiedTicks = doc.LastModified.Ticks
+                LastModifiedTicks = doc.LastModified.Ticks,
             };
+
+            result.ToDispose(new ForgetAboutDecompressionBuffer(doc, context));
+
+            return result;
         }
 
         public static DocumentReplicationItem From(DocumentConflict doc)
@@ -191,6 +207,25 @@ namespace Raven.Server.Documents.Replication.ReplicationItems
         public override void InnerDispose()
         {
             Data?.Dispose();
+            Id?.Dispose();
+            Collection?.Dispose();
+        }
+
+        private class ForgetAboutDecompressionBuffer : IDisposable
+        {
+            private readonly Document _doc;
+            private readonly DocumentsOperationContext _context;
+
+            public ForgetAboutDecompressionBuffer(Document doc, DocumentsOperationContext context)
+            {
+                _doc = doc;
+                _context = context;
+            }
+            
+            public void Dispose()
+            {
+                _context.Transaction.ForgetAbout(_doc);
+            }
         }
     }
 }

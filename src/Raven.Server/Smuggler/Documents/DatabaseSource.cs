@@ -16,12 +16,12 @@ using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Client.ServerWide.Operations.OngoingTasks;
 using Raven.Client.Util;
 using Raven.Server.Documents;
+using Raven.Server.Documents.TimeSeries;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents.Data;
 using Raven.Server.Smuggler.Documents.Iteration;
 using Raven.Server.Utils.Enumerators;
-using Sparrow;
 using Sparrow.Json;
 using Sparrow.Logging;
 using Voron;
@@ -57,6 +57,7 @@ namespace Raven.Server.Smuggler.Documents
             DatabaseItemType.CompareExchangeTombstones,
             DatabaseItemType.CounterGroups,
             DatabaseItemType.Subscriptions,
+            DatabaseItemType.TimeSeriesDeletedRanges,
             DatabaseItemType.TimeSeries,
             DatabaseItemType.ReplicationHubCertificates,
             DatabaseItemType.None
@@ -67,6 +68,10 @@ namespace Raven.Server.Smuggler.Documents
         public long LastRaftIndex { get; private set; }
 
         private readonly SmugglerSourceType _type;
+
+        private SmugglerResult _result;
+
+        public EventHandler<InvalidOperationException> OnCorruptedDataHandler;
 
         public DatabaseSource(DocumentDatabase database, long startDocumentEtag, long startRaftIndex, Logger logger)
         {
@@ -106,6 +111,12 @@ namespace Raven.Server.Smuggler.Documents
                 using (var rawRecord = _database.ServerStore.Cluster.ReadRawDatabaseRecord(_serverContext, _database.Name))
                 {
                     LastRaftIndex = rawRecord.EtagForBackup;
+                }
+
+                if (options.SkipCorruptedData)
+                {
+                    _result = result;
+                    OnCorruptedDataHandler = _result.OnCorruptedData;
                 }
             }
 
@@ -166,19 +177,19 @@ namespace Raven.Server.Smuggler.Documents
         {
             Debug.Assert(_context != null);
 
-            var enumerator = new PulsedTransactionEnumerator<Document, DocumentsIterationState>(_context,
+            var enumerator = new TransactionForgetAboutDocumentEnumerator(new PulsedTransactionEnumerator<Document, DocumentsIterationState>(_context,
                 state =>
                 {
                     if (state.StartEtagByCollection.Count != 0)
                         return GetDocumentsFromCollections(_context, state);
 
-                    return _database.DocumentsStorage.GetDocumentsFrom(_context, state.StartEtag, 0, long.MaxValue);
+                    return _database.DocumentsStorage.GetDocumentsFrom(_context, state.StartEtag, 0, long.MaxValue, DocumentFields.All, OnCorruptedDataHandler);
                 },
                 new DocumentsIterationState(_context, _database.Configuration.Databases.PulseReadTransactionLimit) // initial state
                 {
                     StartEtag = _startDocumentEtag,
                     StartEtagByCollection = collectionsToExport.ToDictionary(x => x, x => _startDocumentEtag)
-                });
+                }), _context);
 
             while (enumerator.MoveNext())
             {
@@ -215,19 +226,19 @@ namespace Raven.Server.Smuggler.Documents
 
             var revisionsStorage = _database.DocumentsStorage.RevisionsStorage;
 
-            var enumerator = new PulsedTransactionEnumerator<Document, DocumentsIterationState>(_context,
+            var enumerator = new TransactionForgetAboutDocumentEnumerator(new PulsedTransactionEnumerator<Document, DocumentsIterationState>(_context,
                 state =>
                 {
                     if (state.StartEtagByCollection.Count != 0)
                         return GetRevisionsFromCollections(_context, state);
 
-                    return revisionsStorage.GetRevisionsFrom(_context, state.StartEtag, long.MaxValue);
+                    return revisionsStorage.GetRevisionsFrom(_context, state.StartEtag, long.MaxValue, DocumentFields.All, OnCorruptedDataHandler);
                 },
                 new DocumentsIterationState(_context, _database.Configuration.Databases.PulseReadTransactionLimit) // initial state
                 {
                     StartEtag = _startDocumentEtag,
                     StartEtagByCollection = collectionsToExport.ToDictionary(x => x, x => _startDocumentEtag)
-                });
+                }), _context);
 
             while (enumerator.MoveNext())
             {
@@ -504,7 +515,7 @@ namespace Raven.Server.Smuggler.Documents
 
 #pragma warning disable CS1998 // Async method lacks 'await' operators and will run synchronously
 
-        public async IAsyncEnumerable<TimeSeriesItem> GetTimeSeriesAsync(List<string> collectionsToExport)
+        public async IAsyncEnumerable<TimeSeriesItem> GetTimeSeriesAsync(ITimeSeriesActions action, List<string> collectionsToExport)
 #pragma warning restore CS1998 // Async method lacks 'await' operators and will run synchronously
         {
             Debug.Assert(_context != null);
@@ -533,7 +544,7 @@ namespace Raven.Server.Smuggler.Documents
         private static IEnumerable<TimeSeriesItem> GetAllTimeSeriesItems(DocumentsOperationContext context, long startEtag)
         {
             var database = context.DocumentDatabase;
-            foreach (var ts in database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, startEtag, long.MaxValue))
+            foreach (var ts in database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, startEtag, long.MaxValue, TimeSeriesSegmentEntryFields.ForSmuggler))
             {
                 using (ts)
                 {
@@ -563,7 +574,7 @@ namespace Raven.Server.Smuggler.Documents
 
                 state.CurrentCollection = collection;
 
-                foreach (var ts in database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, collection, etag, long.MaxValue))
+                foreach (var ts in database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, collection, etag, long.MaxValue, TimeSeriesSegmentEntryFields.ForSmuggler))
                 {
                     using (ts)
                     {
@@ -592,5 +603,90 @@ namespace Raven.Server.Smuggler.Documents
         {
             return _type;
         }
+
+        public IAsyncEnumerable<TimeSeriesDeletedRangeItemForSmuggler> GetTimeSeriesDeletedRangesAsync(ITimeSeriesActions action, List<string> collectionsToExport) =>
+            GetTimeSeriesDeletedRanges(collectionsToExport).ToAsyncEnumerable();
+
+        private IEnumerable<TimeSeriesDeletedRangeItemForSmuggler> GetTimeSeriesDeletedRanges(IEnumerable<string> collectionsToExport)
+        {
+            Debug.Assert(_context != null);
+
+            var initialState = new TimeSeriesDeletedRangeIterationState(_context, _database.Configuration.Databases.PulseReadTransactionLimit)
+            {
+                StartEtag = _startDocumentEtag,
+                StartEtagByCollection = collectionsToExport.ToDictionary(x => x, x => _startDocumentEtag)
+            };
+
+            var enumerator = new PulsedTransactionEnumerator<TimeSeriesDeletedRangeItemForSmuggler, TimeSeriesDeletedRangeIterationState>(_context,
+                state =>
+                {
+                    if (state.StartEtagByCollection.Count != 0)
+                        return GetTimeSeriesDeletedRangesFromCollections(_context, state);
+
+                    return GetAlTimeSeriesDeletedRanges(_context, state.StartEtag);
+                }, initialState);
+
+            while (enumerator.MoveNext())
+            {
+                yield return enumerator.Current;
+            }
+        }
+
+
+        private static IEnumerable<TimeSeriesDeletedRangeItemForSmuggler> GetAlTimeSeriesDeletedRanges(DocumentsOperationContext context, long startEtag)
+        {
+            var database = context.DocumentDatabase;
+            foreach (var deletedRange in database.DocumentsStorage.TimeSeriesStorage.GetDeletedRangesFrom(context, startEtag))
+            {
+                using (deletedRange)
+                {
+                    TimeSeriesValuesSegment.ParseTimeSeriesKey(deletedRange.Key, context, out var docId, out var name);
+
+                    yield return new TimeSeriesDeletedRangeItemForSmuggler
+                    {
+                        DocId = docId,
+                        Name = name,
+                        From = deletedRange.From,
+                        To = deletedRange.To,
+                        Collection = deletedRange.Collection.Clone(context),
+                        ChangeVector = context.GetLazyString(deletedRange.ChangeVector),
+                        Etag = deletedRange.Etag
+                    };
+                }
+            }
+        }
+
+        private static IEnumerable<TimeSeriesDeletedRangeItemForSmuggler> GetTimeSeriesDeletedRangesFromCollections(DocumentsOperationContext context, TimeSeriesDeletedRangeIterationState state)
+        {
+            var database = context.DocumentDatabase;
+            var collections = state.StartEtagByCollection.Keys.ToList();
+
+            foreach (var collection in collections)
+            {
+                var etag = state.StartEtagByCollection[collection];
+
+                state.CurrentCollection = collection;
+
+                foreach (var deletedRange in database.DocumentsStorage.TimeSeriesStorage.GetDeletedRangesFrom(context, collection, etag))
+                {
+                    using (deletedRange)
+                    {
+                        TimeSeriesValuesSegment.ParseTimeSeriesKey(deletedRange.Key, context, out var docId, out var name);
+
+                        yield return new TimeSeriesDeletedRangeItemForSmuggler
+                        {
+                            DocId = docId,
+                            Name = name,
+                            From = deletedRange.From,
+                            To = deletedRange.To,
+                            Collection = deletedRange.Collection.Clone(context),
+                            ChangeVector = context.GetLazyString(deletedRange.ChangeVector),
+                            Etag = deletedRange.Etag
+                        };
+                    }
+                }
+            }
+        }
+
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Server.Documents.PeriodicBackup;
@@ -24,11 +25,12 @@ namespace SlowTests.Server.Documents.PeriodicBackup
         private const string EastRegion1 = "us-east-1";
         private const string WestRegion2 = "us-west-2";
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task put_object()
         {
             var settings = GetS3Settings();
-            using (var client = new RavenAwsS3Client(settings, DefaultConfiguration))
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            using (var client = new RavenAwsS3Client(settings, DefaultConfiguration, cancellationToken: cts.Token))
             {
                 var blobs = GenerateBlobNames(settings, 1, out _);
                 Assert.Equal(1, blobs.Count);
@@ -56,14 +58,15 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task can_get_correct_error_s3()
         {
             var settings = GetS3Settings();
             string region1 = settings.AwsRegionName;
             string region2 = settings.AwsRegionName = WestRegion2;
             var bucketName = settings.BucketName;
-            using (var clientRegion2 = new RavenAwsS3Client(settings, DefaultConfiguration))
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            using (var clientRegion2 = new RavenAwsS3Client(settings, DefaultConfiguration, cancellationToken: cts.Token))
             {
                 var sb = new StringBuilder();
                 for (var i = 0; i < 1 * 1024 * 1024; i++)
@@ -86,7 +89,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonS3Theory]
+        [AmazonS3RetryTheory]
         [InlineData(5, false, UploadType.Regular, false)]
         [InlineData(5, true, UploadType.Regular, false)]
         [InlineData(11, false, UploadType.Chunked, false)]
@@ -110,7 +113,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             var key = "";
 
             var progress = new Progress();
-            using (var client = new RavenAwsS3Client(settings, DefaultConfiguration, progress))
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            using (var client = new RavenAwsS3Client(settings, DefaultConfiguration, progress, cts.Token))
             {
                 client.MaxUploadPutObject = new Sparrow.Size(10, SizeUnit.Megabytes);
                 client.MinOnePartUploadSizeLimit = new Sparrow.Size(7, SizeUnit.Megabytes);
@@ -153,7 +157,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 Assert.NotNull(@object);
 
                 using (var reader = new StreamReader(@object.Data))
-                    Assert.Equal(sb.ToString(), await reader.ReadToEndAsync());
+                    Assert.Equal(sb.ToString(), await reader.ReadToEndAsync(cts.Token));
 
                 var property1check = @object.Metadata.Keys.Single(x => x.Contains(Uri.EscapeDataString(property1).ToLower()));
                 var property2check = @object.Metadata.Keys.Single(x => x.Contains(property2));
@@ -168,7 +172,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonS3Theory]
+        [AmazonS3RetryTheory]
         [InlineData(null)]
         [InlineData("https://some-url.com")]
         public void can_use_custom_region(string customUrl)
@@ -176,12 +180,13 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             var settings = GetS3Settings();
             settings.AwsRegionName = "fr-par";
             settings.CustomServerUrl = customUrl;
-            using (new RavenAwsS3Client(settings, DefaultConfiguration))
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            using (new RavenAwsS3Client(settings, DefaultConfiguration, cancellationToken: cts.Token))
             {
             }
         }
 
-        [AmazonGlacierTheory]
+        [AmazonGlacierRetryTheory]
         [InlineData(EastRegion1)]
         [InlineData(WestRegion2)]
         public async Task upload_archive(string region)
@@ -200,7 +205,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonGlacierTheory]
+        [AmazonGlacierRetryTheory]
         [InlineData(EastRegion1)]
         [InlineData(WestRegion2)]
         public async Task upload_archive_with_remote_folder_name(string region)
@@ -221,7 +226,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonGlacierTheory]
+        [AmazonGlacierRetryTheory]
         [InlineData(EastRegion1, WestRegion2)]
         [InlineData(WestRegion2, EastRegion1)]
         public void can_get_correct_error_glacier(string region1, string region2)
@@ -250,7 +255,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonGlacierTheory]
+        [AmazonGlacierRetryTheory]
         [InlineData(EastRegion1, 5, 2, UploadType.Regular)]
         [InlineData(EastRegion1, 5, 3, UploadType.Regular)]
         [InlineData(WestRegion2, 5, 2, UploadType.Regular)]
@@ -317,7 +322,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
         private static GlacierSettings GetGlacierSettings(string region, string vaultName)
         {
-            var glacierSettings = AmazonGlacierFactAttribute.GlacierSettings;
+            var glacierSettings = AmazonGlacierRetryFactAttribute.GlacierSettings;
             if (glacierSettings == null)
                 return null;
 

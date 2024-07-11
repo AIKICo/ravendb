@@ -142,10 +142,11 @@ namespace RachisTests.DatabaseCluster
                 Assert.True(result);
 
                 cluster.Leader.ServerStore.Engine.HardResetToNewCluster(tag);
+                await AssertWaitForTrueAsync(() => Task.FromResult(node.ServerStore.Engine.CurrentState == RachisState.Passive));
 
-                var outgoingConnections = WaitForValue(() =>
+                var outgoingConnections = await WaitForValueAsync(async () =>
                 {
-                    var dbInstance = cluster.Leader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(dbName).Result;
+                    var dbInstance = await cluster.Leader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(dbName);
                     return dbInstance.ReplicationLoader.OutgoingHandlers.Count();
                 }, 0);
 
@@ -159,6 +160,10 @@ namespace RachisTests.DatabaseCluster
                     await session.StoreAsync(new User { Name = "Karmel" }, "foo/bar/2");
                     await session.SaveChangesAsync();
                 }
+
+                await AssertWaitForValueAsync(() => GetTopologyNodesCount(store), 1);
+                await AssertWaitForValueAsync(() => GetTopologyNodesCount(store2), 1);
+
                 using (var session = store2.OpenAsyncSession())
                 {
                     var user = await session.LoadAsync<User>("foo/bar");
@@ -168,6 +173,12 @@ namespace RachisTests.DatabaseCluster
                     Assert.Null(user2);
                 }
             }
+        }
+
+        private static async Task<int> GetTopologyNodesCount(IDocumentStore store)
+        {
+            var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
+            return record == null ? -1 : record.Topology.Members.Count + record.Topology.Promotables.Count + record.Topology.Rehabs.Count;
         }
 
         [Theory]
@@ -217,9 +228,9 @@ namespace RachisTests.DatabaseCluster
                 cluster.Leader.ServerStore.Engine.HardResetToPassive(Guid.NewGuid().ToString());
                 await cluster.Leader.ServerStore.EnsureNotPassiveAsync(nodeTag: tag);
 
-                var outgoingConnections = WaitForValue(() =>
+                var outgoingConnections = await WaitForValueAsync(async () =>
                 {
-                    var dbInstance = cluster.Leader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(dbName).Result;
+                    var dbInstance = await cluster.Leader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(dbName);
                     return dbInstance.ReplicationLoader.OutgoingHandlers.Count();
                 }, 0);
 
@@ -472,6 +483,40 @@ namespace RachisTests.DatabaseCluster
                 Assert.Equal(replicationFactor - 1, record.Topology.ReplicationFactor);
             }
             return removed;
+        }
+
+        [RavenFact(RavenTestCategory.Cluster)]
+        public async Task NodeShouldBeRemovedFromPriorityOrder()
+        {
+            const int clusterSize = 3;
+            var cluster = await CreateRaftCluster(clusterSize, leaderIndex: 0, watcherCluster: true);
+            var order = new List<string> { "A", "B", "C" };
+
+            using (var store = GetDocumentStore(new Options
+                   {
+                       Server = cluster.Leader,
+                       ReplicationFactor = clusterSize,
+                       ModifyDatabaseRecord = x => x.Topology = new DatabaseTopology
+                       {
+                           Members = order,
+                           ReplicationFactor = 3,
+                           PriorityOrder = order
+                       }
+                   }))
+            {
+                var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
+                Assert.True(order.All(x => record.Topology.PriorityOrder.Contains(x)));
+
+                var toRemove = cluster.Nodes.First(x => x.ServerStore.NodeTag != cluster.Leader.ServerStore.NodeTag);
+                var removed = await DisposeServerAndWaitForFinishOfDisposalAsync(toRemove);
+                await ActionWithLeader(l => l.ServerStore.RemoveFromClusterAsync(removed.NodeTag));
+
+                await WaitAndAssertForValueAsync(async () =>
+                {
+                    record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
+                    return record.Topology.PriorityOrder.Contains(removed.NodeTag);
+                }, false);
+            }
         }
     }
 }

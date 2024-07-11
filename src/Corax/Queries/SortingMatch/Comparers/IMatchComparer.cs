@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using Corax.Mappings;
 using Corax.Utils;
@@ -23,10 +24,8 @@ namespace Corax.Queries
 
         FieldMetadata Field { get; }
 
-        int CompareById(long idx, long idy);
-
         int CompareSequence(ReadOnlySpan<byte> sx, ReadOnlySpan<byte> sy);
-        int CompareNumerical<T>(T sx, T sy) where T : unmanaged;
+        int CompareNumerical<T>(T sx, T sy) where T : unmanaged, INumber<T>;
     }
 
     public interface ISpatialComparer : IMatchComparer

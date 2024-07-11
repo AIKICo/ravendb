@@ -10,6 +10,7 @@ using Jint.Native.Function;
 using Jint.Runtime;
 using Jint.Runtime.Environments;
 using Raven.Client.Documents.Indexes;
+using Raven.Server.Config;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Extensions;
 
@@ -53,6 +54,11 @@ namespace Raven.Server.Documents.Indexes.Static
                         try
                         {
                             jsItem = MapFunc.Call(JsValue.Null, _oneItemArray);
+                        }
+                        catch (StatementsCountOverflowException e)
+                        {
+                            throw new Raven.Client.Exceptions.Documents.Patching.JavaScriptException(
+                                $"The maximum number of statements executed has been reached. You can configure it by modifying the configuration option: '{RavenConfiguration.GetKey(x => x.Indexing.MaxStepsForScript)}'.", e);
                         }
                         catch (JavaScriptException jse)
                         {
@@ -154,10 +160,16 @@ namespace Raven.Server.Documents.Indexes.Static
                     case CallExpression ce:
 
                         if (IsBoostExpression(ce))
+                        {
                             HasBoostedFields = true;
+
+                            if (ce.Arguments[0] is ObjectExpression oe)
+                                AddObjectFieldsToIndexFields(oe);
+                        }
+                        else if (IsArrowFunctionExpressionWithObjectExpressionBody(ce, out var oea))
+                            AddObjectFieldsToIndexFields(oea);
                         else
                             HasDynamicReturns = true;
-
                         break;
 
                     default:
@@ -169,6 +181,29 @@ namespace Raven.Server.Documents.Indexes.Static
             static bool IsBoostExpression(Expression expression)
             {
                 return expression is CallExpression ce && ce.Callee is Identifier identifier && identifier.Name == "boost";
+            }
+            
+            static bool IsArrowFunctionExpressionWithObjectExpressionBody(CallExpression callExpression, out ObjectExpression oea)
+            {
+                oea = null;
+                if (callExpression.Arguments.Count == 1 && callExpression.Arguments.AsNodes()[0] is ArrowFunctionExpression afe && afe.Body is ObjectExpression _oea)
+                    oea = _oea;
+                
+                return oea != null;
+            }
+
+            void AddObjectFieldsToIndexFields(ObjectExpression oe)
+            {
+                foreach (var prop in oe.Properties)
+                {
+                    if (prop is Property property)
+                    {
+                        var fieldName = property.GetKey(engine);
+                        var fieldNameAsString = fieldName.AsString();
+
+                        Fields.Add(fieldNameAsString);
+                    }
+                }
             }
         }
 

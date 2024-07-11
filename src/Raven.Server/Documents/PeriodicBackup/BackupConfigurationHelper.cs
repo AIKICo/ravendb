@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using NCrontab.Advanced;
 using Raven.Client.Documents.Operations.Backups;
@@ -76,7 +78,7 @@ namespace Raven.Server.Documents.PeriodicBackup
             return pathResult;
         }
 
-        public static void AssertBackupConfiguration(PeriodicBackupConfiguration configuration)
+        public static void AssertBackupConfiguration(PeriodicBackupConfiguration configuration, Config.Categories.BackupConfiguration localConfiguration)
         {
             if (VerifyBackupFrequency(configuration.FullBackupFrequency) == null &&
                 VerifyBackupFrequency(configuration.IncrementalBackupFrequency) == null)
@@ -87,6 +89,7 @@ namespace Raven.Server.Documents.PeriodicBackup
             }
 
             AssertBackupConfigurationInternal(configuration);
+            AssertDirectUpload(configuration, localConfiguration);
 
             var retentionPolicy = configuration.RetentionPolicy;
             if (retentionPolicy != null && retentionPolicy.Disabled == false)
@@ -124,6 +127,48 @@ namespace Raven.Server.Documents.PeriodicBackup
                         throw new ArgumentException(error);
                 }
             }
+        }
+
+        private static void AssertDirectUpload(PeriodicBackupConfiguration configuration, Config.Categories.BackupConfiguration localConfiguration)
+        {
+            if (configuration.BackupUploadMode != BackupUploadMode.DirectUpload)
+                return;
+
+            var backupToLocalFolder = BackupConfiguration.CanBackupUsing(configuration.LocalSettings);
+            GetBackupDestinationForDirectUpload(backupToLocalFolder, configuration, localConfiguration); // will throw if destination isn't set correctly
+        }
+
+        internal static BackupConfiguration.BackupDestination GetBackupDestinationForDirectUpload(bool backupToLocalFolder, BackupConfiguration configuration, Config.Categories.BackupConfiguration localConfiguration)
+        {
+            if (backupToLocalFolder)
+            {
+                throw new NotSupportedException("Trying to use direct upload when we configure a backup to a local folder.");
+            }
+
+            var hasAws = BackupConfiguration.CanBackupUsing(configuration.S3Settings);
+            var hasGlacier = BackupConfiguration.CanBackupUsing(configuration.GlacierSettings);
+            var hasAzure = BackupConfiguration.CanBackupUsing(configuration.AzureSettings);
+            var hasGoogleCloud = BackupConfiguration.CanBackupUsing(configuration.GoogleCloudSettings);
+            var hasFtp = BackupConfiguration.CanBackupUsing(configuration.FtpSettings);
+
+            var destinations = new List<bool> { hasAws, hasGlacier, hasAzure, hasGoogleCloud, hasFtp };
+            if (destinations.Count(x => x) != 1)
+            {
+                throw new NotSupportedException("Cannot use direct upload when we configure more than one destination.");
+            }
+
+            if (hasAws)
+                return BackupConfiguration.BackupDestination.AmazonS3;
+
+            if (hasAzure)
+            {
+                if (localConfiguration.AzureLegacy)
+                    throw new NotSupportedException("Direct upload for Azure Legacy client isn't supported.");
+
+                return BackupConfiguration.BackupDestination.Azure;
+            }
+
+            throw new NotSupportedException("No supported backup destination for direct upload was set.");
         }
 
         public static void AssertDestinationAndRegionAreAllowed(BackupConfiguration configuration, ServerStore serverStore)

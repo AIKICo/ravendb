@@ -34,6 +34,8 @@ namespace Raven.Client
 
             public const string TopologyEtag = "Topology-Etag";
 
+            public const string ClusterTopologyEtag = "Cluster-Topology-Etag";
+
             public const string ClientConfigurationEtag = "Client-Configuration-Etag";
 
             public const string LastKnownClusterTransactionIndex = "Known-Raft-Index";
@@ -54,7 +56,11 @@ namespace Raven.Client
 
             public const string ContentEncoding = "Content-Encoding";
 
+            public const string ContentType = "Content-Type";
+
             public const string ContentLength = "Content-Length";
+
+            public const string Origin = "Origin";
 
             public const string IncrementalTimeSeriesPrefix = "INC:";
         }
@@ -121,7 +127,7 @@ namespace Raven.Client
             public const string Prefix = "certificates/";
             public const int MaxNumberOfCertsWithSameHash = 5;
         }
-        
+
         internal class Network
         {
             public const string AnyIp = "0.0.0.0";
@@ -150,7 +156,7 @@ namespace Raven.Client
             {
                 internal const string IndexingStaticSearchEngineType = "Indexing.Static.SearchEngineType";
             }
-            
+
             public const string ClientId = "Configuration/Client";
 
             public const string StudioId = "Configuration/Studio";
@@ -267,6 +273,8 @@ namespace Raven.Client
 
                     public const string CountFieldName = "Count";
 
+                    public const string SumFieldName = "Sum";
+
 #if FEATURE_CUSTOM_SORTING
                     public const string CustomSortFieldName = "__customSort";
 #endif
@@ -300,6 +308,23 @@ namespace Raven.Client
                     public const string NullValue = "NULL_VALUE";
 
                     public const string EmptyString = "EMPTY_STRING";
+
+                    public class JavaScript
+                    {
+                        private JavaScript()
+                        {
+                        }
+
+                        public const string ValuePropertyName = "$value";
+
+                        public const string OptionsPropertyName = "$options";
+
+                        public const string NamePropertyName = "$name";
+
+                        public const string SpatialPropertyName = "$spatial";
+
+                        public const string BoostPropertyName = "$boost";
+                    }
                 }
 
                 public class Spatial
@@ -403,7 +428,7 @@ namespace Raven.Client
                 public const string Size = "@raven-blob-size";
             }
         }
-        
+
         internal static class Smuggler
         {
             public const string ImportOptions = "importOptions";
@@ -454,6 +479,11 @@ namespace Raven.Client
 
                 public const string DestinationDocumentChangeVector = null;
             }
+        }
+
+        internal static class Identities
+        {
+            public const char DefaultSeparator = '/';
         }
 
         internal class Obsolete

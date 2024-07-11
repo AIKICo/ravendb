@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------
 
 using System;
+using Raven.Client.Documents.Queries.Timings;
 using Raven.Client.ServerWide.Tcp;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
@@ -35,6 +36,21 @@ namespace Raven.Client.Documents.Changes
                 Url = url,
                 Database = database
             };
+        }
+    }
+
+    internal class AggressiveCacheChange : DatabaseChange
+    {
+        internal static readonly AggressiveCacheChange Instance = new();
+
+        internal static bool ShouldUpdateAggressiveCache(DocumentChange change)
+        {
+            return change.Type is DocumentChangeTypes.Put or DocumentChangeTypes.Delete;
+        }
+
+        internal static bool ShouldUpdateAggressiveCache(IndexChange change)
+        {
+            return change.Type is IndexChangeTypes.BatchCompleted or IndexChangeTypes.IndexRemoved;
         }
     }
 
@@ -303,7 +319,7 @@ namespace Raven.Client.Documents.Changes
                 DocumentId = documentId,
                 ChangeVector = changeVector,
                 Type = (TimeSeriesChangeTypes)Enum.Parse(typeof(TimeSeriesChangeTypes), type, ignoreCase: true),
-                CollectionName = collectionName 
+                CollectionName = collectionName
             };
         }
     }
@@ -388,7 +404,7 @@ namespace Raven.Client.Documents.Changes
     internal class TrafficWatchHttpChange : TrafficWatchChangeBase
     {
         public override TrafficWatchType TrafficWatchType => TrafficWatchType.Http;
-        public int RequestId { get; set; }
+        public long RequestId { get; set; }
         public string HttpMethod { get; set; }
         public long ElapsedMilliseconds { get; set; }
         public int ResponseStatusCode { get; set; }
@@ -397,6 +413,7 @@ namespace Raven.Client.Documents.Changes
         public long RequestSizeInBytes { get; set; }
         public long ResponseSizeInBytes { get; set; }
         public TrafficWatchChangeType Type { get; set; }
+        public QueryTimings QueryTimings { get; set; }
 
         public override DynamicJsonValue ToJson()
         {
@@ -410,6 +427,10 @@ namespace Raven.Client.Documents.Changes
             json[nameof(RequestSizeInBytes)] = RequestSizeInBytes;
             json[nameof(ResponseSizeInBytes)] = ResponseSizeInBytes;
             json[nameof(Type)] = Type;
+            
+            if(QueryTimings != null)
+                json[nameof(QueryTimings)] = QueryTimings;
+
             return json;
         }
     }
@@ -444,6 +465,8 @@ namespace Raven.Client.Documents.Changes
         Subscriptions,
         Streams,
         Documents,
-        TimeSeries
+        TimeSeries,
+        Notifications,
+        ClusterCommands
     }
 }

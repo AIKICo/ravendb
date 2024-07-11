@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using Corax.Mappings;
@@ -12,8 +12,10 @@ namespace Corax.Queries
     {
         private readonly CompactTree _tree;
         private readonly IndexSearcher _searcher;
-        private CompactTree.Iterator _iterator;
         private readonly FieldMetadata _field;
+
+        private CompactTree.Iterator _iterator;
+
         public ExistsTermProvider(IndexSearcher searcher, CompactTree tree, FieldMetadata field)
         {
             _tree = tree;
@@ -31,28 +33,31 @@ namespace Corax.Queries
 
         public bool Next(out TermMatch term)
         {
-            while (_iterator.MoveNext(out Slice termSlice, out var _))
+            while (_iterator.MoveNext(out var keyScope, out var _))
             {
-                term = _searcher.TermQuery(_tree, termSlice);
+                term = _searcher.TermQuery(_field, keyScope.Key, _tree);
+                keyScope.Dispose();
                 return true;
             }
 
-            term = TermMatch.CreateEmpty(_searcher.Allocator);
+            term = TermMatch.CreateEmpty(_searcher, _searcher.Allocator);
             return false;
         }
 
         public bool GetNextTerm(out ReadOnlySpan<byte> term)
         {
-            while (_iterator.MoveNext(out Span<byte> termSlice, out var _))
+            while (_iterator.MoveNext(out var keyScope, out var _))
             {
-                int termSize = termSlice.Length;
-                if (termSlice.Length > 1)
+                var key = keyScope.Key.Decoded();
+
+                int termSize = key.Length;
+                if (key.Length > 1)
                 {
-                    if (termSlice[^1] == 0)
+                    if (key[^1] == 0)
                         termSize--;
                 }
 
-                term = termSlice.Slice(0, termSize);
+                term = key.Slice(0, termSize);
                 return true;
             }
 

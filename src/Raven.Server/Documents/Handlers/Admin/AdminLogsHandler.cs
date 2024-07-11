@@ -3,7 +3,9 @@ using System.IO;
 using System.IO.Compression;
 using System.Threading.Tasks;
 using Raven.Client.ServerWide.Operations.Logs;
-using Raven.Server.Indexing;
+using Raven.Server.Config;
+using Raven.Server.Exceptions;
+using Raven.Server.Utils.MicrosoftLogging;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide;
@@ -60,6 +62,25 @@ namespace Raven.Server.Documents.Handlers.Admin
                     configuration.RetentionTime,
                     configuration.RetentionSize?.GetValue(SizeUnit.Bytes),
                     configuration.Compress);
+
+                if (configuration.Persist)
+                {
+                    try
+                    {
+                        using var jsonFileModifier = SettingsJsonModifier.Create(context, ServerStore.Configuration.ConfigPath);
+                        jsonFileModifier.SetOrRemoveIfDefault(LoggingSource.Instance.LogMode, x => x.Logs.Mode);
+                        long? retentionSize = LoggingSource.Instance.RetentionSize == long.MaxValue
+                            ? null : new Size(LoggingSource.Instance.RetentionSize, SizeUnit.Bytes).GetValue(SizeUnit.Megabytes);
+                        jsonFileModifier.SetOrRemoveIfDefault(retentionSize, x => x.Logs.RetentionSize);
+                        jsonFileModifier.SetOrRemoveIfDefault((int)LoggingSource.Instance.RetentionTime.TotalHours, x => x.Logs.RetentionTime);
+                        jsonFileModifier.SetOrRemoveIfDefault(LoggingSource.Instance.Compressing, x => x.Logs.Compress);
+                        await jsonFileModifier.ExecuteAsync();
+                    }
+                    catch (Exception e)
+                    {
+                        throw new PersistConfigurationException("The log configuration was modified but couldn't be persisted. The configuration will be reverted on server restart.", e);
+                    }
+                }
             }
 
             NoContentStatus();
@@ -95,38 +116,45 @@ namespace Raven.Server.Documents.Handlers.Admin
             var adminLogsFileName = $"admin.logs.download.{Guid.NewGuid():N}";
             var adminLogsFilePath = ServerStore._env.Options.DataPager.Options.TempPath.Combine(adminLogsFileName);
 
-            var from = GetDateTimeQueryString("from", required: false);
-            var to = GetDateTimeQueryString("to", required: false);
+            var startUtc = GetDateTimeQueryString("from", required: false);
+            var endUtc = GetDateTimeQueryString("to", required: false);
 
-            using (var stream = SafeFileStream.Create(adminLogsFilePath.FullPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite, 4096,
+            if (startUtc >= endUtc)
+                throw new ArgumentException($"End Date '{endUtc:yyyy-MM-ddTHH:mm:ss.fffffff} UTC' must be greater than Start Date '{startUtc:yyyy-MM-ddTHH:mm:ss.fffffff} UTC'");
+
+            await using (var stream = SafeFileStream.Create(adminLogsFilePath.FullPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite, 4096,
                        FileOptions.DeleteOnClose | FileOptions.SequentialScan))
             {
                 using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, true))
                 {
+                    bool isEmptyArchive = true;
+
                     foreach (var filePath in Directory.GetFiles(ServerStore.Configuration.Logs.Path.FullPath))
                     {
                         var fileName = Path.GetFileName(filePath);
-                        if (fileName.EndsWith(LoggingSource.LogInfo.LogExtension, StringComparison.OrdinalIgnoreCase) == false &&
-                            fileName.EndsWith(LoggingSource.LogInfo.FullCompressExtension, StringComparison.OrdinalIgnoreCase) == false)
+                        if (fileName.EndsWith(LoggingSource.LogExtension, StringComparison.OrdinalIgnoreCase) == false &&
+                            fileName.EndsWith(LoggingSource.FullCompressExtension, StringComparison.OrdinalIgnoreCase) == false)
                             continue;
 
-                        var hasLogDateTime = LoggingSource.LogInfo.TryGetDate(filePath, out var logDateTime);
-                        if (hasLogDateTime)
-                        {
-                            if (from != null && logDateTime < from)
-                                continue;
+                        // Skip this file if either the last write time or the creation time could not be determined
+                        if (LoggingSource.TryGetLastWriteTimeUtc(filePath, out var logLastWriteTimeUtc) == false ||
+                            LoggingSource.TryGetCreationTimeUtc(filePath, out var logCreationTimeUtc) == false)
+                            continue;
 
-                            if (to != null && logDateTime > to)
-                                continue;
-                        }
-                        
+                        bool isWithinDateRange =
+                            // Check if the file was created before the end date.
+                            (endUtc.HasValue == false || logCreationTimeUtc < endUtc.Value) &&
+                            // Check if the file was last modified after the start date.
+                            (startUtc.HasValue == false || logLastWriteTimeUtc > startUtc.Value);
+
+                        // Skip this file if it does not fall within the specified date range
+                        if (isWithinDateRange == false)
+                            continue;
+
                         try
                         {
                             var entry = archive.CreateEntry(fileName);
-                            if (hasLogDateTime)
-                                entry.LastWriteTime = logDateTime;
-
-                            using (var fs = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                            await using (var fs = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                             {
                                 entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
 
@@ -134,12 +162,32 @@ namespace Raven.Server.Documents.Handlers.Admin
                                 {
                                     await fs.CopyToAsync(entryStream);
                                 }
+
+                                isEmptyArchive = false;
                             }
                         }
                         catch (Exception e)
                         {
                             await DebugInfoPackageUtils.WriteExceptionAsZipEntryAsync(e, archive, fileName);
                         }
+                    }
+
+                    // Add an informational file to the archive if no log files match the specified date range,
+                    // ensuring the user receives a non-empty archive with an explanation.
+                    if (isEmptyArchive)
+                    {
+                        const string infoFileName = "No logs matched the date range.txt";
+
+                        // Create a dummy entry in the zip file
+                        var infoEntry = archive.CreateEntry(infoFileName);
+                        await using var entryStream = infoEntry.Open();
+                        await using var streamWriter = new StreamWriter(entryStream);
+
+                        var formattedStartUtc = startUtc.HasValue ? startUtc.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffff 'UTC'") : "not specified";
+                        var formattedEndUtc = endUtc.HasValue ? endUtc.Value.ToString("yyyy-MM-ddTHH:mm:ss.fffffff 'UTC'") : "not specified";
+
+                        await streamWriter.WriteAsync(
+                            $"No log files were found that matched the specified date range from '{formattedStartUtc}' to '{formattedEndUtc}'.");
                     }
                 }
 
@@ -155,7 +203,8 @@ namespace Raven.Server.Documents.Handlers.Admin
             await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
             {
                 var djv = new DynamicJsonValue();
-                foreach (var (name, minLogLevel) in Server.MicrosoftLogger.GetLoggers())
+                var provider = Server.GetService<MicrosoftLoggingProvider>();
+                foreach (var (name, minLogLevel) in provider.GetLoggers())
                 {
                     djv[name] = minLogLevel;
                 }
@@ -163,7 +212,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 writer.WriteObject(json);
             }
         }
-        
+
         [RavenAction("/admin/logs/microsoft/configuration", "GET", AuthorizationStatus.Operator)]
         public async Task GetMicrosoftConfiguration()
         {
@@ -171,11 +220,34 @@ namespace Raven.Server.Documents.Handlers.Admin
             await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
             {
                 var djv = new DynamicJsonValue();
-                foreach (var (category, logLevel) in Server.MicrosoftLogger.GetConfiguration())
+                var provider = Server.GetService<MicrosoftLoggingProvider>();
+                foreach (var (category, logLevel) in provider.Configuration)
                 {
                     djv[category] = logLevel;
                 }
                 var json = context.ReadObject(djv, "logs/configuration");
+                writer.WriteObject(json);
+            }
+        }
+
+        [RavenAction("/admin/logs/microsoft/state", "GET", AuthorizationStatus.Operator)]
+        public async Task GetMicrosoftLoggersState()
+        {
+            using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            {
+                var provider = Server.GetService<MicrosoftLoggingProvider>();
+                var minLogLevelPerLogger = new DynamicJsonValue();
+                var respondBody = new DynamicJsonValue
+                {
+                    ["IsActive"] = provider.IsActive,
+                    ["Loggers"] = minLogLevelPerLogger
+                };
+                foreach (var (category, logger) in provider.Loggers)
+                {
+                    minLogLevelPerLogger[category] = logger.MinLogLevel;
+                }
+                var json = context.ReadObject(respondBody, "logs/configuration");
                 writer.WriteObject(json);
             }
         }
@@ -186,10 +258,57 @@ namespace Raven.Server.Documents.Handlers.Admin
             using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
             {
                 bool reset = GetBoolValueQueryString("reset", required: false) ?? false;
-                await Server.MicrosoftLogger.ReadAndApplyConfigurationAsync(RequestBodyStream(), context, reset);
+                var provider = Server.GetService<MicrosoftLoggingProvider>();
+                var parameters = await context.ReadForMemoryAsync(RequestBodyStream(), "logs/configuration");
+                if (parameters.TryGet("Configuration", out BlittableJsonReaderObject microsoftConfig) == false)
+                    throw new InvalidOperationException($"The request body doesn't contain required 'Configuration' property - {parameters}");
+
+                provider.Configuration.ReadConfigurationOrThrow(microsoftConfig, reset);
+                provider.ApplyConfiguration();
+
+                if (parameters.TryGet("Persist", out bool persist) && persist)
+                {
+                    try
+                    {
+                        using var microsoftConfigModifier = JsonConfigFileModifier.Create(context, ServerStore.Configuration.Logs.MicrosoftLogsConfigurationPath.FullPath, overwriteWholeFile: true);
+                        foreach (var (category, logLevel) in Server.GetService<MicrosoftLoggingProvider>().Configuration)
+                        {
+                            microsoftConfigModifier.Modifications[category] = logLevel;
+                        }
+                        await microsoftConfigModifier.ExecuteAsync();
+
+                        using var settingJsonConfigModifier = SettingsJsonModifier.Create(context, ServerStore.Configuration.ConfigPath);
+                        settingJsonConfigModifier.SetOrRemoveIfDefault(false, x => x.Logs.DisableMicrosoftLogs);
+                        await settingJsonConfigModifier.ExecuteAsync();
+                    }
+                    catch (Exception e)
+                    {
+                        throw new PersistConfigurationException("The Microsoft configuration was modified but couldn't be persisted. The configuration will be reverted on server restart.", e);
+                    }
+                }
             }
 
             NoContentStatus();
+        }
+
+        [RavenAction("/admin/logs/microsoft/enable", "POST", AuthorizationStatus.Operator)]
+        public Task EnableMicrosoftLog()
+        {
+            var provider = Server.GetService<MicrosoftLoggingProvider>();
+            provider.ApplyConfiguration();
+
+            NoContentStatus();
+            return Task.CompletedTask;
+        }
+
+        [RavenAction("/admin/logs/microsoft/disable", "POST", AuthorizationStatus.Operator)]
+        public Task DisableMicrosoftLog()
+        {
+            var provider = Server.GetService<MicrosoftLoggingProvider>();
+            provider.DisableLogging();
+
+            NoContentStatus();
+            return Task.CompletedTask;
         }
     }
 }

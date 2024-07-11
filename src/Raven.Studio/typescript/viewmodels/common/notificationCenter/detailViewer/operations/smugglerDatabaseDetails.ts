@@ -5,6 +5,9 @@ import notificationCenter = require("common/notifications/notificationCenter");
 import abstractOperationDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/abstractOperationDetails");
 import generalUtils = require("common/generalUtils");
 import genericProgress = require("common/helpers/database/genericProgress");
+import delayBackupCommand = require("commands/database/tasks/delayBackupCommand");
+import viewHelpers = require("common/helpers/view/viewHelpers");
+import copyToClipboard = require("common/copyToClipboard");
 
 type smugglerListItemStatus = "processed" | "skipped" | "processing" | "pending" | "processedWithErrors";
 
@@ -41,12 +44,18 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
     itemsLastCount: dictionary<number> = {};
     lastProcessingSpeedText = smugglerDatabaseDetails.ProcessingText;
     
+    canDelay: KnockoutComputed<boolean>;
+    
     exportItems: KnockoutComputed<Array<smugglerListItem>>;
     uploadItems: KnockoutComputed<Array<uploadListItem>>;
     messages: KnockoutComputed<Array<string>>;
     messagesJoined: KnockoutComputed<string>;
     previousProgressMessages: string[];
     processingSpeed: KnockoutComputed<string>;
+    
+    filesProcessed: KnockoutComputed<File>;
+    
+    filesCount: KnockoutComputed<Raven.Client.Documents.Smuggler.SmugglerProgressBase.FileCounts>;
 
     constructor(op: operation, notificationCenter: notificationCenter) {
         super(op, notificationCenter);
@@ -57,6 +66,37 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
 
     protected initObservables() {
         super.initObservables();
+        
+        this.filesCount = ko.pureComputed(() => {
+            if (this.op.status() !== "InProgress") {
+                return null;
+            }
+
+            const status = this.op.progress();
+            if (!status) {
+                return null;
+            }
+
+            if ("Files" in status) {
+                const files = (status as Raven.Client.ServerWide.Operations.RestoreProgress).Files;
+
+                if (!files.FileCount) {
+                    return null;
+                }
+                
+                return files;
+            }
+            
+            return null;
+        });
+        
+        this.canDelay = ko.pureComputed(() => {
+            const completed = this.op.isCompleted();
+            const isBackup = this.op.taskType() === "DatabaseBackup";
+            const isOneTime = this.op.message().startsWith("Manual backup"); // unfortunately we don't have better way of detection as of now
+            
+            return !completed && isBackup && !isOneTime;
+        });
 
         this.exportItems = ko.pureComputed(() => {
             if (this.op.status() === "Faulted") {
@@ -128,6 +168,7 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
                 }
                 
                 result.push(this.mapToExportListItem("Subscriptions", status.Subscriptions));
+                result.push(this.mapToExportListItem("Time Series Deleted Ranges", status.TimeSeriesDeletedRanges));
             }
 
             const currentlyProcessingItems = smugglerDatabaseDetails.findCurrentlyProcessingItems(result);
@@ -227,6 +268,32 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
             this.detailsVisible(true);
         }
     }
+
+    delayBackup(duration: string) {
+        if (!this.canDelay()) {
+            return;
+        }
+        
+        this.close();
+        
+        const durationFormatted = generalUtils.formatTimeSpan(duration, true);
+        
+        viewHelpers.confirmationMessage("Delay backup", "Do you want to delay backup by " + durationFormatted +  "?", {
+            buttons: ["Cancel", "Delay"]
+        })
+            .done(result => {
+                if (result.can) {
+                    new delayBackupCommand(this.op.database, this.op.operationId(), duration)
+                        .execute();
+                } else {
+                    this.openDetails();
+                }
+            })
+            .fail(() => {
+                this.openDetails();
+            })
+        
+    }
     
     private static findCurrentlyProcessingItems(result: Array<smugglerListItem>): string[] {
         // since we don't know the contents of smuggler import file we assume that currently processed
@@ -306,9 +373,9 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
         }
 
         let processingSpeedText = smugglerDatabaseDetails.ProcessingText;
-        const isDocuments = name === "Documents";
 
-        const skippedCount = isDocuments ? (item as Raven.Client.Documents.Smuggler.SmugglerProgressBase.CountsWithSkippedCountAndLastEtag).SkippedCount : 0;
+        const hasSkippedCount = "SkippedCount" in item;
+        const skippedCount = hasSkippedCount ? (item as Raven.Client.Documents.Smuggler.SmugglerProgressBase.CountsWithSkippedCountAndLastEtag).SkippedCount : 0;
         
         if (this.showSpeed(name) && item.StartTime) {
             const itemsCount = item.ReadCount + skippedCount + item.ErroredCount;
@@ -326,8 +393,8 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
             stage: stage,
             hasReadCount: true, // it will be reassigned in post-processing
             readCount: item.ReadCount.toLocaleString(),
-            hasSkippedCount: isDocuments,
-            skippedCount: isDocuments ? skippedCount.toLocaleString() : "-",
+            hasSkippedCount: hasSkippedCount,
+            skippedCount: hasSkippedCount ? skippedCount.toLocaleString() : "-",
             hasErroredCount: true, // it will be reassigned in post-processing
             erroredCount: item.ErroredCount.toLocaleString(),
             processingSpeedText: processingSpeedText,
@@ -389,6 +456,10 @@ class smugglerDatabaseDetails extends abstractOperationDetails {
         }
         
         return true;
+    }
+
+    copyLogs() {
+        copyToClipboard.copy(this.messagesJoined(), "Copied details to clipboard.");
     }
 }
 

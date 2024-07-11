@@ -18,6 +18,7 @@ using Raven.Server.Documents;
 using Raven.Server.Documents.ETL.Providers.OLAP;
 using Raven.Server.Documents.PeriodicBackup.Aws;
 using Raven.Server.Documents.PeriodicBackup.Restore;
+using Sparrow.Server;
 using Tests.Infrastructure;
 using Tests.Infrastructure.Entities;
 using Xunit;
@@ -35,7 +36,7 @@ namespace SlowTests.Server.Documents.ETL.Olap
         private const string CollectionName = "Orders";
         private static readonly HashSet<char> SpecialChars = new HashSet<char> { '&', '@', ':', ',', '$', '=', '+', '?', ';', ' ', '"', '^', '`', '>', '<', '{', '}', '[', ']', '#', '\'', '~', '|' };
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanUploadToS3()
         {
             var settings = GetS3Settings();
@@ -91,7 +92,8 @@ loadToOrders(partitionBy(key),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, string.Empty, false);
@@ -109,7 +111,7 @@ loadToOrders(partitionBy(key),
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task SimpleTransformation()
         {
             var settings = GetS3Settings();
@@ -155,7 +157,8 @@ loadToOrders(partitionBy(key),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
 
@@ -215,7 +218,7 @@ loadToOrders(partitionBy(key),
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanLoadToMultipleTables()
         {
             const string salesTableName = "Sales";
@@ -289,7 +292,7 @@ loadToOrders(partitionBy(key),
                     }
 
                     var database = await GetDatabase(store.Database);
-                    var etlDone = new ManualResetEventSlim();
+                    var etlDone = new AsyncManualResetEvent();
                     
                     database.EtlLoader.BatchCompleted += x =>
                     {
@@ -334,9 +337,10 @@ loadToOrders(partitionBy(key), orderData);
                         ? TimeSpan.FromMinutes(2)
                         : TimeSpan.FromMinutes(1);
 
-                    Assert.True(etlDone.Wait(timeout), $"olap etl to s3 did not finish in {timeout.TotalMinutes} minutes. stats : {GetPerformanceStats(database)}");
+                    Assert.True(await etlDone.WaitAsync(timeout), $"olap etl to s3 did not finish in {timeout.TotalMinutes} minutes. stats : {GetPerformanceStats(database)}");
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, string.Empty, false);
@@ -369,7 +373,8 @@ loadToOrders(partitionBy(key), orderData);
                         }
                     }
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{salesTableName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, string.Empty, false);
@@ -417,7 +422,7 @@ loadToOrders(partitionBy(key), orderData);
             return string.Join(Environment.NewLine, stats.Select(JsonConvert.SerializeObject));
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanModifyPartitionColumnName()
         {
             var settings = GetS3Settings();
@@ -493,7 +498,8 @@ loadToOrders(partitionBy(['order_date', key]),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, string.Empty, false);
@@ -512,7 +518,7 @@ loadToOrders(partitionBy(['order_date', key]),
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task SimpleTransformation_NoPartition()
         {
             var settings = GetS3Settings();
@@ -552,7 +558,8 @@ loadToOrders(noPartition(),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
 
@@ -620,7 +627,7 @@ loadToOrders(noPartition(),
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task SimpleTransformation_MultiplePartitions()
         {
             var settings = GetS3Settings();
@@ -685,7 +692,8 @@ loadToOrders(partitionBy(
 
                     var expectedFields = new[] { "RequireAt", "ShipVia", "Company", ParquetTransformedItems.DefaultIdColumn, ParquetTransformedItems.LastModifiedColumn };
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}/";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: "/", listFolders: true);
@@ -755,7 +763,7 @@ loadToOrders(partitionBy(
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanPartitionByCustomDataFieldViaScript()
         {
             var settings = GetS3Settings();
@@ -811,7 +819,8 @@ loadToOrders(partitionBy(['year', year], ['month', month], ['source', $customPar
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}/";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: "/", listFolders: true);
@@ -830,7 +839,7 @@ loadToOrders(partitionBy(['year', year], ['month', month], ['source', $customPar
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanHandleSpecialCharsInEtlName()
         {
             var settings = GetS3Settings();
@@ -854,7 +863,8 @@ loadToOrders(noPartition(), {
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -872,7 +882,7 @@ loadToOrders(noPartition(), {
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanHandleSpecialCharsInFolderPath()
         {
             var settings = GetS3Settings();
@@ -959,7 +969,8 @@ for (var i = 0; i < this.Lines.length; i++){
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -982,7 +993,7 @@ for (var i = 0; i < this.Lines.length; i++){
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanHandleSlashInPartitionValue()
         {
             var settings = GetS3Settings();
@@ -1016,7 +1027,8 @@ for (var i = 0; i < this.Lines.length; i++){
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -1037,7 +1049,7 @@ for (var i = 0; i < this.Lines.length; i++){
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task CanUpdateS3Settings()
         {
             var settings = GetS3Settings();
@@ -1121,7 +1133,8 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings1, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings1.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -1190,7 +1203,8 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
                     etlDone = WaitForEtl(store, (n, statistics) => statistics.LoadSuccesses != 0);
                     Assert.True(etlDone.Wait(TimeSpan.FromMinutes(1)));
 
-                    using (var s3Client = new RavenAwsS3Client(settings2, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings2.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -1212,7 +1226,7 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
             }
         }
 
-        [AmazonS3Fact]
+        [AmazonS3RetryFact]
         public async Task ShouldTrimRedundantSlashInRemoteFolderName()
         {
             var settings = GetS3Settings();
@@ -1250,7 +1264,8 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var s3Client = new RavenAwsS3Client(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}{CollectionName}";
                         Assert.False(prefix.EndsWith('/'));
@@ -1317,7 +1332,7 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
 
         private S3Settings GetS3Settings([CallerMemberName] string caller = null)
         {
-            var s3Settings = AmazonS3FactAttribute.S3Settings;
+            var s3Settings = AmazonS3RetryFactAttribute.S3Settings;
             if (s3Settings == null)
                 return null;
 
@@ -1359,7 +1374,8 @@ loadToOrders(partitionBy(['year', orderDate.getFullYear()]),
 
             try
             {
-                using (var s3Client = new RavenAwsS3Client(s3Settings, DefaultBackupConfiguration))
+                using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                using (var s3Client = new RavenAwsS3Client(s3Settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                 {
                     var cloudObjects = await s3Client.ListObjectsAsync(prefix, delimiter, listFolder);
                     if (cloudObjects.FileInfoDetails.Count == 0)

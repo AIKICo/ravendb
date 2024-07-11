@@ -39,7 +39,7 @@ import compactDatabaseDetails = require("viewmodels/common/notificationCenter/de
 import indexingDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/indexingDetails");
 import slowSqlDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/slowSqlDetails");
 import indexingReferencesDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/indexingReferencesDetails");
-import slowWriteDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/slowWriteDetails");
+import slowIoDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/slowIoDetails");
 import pagingDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/pagingDetails");
 import hugeDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/hugeDocumentsDetails");
 import newVersionAvailableDetails = require("viewmodels/common/notificationCenter/detailViewer/alerts/newVersionAvailableDetails");
@@ -54,6 +54,13 @@ import dumpRawIndexDataDetails = require("viewmodels/common/notificationCenter/d
 
 import studioSettings = require("common/settings/studioSettings");
 import optimizeIndexDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/optimizeIndexDetails");
+import mismatchedReferenceLoadDetails
+    from "viewmodels/common/notificationCenter/detailViewer/alerts/mismatchedReferenceLoadDetails";
+import blockingTombstonesDetails
+    from "viewmodels/common/notificationCenter/detailViewer/alerts/blockingTombstonesDetails";
+import serverLimitsDetails from "viewmodels/common/notificationCenter/detailViewer/alerts/serverLimitsDetails";
+import conflictExceededDetails
+    from "viewmodels/common/notificationCenter/detailViewer/alerts/conflictExceededDetails";
 
 interface detailsProvider {
     supportsDetailsFor(notification: abstractNotification): boolean;
@@ -164,7 +171,7 @@ class notificationCenter {
             indexingDetails,
             slowSqlDetails,
             indexingReferencesDetails,
-            slowWriteDetails,
+            slowIoDetails,
             pagingDetails,
             requestLatencyDetails,
             hugeDocumentsDetails,
@@ -172,6 +179,10 @@ class notificationCenter {
             // alerts:
             newVersionAvailableDetails,
             etlTransformOrLoadErrorDetails,
+            mismatchedReferenceLoadDetails,
+            blockingTombstonesDetails,
+            serverLimitsDetails,
+            conflictExceededDetails,
 
             genericAlertDetails  // leave it as last item on this list - this is fallback handler for all alert types
         );

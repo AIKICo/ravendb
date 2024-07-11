@@ -4,6 +4,7 @@ using System.Dynamic;
 using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Net.Http;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -39,32 +40,31 @@ namespace Raven.Client.Documents.Conventions
 
         public delegate bool TryConvertValueToObjectForQueryDelegate<in T>(string fieldName, T value, bool forRange, out object objValue);
 
-        internal static readonly DocumentConventions Default = new DocumentConventions();
+        internal static readonly DocumentConventions Default = new();
 
-        internal static readonly DocumentConventions DefaultForServer = new DocumentConventions
+        internal static readonly DocumentConventions DefaultForServer = new()
         {
             SendApplicationIdentifier = false,
             MaxContextSizeToKeep = new Size(PlatformDetails.Is32Bits == false ? 8 : 2, SizeUnit.Megabytes),
 #if NETCOREAPP3_1_OR_GREATER
-            HttpPooledConnectionLifetime = TimeSpan.FromMinutes(19)
+            HttpPooledConnectionLifetime = TimeSpan.FromMinutes(19),
+            HttpVersion = System.Net.HttpVersion.Version20
 #endif
-        };
+    };
 
         private static readonly bool DefaultDisableTcpCompression = false;
 
-        private static Dictionary<Type, string> CachedDefaultTypeCollectionNames = new Dictionary<Type, string>();
+        private static Dictionary<Type, string> CachedDefaultTypeCollectionNames = new();
 
-        private readonly Dictionary<MemberInfo, CustomQueryTranslator> _customQueryTranslators = new Dictionary<MemberInfo, CustomQueryTranslator>();
+        private readonly Dictionary<MemberInfo, CustomQueryTranslator> _customQueryTranslators = new();
 
-        private readonly List<(Type Type, TryConvertValueToObjectForQueryDelegate<object> Convert)> _listOfQueryValueToObjectConverters =
-            new List<(Type, TryConvertValueToObjectForQueryDelegate<object>)>();
+        private readonly List<(Type Type, TryConvertValueToObjectForQueryDelegate<object> Convert)> _listOfQueryValueToObjectConverters = new();
 
-        private readonly List<QueryMethodConverter> _listOfQueryMethodConverters = new List<QueryMethodConverter>();
+        private readonly List<QueryMethodConverter> _listOfQueryMethodConverters = new();
 
-        private readonly Dictionary<Type, RangeType> _customRangeTypes = new Dictionary<Type, RangeType>();
+        private readonly Dictionary<Type, RangeType> _customRangeTypes = new();
 
-        private readonly List<Tuple<Type, Func<string, object, Task<string>>>> _listOfRegisteredIdConventionsAsync =
-            new List<Tuple<Type, Func<string, object, Task<string>>>>();
+        private readonly List<Tuple<Type, Func<string, object, Task<string>>>> _listOfRegisteredIdConventionsAsync = new();
 
         public readonly BulkInsertConventions BulkInsert;
 
@@ -165,6 +165,22 @@ namespace Raven.Client.Documents.Conventions
                     ? null
                     : TimeSpan.FromSeconds(httpPooledConnectionLifetime);
             }
+
+            var httpVersionAsString = Environment.GetEnvironmentVariable("RAVEN_HTTP_VERSION");
+            if (httpVersionAsString != null)
+            {
+                Version httpVersion;
+                try
+                {
+                    httpVersion = Version.Parse(httpVersionAsString);
+                }
+                catch (Exception e)
+                {
+                    throw new InvalidOperationException($"Could not parse 'RAVEN_HTTP_VERSION' env variable with value '{httpVersionAsString}'.", e);
+                }
+
+                DefaultForServer.HttpVersion = httpVersion;
+            }
 #endif
 
 #if NETCOREAPP3_1_OR_GREATER
@@ -198,9 +214,9 @@ namespace Raven.Client.Documents.Conventions
 
             FindIdentityProperty = q => q.Name == "Id";
             IdentityPartsSeparator = '/';
-            FindIdentityPropertyNameFromCollectionName = collectionName => "Id";
+            FindIdentityPropertyNameFromCollectionName = _ => "Id";
 
-            FindClrType = (id, doc) =>
+            FindClrType = (_, doc) =>
             {
                 if (doc.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) &&
                     metadata.TryGet(Constants.Documents.Metadata.RavenClrType, out string clrType))
@@ -245,11 +261,14 @@ namespace Raven.Client.Documents.Conventions
                 : new Size(256, SizeUnit.Kilobytes);
 
             _disableTcpCompression = DefaultDisableTcpCompression;
+
+            _httpClientType = typeof(HttpClient);
+            _createHttpClient = handler => new HttpClient(handler);
         }
 
         private bool _frozen;
         private ClientConfiguration _originalConfiguration;
-        private Dictionary<Type, MemberInfo> _idPropertyCache = new Dictionary<Type, MemberInfo>();
+        private Dictionary<Type, MemberInfo> _idPropertyCache = new();
 
         private bool _saveEnumsAsIntegers;
         private char _identityPartsSeparator;
@@ -296,6 +315,8 @@ namespace Raven.Client.Documents.Conventions
         private bool _disableTopologyCache;
         private string _topologyCacheLocation;
         private Version _httpVersion;
+        private Type _httpClientType;
+        private Func<HttpClientHandler, HttpClient> _createHttpClient;
 #if NETCOREAPP3_1_OR_GREATER
         private TimeSpan? _httpPooledConnectionLifetime;
         private TimeSpan? _httpPooledConnectionIdleTimeout;
@@ -347,6 +368,29 @@ namespace Raven.Client.Documents.Conventions
             {
                 AssertNotFrozen();
                 _httpVersion = value;
+            }
+        }
+
+        /// <summary>
+        /// Used by HttpClient cache, if you are overriding DocumentConventions.CreateHttpClient convention then it is advisable to return here the type of the HttpClient from that convention
+        /// </summary>
+        public Type HttpClientType
+        {
+            get => _httpClientType;
+            set
+            {
+                AssertNotFrozen();
+                _httpClientType = value;
+            }
+        }
+
+        public Func<HttpClientHandler, HttpClient> CreateHttpClient
+        {
+            get => _createHttpClient;
+            set
+            {
+                AssertNotFrozen();
+                _createHttpClient = value;
             }
         }
 
@@ -1353,6 +1397,21 @@ namespace Raven.Client.Documents.Conventions
             if (_frozen)
                 throw new InvalidOperationException(
                     $"Conventions has frozen after '{nameof(DocumentStore)}.{nameof(DocumentStore.Initialize)}()' and no changes can be applied to them.");
+        }
+
+        internal TestingStuff ForTestingPurposes;
+
+        internal TestingStuff ForTestingPurposesOnly()
+        {
+            if (ForTestingPurposes != null)
+                return ForTestingPurposes;
+
+            return ForTestingPurposes = new TestingStuff();
+        }
+
+        internal class TestingStuff
+        {
+            internal Action<RequestExecutor> OnBeforeTopologyUpdate;
         }
     }
 }

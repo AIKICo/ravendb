@@ -57,19 +57,22 @@ namespace Raven.Client.Json
 
             using var orderedProperties = newBlittable.GetPropertiesByInsertionOrder();
 
+            var newProp = new BlittableJsonReaderObject.PropertyDetails();
+            var oldProp = new BlittableJsonReaderObject.PropertyDetails();
+
             foreach (var field in removedFields)
             {
-                if (changes == null)
-                    return true;
                 if (field.Equals(LastModified) ||
                     field.Equals(ChangeVector) ||
                     field.Equals(Id))
                     continue;
-                NewChange(fieldPath, field, null, null, docChanges, DocumentsChanges.ChangeType.RemovedField);
-            }
+                if (changes == null)
+                    return true;
 
-            var newProp = new BlittableJsonReaderObject.PropertyDetails();
-            var oldProp = new BlittableJsonReaderObject.PropertyDetails();
+                var oldPropId = originalBlittable.GetPropertyIndex(field);
+                originalBlittable.GetPropertyByIndex(oldPropId, ref oldProp);
+                NewChange(fieldPath, field, null, oldProp.Value, docChanges, DocumentsChanges.ChangeType.RemovedField);
+            }
 
             for (int i = 0; i < orderedProperties.Size; i++)
             {

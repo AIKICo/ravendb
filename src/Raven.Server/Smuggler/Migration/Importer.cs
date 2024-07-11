@@ -18,7 +18,9 @@ using Raven.Server.Json;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents;
 using Raven.Server.Smuggler.Documents.Data;
+using Raven.Server.Utils;
 using Sparrow.Json;
+using BackupUtils = Raven.Server.Utils.BackupUtils;
 
 namespace Raven.Server.Smuggler.Migration
 {
@@ -79,13 +81,13 @@ namespace Raven.Server.Smuggler.Migration
                     if ((_buildVersion >= 40000 && _buildVersion < 41000) || _buildVersion == 40)
                     {
                         // prevent NRE, counter were added in 4.1
-                        smugglerResult.Counters = new SmugglerProgressBase.CountsWithLastEtag();
+                        smugglerResult.Counters = new SmugglerProgressBase.CountsWithSkippedCountAndLastEtag();
                     }
 
                     if ((_buildVersion >= 40000 && _buildVersion < 50000) || (_buildVersion >= 40 && _buildVersion < 50))
                     {
                         // prevent NRE, time series were added in 5.0
-                        smugglerResult.TimeSeries = new SmugglerProgressBase.CountsWithLastEtag();
+                        smugglerResult.TimeSeries = new SmugglerProgressBase.CountsWithSkippedCountAndLastEtag();
                     }
 
                     var importInfo = new ImportInfo
@@ -170,7 +172,7 @@ namespace Raven.Server.Smuggler.Migration
             }
 
             await using (var responseStream = await response.Content.ReadAsStreamAsync())
-            await using (var stream = new GZipStream(responseStream, mode: CompressionMode.Decompress))
+            await using (var stream = await BackupUtils.GetDecompressionStreamAsync(responseStream))
             using (Parameters.Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (var source = new StreamSource(stream, context, Parameters.Database))
             {
@@ -227,7 +229,7 @@ namespace Raven.Server.Smuggler.Migration
             }
         }
 
-        public static async Task<List<string>> GetDatabasesToMigrate(string serverUrl, HttpClient httpClient, CancellationToken cancelToken)
+        public static async Task<List<string>> GetDatabasesToMigrate(string serverUrl, RavenHttpClient httpClient, CancellationToken cancelToken)
         {
             var url = $"{serverUrl}/databases?namesOnly=true";
             var request = new HttpRequestMessage(HttpMethod.Get, url);

@@ -17,6 +17,7 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 using Sparrow.Server;
 using Sparrow.Server.Utils;
 using Sparrow.Threading;
@@ -35,11 +36,12 @@ namespace Raven.Server.Rachis
     {
         private TaskCompletionSource<object> _topologyModification;
         private readonly RachisConsensus _engine;
+        private readonly string _threadName;
 
         public delegate object ConvertResultFromLeader(JsonOperationContext ctx, object result);
 
         private TaskCompletionSource<object> _newEntriesArrived = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly TaskCompletionSource<object> _errorOccurred = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<object> _errorOccurred = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private readonly ConcurrentDictionary<long, CommandState> _entries = new ConcurrentDictionary<long, CommandState>();
 
@@ -84,6 +86,7 @@ namespace Raven.Server.Rachis
             Term = term;
             _engine = engine;
             PeersVersion[engine.Tag] = ClusterCommandsVersionManager.MyCommandsVersion;
+            _threadName = $"Consensus Leader - {_engine.Tag} in term {Term}";
         }
 
         private MultipleUseFlag _running = new MultipleUseFlag();
@@ -105,7 +108,8 @@ namespace Raven.Server.Rachis
             RefreshAmbassadors(clusterTopology, connections);
 
             _leaderLongRunningWork =
-                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, $"Consensus Leader - {_engine.Tag} in term {Term}");
+                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null,
+                    ThreadNames.ForConsensusLeader(_threadName, _engine.Tag, Term));
         }
 
         private int _steppedDown;
@@ -296,6 +300,8 @@ namespace Raven.Server.Rachis
         {
             try
             {
+                ThreadHelper.TrySetThreadPriority(ThreadPriority.AboveNormal, _threadName, _engine.Log);
+
                 var handles = new WaitHandle[]
                 {
                     _newEntry,
@@ -308,80 +314,96 @@ namespace Raven.Server.Rachis
                 _newEntry.Set(); //This is so the noop would register right away
                 while (_running)
                 {
-                    switch (WaitHandle.WaitAny(handles, _engine.ElectionTimeout))
+                    try
                     {
-                        case 0: // new entry
-                            _newEntry.Reset();
-                            // release any waiting ambassadors to send immediately
-                            TaskExecutor.CompleteAndReplace(ref _newEntriesArrived);
-                            if (_voters.Count == 0)
-                                goto case 1;
-                            break;
-                        case 1: // voter responded
-                            _voterResponded.Reset();
-                            OnVoterConfirmation();
-                            break;
-                        case 2: // promotable updated
-                            _promotableUpdated.Reset();
-                            CheckPromotables();
-                            break;
-                        case WaitHandle.WaitTimeout:
-                            break;
-                        case 3: // shutdown requested
-                            if (_engine.Log.IsInfoEnabled && _voters.Count != 0)
-                            {
-                                _engine.Log.Info($"{ToString()}: shutting down");
-                            }
-                            _running.Lower();
-                            return;
-                        case 4: // an error occurred during EmptyQueue()
-                            _errorOccurred.Task.Wait();
-                            break;
-                    }
-
-                    EnsureThatWeHaveLeadership(VotersMajority);
-                    _engine.ReportLeaderTime(LeaderShipDuration);
-
-                    // don't truncate if we are disposing an old peer
-                    // otherwise he would not receive notification that he was
-                    // kick out of the cluster
-                    if (_previousPeersWereDisposed > 0) // Not Interlocked, because the race here is not interesting.
-                        continue;
-
-                    var lowestIndexInEntireCluster = GetLowestIndexInEntireCluster(out var lastTruncated);
-                    if (lowestIndexInEntireCluster == 0) // one of the nodes might be during the handshake
-                        continue;
-
-                    if (lowestIndexInEntireCluster > lastTruncated)
-                    {
-                        using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
-                        using (context.OpenWriteTransaction())
+                        switch (WaitHandle.WaitAny(handles, _engine.ElectionTimeout))
                         {
-                            _engine.TruncateLogBefore(context, lowestIndexInEntireCluster);
-                            LowestIndexInEntireCluster = lowestIndexInEntireCluster;
-                            context.Transaction.Commit();
+                            case 0: // new entry
+                                _newEntry.Reset();
+                                // release any waiting ambassadors to send immediately
+                                TaskExecutor.CompleteAndReplace(ref _newEntriesArrived);
+                                if (_voters.Count == 0)
+                                    goto case 1;
+                                break;
+                            case 1: // voter responded
+                                _voterResponded.Reset();
+                                OnVoterConfirmation();
+                                break;
+                            case 2: // promotable updated
+                                _promotableUpdated.Reset();
+                                CheckPromotables();
+                                break;
+                            case WaitHandle.WaitTimeout:
+                                break;
+                            case 3: // shutdown requested
+                                if (_engine.Log.IsInfoEnabled && _voters.Count != 0)
+                                {
+                                    _engine.Log.Info($"{ToString()}: shutting down");
+                                }
+                                _running.Lower();
+                                return;
+                            case 4: // an error occurred during EmptyQueue()
+                                _errorOccurred.Task.Wait();
+                                break;
                         }
+
+                        EnsureThatWeHaveLeadership(VotersMajority);
+                        _engine.ReportLeaderTime(LeaderShipDuration);
+
+                        // don't truncate if we are disposing an old peer
+                        // otherwise he would not receive notification that he was
+                        // kick out of the cluster
+                        if (_previousPeersWereDisposed > 0) // Not Interlocked, because the race here is not interesting.
+                            continue;
+
+                        var lowestIndexInEntireCluster = GetLowestIndexInEntireCluster(out var lastTruncated);
+                        if (lowestIndexInEntireCluster == 0) // one of the nodes might be during the handshake
+                            continue;
+
+                        if (lowestIndexInEntireCluster > lastTruncated)
+                        {
+                            using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
+                            using (context.OpenWriteTransaction())
+                            {
+                                _engine.TruncateLogBefore(context, lowestIndexInEntireCluster);
+                                LowestIndexInEntireCluster = lowestIndexInEntireCluster;
+                                context.Transaction.Commit();
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ClusterTopology clusterTopology;
+                        using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
+                        using (context.OpenReadTransaction())
+                        {
+                            clusterTopology = _engine.GetTopology(context);
+                        }
+
+                        if (clusterTopology.Members.Count == 1 && clusterTopology.Members.ContainsKey(_engine.Tag))
+                        {
+                            if (_errorOccurred.Task.IsFaulted)
+                            {
+                                _errorOccurred = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                                handles[4] = ((IAsyncResult)_errorOccurred.Task).AsyncWaitHandle;
+                            }
+
+                            LogAndNotifyLeaderRunExceptions(ex);
+                            Task.Run(async () =>
+                            {
+                                await TimeoutManager.WaitFor(_engine.ElectionTimeout / 3);
+                                _newEntry.Set();
+                            });
+                            continue;
+                        }
+
+                        throw;
                     }
                 }
             }
             catch (Exception e)
             {
-                const string msg = "Error when running leader behavior";
-
-                if (_engine.Log.IsInfoEnabled)
-                {
-                    _engine.Log.Info(msg, e);
-                }
-
-                if (e is VoronErrorException)
-                {
-                    _engine.Notify(AlertRaised.Create(
-                        null,
-                        msg,
-                        e.Message,
-                        AlertType.ClusterTopologyWarning,
-                        NotificationSeverity.Error, details: new ExceptionDetails(e)));
-                }
+                LogAndNotifyLeaderRunExceptions(e);
 
                 try
                 {
@@ -394,6 +416,26 @@ namespace Raven.Server.Rachis
                         _engine.Log.Operations("After leadership failure, could not setup switch to candidate state", e2);
                     }
                 }
+            }
+        }
+
+        private void LogAndNotifyLeaderRunExceptions(Exception e)
+        {
+            const string msg = "Error when running leader behavior";
+
+            if (_engine.Log.IsInfoEnabled)
+            {
+                _engine.Log.Info(msg, e);
+            }
+
+            if (e is VoronErrorException)
+            {
+                _engine.Notify(AlertRaised.Create(
+                    null,
+                    msg,
+                    e.Message,
+                    AlertType.ClusterTopologyWarning,
+                    NotificationSeverity.Error, details: new ExceptionDetails(e)));
             }
         }
 
@@ -633,11 +675,49 @@ namespace Raven.Server.Rachis
             }
         }
 
-        private class RachisMergedCommand
+        public class RachisMergedCommand : IDisposable
         {
+            private readonly ClusterContextPool _pool;
+            private IDisposable _ctxReturn;
+
             public CommandBase Command;
-            public TaskCompletionSource<Task<(long Index, object Result)>> Tcs;
+            public TaskCompletionSource<Task<(long Index, object Result)>> Tcs = new TaskCompletionSource<Task<(long Index, object Result)>>(TaskCreationOptions.RunContinuationsAsynchronously);
             public readonly MultipleUseFlag Consumed = new MultipleUseFlag();
+            public BlittableResultWriter BlittableResultWriter { get; private set; }
+
+            public RachisMergedCommand(ClusterContextPool pool, CommandBase command)
+            {
+                _pool = pool;
+                Command = command;
+            }
+
+            public void Initialize()
+            {
+                BlittableResultWriter = Command is IBlittableResultCommand crCommand ? new BlittableResultWriter(crCommand.WriteResult) : null;
+
+                // we prepare the command _not_ under the write lock
+                if (Command.Raw == null)
+                {
+                    _ctxReturn = _pool.AllocateOperationContext(out JsonOperationContext context);
+                    var djv = Command.ToJson(context);
+                    Command.Raw = context.ReadObject(djv, "prepare-raw-command");
+                }
+            }
+
+            public async Task<(long Index, object Result)> Result()
+            {
+                var inner = await Tcs.Task;
+                var r = await inner;
+                return BlittableResultWriter == null ? r : (r.Index, BlittableResultWriter.Result);
+            } 
+
+            public void Dispose()
+            {
+                Command.Raw?.Dispose();
+                Command.Raw = null;
+                BlittableResultWriter?.Dispose();
+                _ctxReturn?.Dispose();
+            }
         }
 
         private readonly ConcurrentQueue<RachisMergedCommand> _commandsQueue = new ConcurrentQueue<RachisMergedCommand>();
@@ -646,11 +726,10 @@ namespace Raven.Server.Rachis
 
         public async Task<(long Index, object Result)> PutAsync(CommandBase command, TimeSpan timeout)
         {
-            var rachisMergedCommand = new RachisMergedCommand
-            {
-                Command = command,
-                Tcs = new TaskCompletionSource<Task<(long, object)>>(TaskCreationOptions.RunContinuationsAsynchronously)
-            };
+            using var rachisMergedCommand = new RachisMergedCommand(_engine.ContextPool, command);
+
+            rachisMergedCommand.Initialize();
+
             _commandsQueue.Enqueue(rachisMergedCommand);
 
             while (rachisMergedCommand.Tcs.Task.IsCompleted == false)
@@ -669,10 +748,7 @@ namespace Raven.Server.Rachis
                         if (await waitAsync == false)
                         {
                             if (rachisMergedCommand.Consumed.Raise())
-                            {
-                                GetConvertResult(command)?.AboutToTimeout();
                                 throw new TimeoutException($"Waited for {timeout} but the command was not applied in this time.");
-                            }
 
                             // if the command is already dequeued we must let it continue to keep its context valid.
                             await rachisMergedCommand.Tcs.Task;
@@ -691,12 +767,9 @@ namespace Raven.Server.Rachis
 
             var inner = await rachisMergedCommand.Tcs.Task;
             if (await inner.WaitWithTimeout(timeout) == false)
-            {
-                GetConvertResult(command)?.AboutToTimeout();
                 throw new TimeoutException($"Waited for {timeout} but the command was not applied in this time.");
-            }
 
-            return await inner;
+            return await rachisMergedCommand.Result();
         }
 
         private void EmptyQueue()
@@ -705,7 +778,6 @@ namespace Raven.Server.Rachis
             var tasks = new List<Task<(long, object)>>();
             const string leaderDisposedMessage = "We are no longer the leader, this leader is disposed";
             var lostLeadershipException = new NotLeadingException(leaderDisposedMessage);
-
             using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
             {
                 try
@@ -730,12 +802,9 @@ namespace Raven.Server.Rachis
                             }
 
                             list.Add(cmd.Tcs);
-                            _engine.InvokeBeforeAppendToRaftLog(context, cmd.Command);
+                            _engine.InvokeBeforeAppendToRaftLog(context, cmd);
 
-                            var djv = cmd.Command.ToJson(context);
-                            var cmdJson = context.ReadObject(djv, "raft/command");
-
-                            if (_engine.LogHistory.HasHistoryLog(context, cmdJson, out var index, out var result, out var exception))
+                            if (_engine.LogHistory.HasHistoryLog(context, cmd.Command.UniqueRequestId, out var index, out var result, out var exception))
                             {
                                 // if this command is already committed, we can skip it and notify the caller about it
                                 if (lastCommitted >= index)
@@ -748,7 +817,17 @@ namespace Raven.Server.Rachis
                                     {
                                         if (result != null)
                                         {
-                                            result = GetConvertResult(cmd.Command)?.Apply(result) ?? cmd.Command.FromRemote(result);
+                                            if (cmd.BlittableResultWriter != null)
+                                            {
+                                                cmd.BlittableResultWriter.CopyResult(result);
+                                                //The result are consumed by the `CopyResult` and the context of the result from `HasHistoryLog` is not valid outside
+                                                //so we `TrySetResult` to null to make sure no use of invalid context 
+                                                result = null;
+                                            }
+                                            else
+                                            {
+                                                result = cmd.Command.FromRemote(result);
+                                            }
                                         }
 
                                         cmd.Tcs.TrySetResult(Task.FromResult<(long, object)>((index, result)));
@@ -759,29 +838,31 @@ namespace Raven.Server.Rachis
                             }
                             else
                             {
-                                index = _engine.InsertToLeaderLog(context, Term, cmdJson, RachisEntryFlags.StateMachineCommand);
+                                index = _engine.InsertToLeaderLog(context, Term, cmd.Command.Raw, RachisEntryFlags.StateMachineCommand);
                             }
 
-                            if (_entries.TryGetValue(index, out var state))
-                            {
-                                tasks.Add(state.TaskCompletionSource.Task);
-                            }
-                            else
+                            if (_entries.TryGetValue(index, out var state) == false)
                             {
                                 var tcs = new TaskCompletionSource<(long, object)>(TaskCreationOptions.RunContinuationsAsynchronously);
-                                tasks.Add(tcs.Task);
-                                state = new
-                                    CommandState
+                                state = new CommandState
                                 // we need to add entry inside write tx lock to avoid
                                 // a situation when command will be applied (and state set)
                                 // before it is added to the entries list
                                 {
                                     CommandIndex = index,
                                     TaskCompletionSource = tcs,
-                                    ConvertResult = GetConvertResult(cmd.Command),
                                 };
                                 _entries[index] = state;
                             }
+
+                            if (cmd.BlittableResultWriter != null)
+                                //If we need to return a blittable as a result the context must be valid for each command that tries to read from it.
+                                //So we let the command provide the method to handle the write while the command is aware of its context validation status.
+                                //We can have multiple delegates if the same command was sent multiple times (multiple attempts)
+                                //https://issues.hibernatingrhinos.com/issue/RavenDB-20762
+                                state.WriteResultAction += cmd.BlittableResultWriter.CopyResult;
+
+                            tasks.Add(state.TaskCompletionSource.Task);
                         }
                         context.Transaction.Commit();
                     }
@@ -807,35 +888,6 @@ namespace Raven.Server.Rachis
 
                     _errorOccurred.TrySetException(e);
                 }
-            }
-        }
-
-        internal static ConvertResultAction GetConvertResult(CommandBase cmd)
-        {
-            ConvertResultAction action;
-            switch (cmd)
-            {
-                case AddOrUpdateCompareExchangeBatchCommand batchCmpExchangeCommand:
-                    action = batchCmpExchangeCommand.ConvertResultAction;
-                    if (action != null)
-                        return action;
-
-                    action = new ConvertResultAction(batchCmpExchangeCommand.ContextToWriteResult, CompareExchangeCommandBase.ConvertResult);
-                    Interlocked.CompareExchange(ref batchCmpExchangeCommand.ConvertResultAction, action, null);
-                    return batchCmpExchangeCommand.ConvertResultAction;
-
-                case CompareExchangeCommandBase cmpExchange:
-
-                    action = cmpExchange.ConvertResultAction;
-                    if (action != null)
-                        return action;
-
-                    action = new ConvertResultAction(cmpExchange.ContextToWriteResult, CompareExchangeCommandBase.ConvertResult);
-                    Interlocked.CompareExchange(ref cmpExchange.ConvertResultAction, action, null);
-                    return cmpExchange.ConvertResultAction;
-
-                default:
-                    return null;
             }
         }
 
@@ -899,19 +951,26 @@ namespace Raven.Server.Rachis
 
                         foreach (var entry in _entries)
                         {
-                            if (entry.Value.OnNotify != null)
+                            if (entry.Key <= _lastCommit)
                             {
-                                try
+                                if (entry.Value.OnNotify != null)
                                 {
-                                    entry.Value.OnNotify(entry.Value.TaskCompletionSource);
+                                    try
+                                    {
+                                        entry.Value.OnNotify(entry.Value.TaskCompletionSource);
+                                    }
+                                    catch (Exception e)
+                                    {
+                                        entry.Value.TaskCompletionSource.TrySetException(e);
+                                    }
                                 }
-                                catch (Exception e)
+                                else
                                 {
-                                    entry.Value.TaskCompletionSource.TrySetException(e);
-                                    continue;
+                                    entry.Value.TaskCompletionSource.TrySetResult((entry.Value.CommandIndex, entry.Value.Result));
                                 }
+                                continue;
                             }
-
+                            
                             if (te == null)
                             {
                                 entry.Value.TaskCompletionSource.TrySetCanceled();
@@ -926,7 +985,7 @@ namespace Raven.Server.Rachis
                     if (_leaderLongRunningWork != null && _leaderLongRunningWork.ManagedThreadId != Thread.CurrentThread.ManagedThreadId)
                         _leaderLongRunningWork.Join(int.MaxValue);
 
-                    _engine.ForTestingPurposes?.LeaderDispose();
+                    _engine.ForTestingPurposes?.ReleaseOnLeaderElect();
 
                     var ae = new ExceptionAggregator("Could not properly dispose Leader");
                     foreach (var ambassador in _nonVoters)
@@ -1124,20 +1183,27 @@ namespace Raven.Server.Rachis
             }
         }
 
+        public void SetExceptionOf(long index, Exception e)
+        {
+            if (_entries.TryGetValue(index, out CommandState value))
+            {
+                value.TaskCompletionSource.TrySetException(e);
+            }
+        }
+
         public void SetStateOf(long index, object result)
         {
-            if (_entries.TryGetValue(index, out CommandState state))
+            if (_entries.TryGetValue(index, out CommandState state) == false) 
+                return;
+
+            if (state.WriteResultAction != null)
             {
-                if (state.ConvertResult == null)
-                {
-                    ValidateUsableReturnType(result);
-                    state.Result = result;
-                }
-                else
-                {
-                    state.Result = state.ConvertResult.Apply(result);
-                }
+                state.WriteResultAction?.Invoke(result);
+                return;
             }
+            
+            ValidateUsableReturnType(result);
+            state.Result = result;
         }
 
         [Conditional("DEBUG")]
@@ -1159,41 +1225,9 @@ namespace Raven.Server.Rachis
         {
             public long CommandIndex;
             public object Result;
-            public ConvertResultAction ConvertResult;
+            public Action<object> WriteResultAction;
             public TaskCompletionSource<(long, object)> TaskCompletionSource;
             public Action<TaskCompletionSource<(long, object)>> OnNotify;
-        }
-
-        public class ConvertResultAction
-        {
-            private readonly JsonOperationContext _contextToWriteBlittableResult;
-            private readonly ConvertResultFromLeader _action;
-            private readonly SingleUseFlag _timeout = new SingleUseFlag();
-
-            public ConvertResultAction(JsonOperationContext contextToWriteBlittableResult, ConvertResultFromLeader action)
-            {
-                _contextToWriteBlittableResult = contextToWriteBlittableResult ?? throw new ArgumentNullException(nameof(contextToWriteBlittableResult));
-                _action = action ?? throw new ArgumentNullException(nameof(action));
-            }
-
-            public object Apply(object result)
-            {
-                lock (this)
-                {
-                    if (_timeout.IsRaised())
-                        return null;
-
-                    return _action(_contextToWriteBlittableResult, result);
-                }
-            }
-
-            public void AboutToTimeout()
-            {
-                lock (this)
-                {
-                    _timeout.Raise();
-                }
-            }
         }
     }
 }

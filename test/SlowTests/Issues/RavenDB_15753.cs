@@ -5,6 +5,8 @@ using Orders;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Exceptions.Documents.Compilation;
+using Tests.Infrastructure;
+using xRetry;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -62,7 +64,7 @@ namespace SlowTests.Issues
             }
         }
 
-        [Fact]
+        [RetryFact(delayBetweenRetriesMs: 1000)]
         public void AdditionalAssemblies_NuGet()
         {
             using (var store = GetDocumentStore())
@@ -83,7 +85,27 @@ namespace SlowTests.Issues
             }
         }
 
-        [Fact]
+        [RetryFact(delayBetweenRetriesMs: 1000, Skip = "Uses NPOI and downloads 150MB of packages")]
+        public void AdditionalAssemblies_NuGet_With_Prerelease_Dependency()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.Maintenance.Send(new PutIndexesOperation(new IndexDefinition
+                {
+                    Name = "NPOIIndex",
+                    Maps =
+                    {
+                        "from c in docs.Companies select new { Name = typeof(NPOI.OpenXml4Net.Util.XmlHelper).Name }"
+                    },
+                    AdditionalAssemblies =
+                    {
+                        AdditionalAssembly.FromNuGet("NPOI", "2.6.0"),
+                    }
+                }));
+            }
+        }
+
+        [RetryFact(delayBetweenRetriesMs: 1000)]
         public void AdditionalAssemblies_NuGet_InvalidName()
         {
             using (var store = GetDocumentStore())
@@ -106,7 +128,7 @@ namespace SlowTests.Issues
             }
         }
 
-        [Fact]
+        [RetryFact(delayBetweenRetriesMs: 1000)]
         public void AdditionalAssemblies_NuGet_InvalidSource()
         {
             using (var store = GetDocumentStore())
@@ -129,7 +151,7 @@ namespace SlowTests.Issues
             }
         }
 
-        [Fact]
+        [RetryFact(delayBetweenRetriesMs: 1000)]
         public void AdditionalAssemblies_NuGet_Live()
         {
             using (var store = GetDocumentStore())

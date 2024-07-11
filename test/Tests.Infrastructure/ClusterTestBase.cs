@@ -134,11 +134,11 @@ namespace Tests.Infrastructure
             Assert.NotNull(await WaitForDocumentToReplicateAsync<object>(dst, id, 15 * 1000));
         }
 
-        protected async Task<T> WaitForDocumentToReplicateAsync<T>(IDocumentStore store, string id, int timeout)
+        protected async Task<T> WaitForDocumentToReplicateAsync<T>(IDocumentStore store, string id, TimeSpan timeout)
             where T : class
         {
             var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds <= timeout)
+            while (sw.Elapsed <= timeout)
             {
                 using (var session = store.OpenAsyncSession(store.Database))
                 {
@@ -151,6 +151,12 @@ namespace Tests.Infrastructure
             }
 
             return null;
+        }
+
+        protected Task<T> WaitForDocumentToReplicateAsync<T>(IDocumentStore store, string id, int timeoutInMs)
+            where T : class
+        {
+            return WaitForDocumentToReplicateAsync<T>(store, id, TimeSpan.FromMilliseconds(timeoutInMs));
         }
 
         protected T WaitForDocumentToReplicate<T>(IDocumentStore store, string id, int timeout)
@@ -205,7 +211,7 @@ namespace Tests.Infrastructure
             var deleteResult = await store.Maintenance.Server.SendAsync(new DeleteDatabasesOperation(database, hardDelete: true,
                 fromNode: toDeleteTag, timeToWaitForConfirmation: TimeSpan.FromSeconds(15)));
             await Task.WhenAll(nonDeleted.Select(n =>
-                n.ServerStore.WaitForCommitIndexChange(RachisConsensus.CommitIndexModification.GreaterOrEqual, deleteResult.RaftCommandIndex + 1)));
+                n.ServerStore.WaitForCommitIndexChange(RachisConsensus.CommitIndexModification.GreaterOrEqual, deleteResult.RaftCommandIndex)));
 
             Assert.True(await WaitForDatabaseToBeDeleted(store, database, TimeSpan.FromSeconds(15)), await Task.Run(async () =>
             {
@@ -239,7 +245,7 @@ namespace Tests.Infrastructure
                     }
                     continue;
                 }
-                var dbRecord = dbTask.Result;
+                var dbRecord = await dbTask;
                 if (dbRecord == null || dbRecord.DeletionInProgress == null || dbRecord.DeletionInProgress.Count == 0)
                 {
                     return true;
@@ -370,7 +376,7 @@ namespace Tests.Infrastructure
             return string.Join(Environment.NewLine, servers);
         }
 
-        protected async Task<T> WaitForValueOnGroupAsync<T>(DatabaseTopology topology, Func<ServerStore, T> func, T expected, int timeout = 15000)
+        protected async Task<T> WaitForValueOnGroupAsync<T>(DatabaseTopology topology, Func<ServerStore, Task<T>> func, T expected, int timeout = 15000)
         {
             var nodes = topology.AllNodes;
             var servers = new List<ServerStore>();
@@ -615,7 +621,18 @@ namespace Tests.Infrastructure
             string database, 
             Func<IDocumentStore, Task<T>> waitFunc)
         {
-            var stores = nodes.Select(n => new DocumentStore {Database = database, Urls = new[] {n.WebUrl}}.Initialize()).ToArray();
+            var stores = nodes.Select(n => new DocumentStore
+            {
+                Database = database, 
+                Urls = new[]
+                {
+                    n.WebUrl
+                },
+                Conventions = new DocumentConventions
+                {
+                    DisableTopologyUpdates = true
+                }
+            }.Initialize()).ToArray();
 
             using (new DisposableAction(Action))
             {
@@ -883,6 +900,7 @@ namespace Tests.Infrastructure
                     try
                     {
                         leader = await ActionWithLeader(_ => Task.CompletedTask, clusterNodes);
+                        Assert.True(await WaitForNotHavingPromotables(clusterNodes));
                         return (clusterNodes, leader, certificates);
                     }
                     catch (InvalidOperationException ex)
@@ -895,6 +913,7 @@ namespace Tests.Infrastructure
                     states += $"{Environment.NewLine}{e}";
             }
             Assert.True(condition, states);
+            Assert.True(await WaitForNotHavingPromotables(clusterNodes));
             return (clusterNodes, leader, certificates);
         }
 
@@ -905,6 +924,35 @@ namespace Tests.Infrastructure
                 var nodesInTopology = await WaitForValueAsync(async () => await Task.FromResult(node.ServerStore.GetClusterTopology().AllNodes.Count), clusterNodes.Count, interval: 444);
                 Assert.Equal(clusterNodes.Count, nodesInTopology);
             }
+        }
+
+        private static async Task<bool> WaitForNotHavingPromotables(List<RavenServer> clusterNodes, long timeout = 15_000)
+        {
+            // Waiting for not having Promotables and all nodes topologies will be updated
+
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeout)
+            {
+                bool havePromotables = false;
+                foreach (var server in clusterNodes)
+                {
+                    var t1 = server.ServerStore.GetClusterTopology();
+                    if (t1.Promotables.Count > 0)
+                    {
+                        havePromotables = true;
+                        break;
+                    }
+                }
+
+                if (havePromotables == false)
+                {
+                    return true;
+                }
+
+                await Task.Delay(200);
+            }
+
+            return false;
         }
 
         protected Dictionary<string, string> GetServerSettingsForPort(bool useSsl, out string serverUrl, out TestCertificatesHolder certificates)
@@ -928,14 +976,14 @@ namespace Tests.Infrastructure
 
         public async Task WaitForLeader(TimeSpan timeout)
         {
+            using var cts = new CancellationTokenSource(timeout);
             var tasks = Servers
-                .Select(server => server.ServerStore.WaitForState(RachisState.Leader, CancellationToken.None))
+                .Select(server => server.ServerStore.WaitForState(RachisState.Leader, cts.Token))
                 .ToList();
 
-            tasks.Add(Task.Delay(timeout));
-            await Task.WhenAny(tasks);
+            var t = await Task.WhenAny(tasks);
 
-            if (Task.Delay(timeout).IsCompleted)
+            if (t.Result == false)
                 throw new TimeoutException(Cluster.GetLastStatesFromAllServersOrderedByTime());
         }
 
@@ -993,16 +1041,18 @@ namespace Tests.Infrastructure
             }
 
             if (numberOfInstances != replicationFactor)
-                throw new InvalidOperationException($@"Couldn't create the db on all nodes, just on {numberOfInstances}
-                                                    out of {replicationFactor}{Environment.NewLine}
-                                                    Server urls are {string.Join(",", Servers.Select(x => $"[{x.WebUrl}|{x.Disposed}]"))}; Current cluster (members) urls are : {string.Join(",", urls)}; The relevant servers are : {string.Join(",", relevantServers.Select(x => x.WebUrl))}; current servers are : {string.Join(",", currentCluster.Select(x => x.WebUrl))}");
+                throw new InvalidOperationException($"Couldn't create the db on all nodes, just on {numberOfInstances} out of {replicationFactor}{Environment.NewLine}" +
+                                                    $"Server urls are {string.Join(",", Servers.Select(x => $"[{x.WebUrl}|{x.Disposed}]"))};{Environment.NewLine}" +
+                                                    $"Current cluster (members) urls are : {string.Join(",", urls)};{Environment.NewLine}" +
+                                                    $"The relevant servers are : {string.Join(",", relevantServers.Select(x => x.WebUrl))};{Environment.NewLine}" +
+                                                    $"current servers are: {string.Join(",", currentCluster.Select(x => x.WebUrl))}");
             return (databaseResult, relevantServers.ToList());
         }
 
         private static async Task<string[]> GetClusterNodeUrlsAsync(string leadersUrl, IDocumentStore store)
         {
             string[] urls;
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leadersUrl, store.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leadersUrl, store.Certificate, DocumentConventions.DefaultForServer))
             {
                 try
                 {

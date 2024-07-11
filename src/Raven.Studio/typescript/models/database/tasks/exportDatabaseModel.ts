@@ -13,6 +13,7 @@ class exportDatabaseModel {
     includeCounters = ko.observable(true);
     includeAttachments = ko.observable(true);
     includeTimeSeries = ko.observable(true);
+    includeTimeSeriesDeletedRanges = ko.observable(true);
     includeRevisionDocuments = ko.observable(true);
     includeSubscriptions = ko.observable(true);
     
@@ -31,8 +32,11 @@ class exportDatabaseModel {
 
     includeAllCollections = ko.observable(true);
     includedCollections = ko.observableArray<string>([]);
+    skipCorruptedData = ko.observable(false);
 
     transformScript = ko.observable<string>();
+
+    compressionAlgorithm = ko.observable<Raven.Client.Documents.Smuggler.ExportCompressionAlgorithm>(null);
     
     validationGroup: KnockoutValidationGroup;
     encryptionValidationGroup: KnockoutValidationGroup;
@@ -69,7 +73,7 @@ class exportDatabaseModel {
                 this.includeDocuments(true);
             }
         });
-
+        
         this.includeRevisionDocuments.subscribe(revisions => {
             if (revisions) {
                 this.includeDocuments(true);
@@ -82,9 +86,16 @@ class exportDatabaseModel {
             }
         });
 
+        this.databaseModel.includeIndexHistory.subscribe(indexHistory => {
+            if (indexHistory) {
+                this.includeIndexes(true);
+            }
+        });
+
         this.includeIndexes.subscribe(indexes => {
             if (!indexes) {
                 this.removeAnalyzers(false);
+                this.databaseModel.includeIndexHistory(false);
             }
         });
 
@@ -153,6 +164,9 @@ class exportDatabaseModel {
         if (this.includeTimeSeries()) {
             operateOnTypes.push("TimeSeries");
         }
+        if (this.includeTimeSeriesDeletedRanges()) {
+            operateOnTypes.push("TimeSeriesDeletedRanges");
+        }
         if (this.includeSubscriptions()) {
             operateOnTypes.push("Subscriptions");
         }
@@ -172,7 +186,9 @@ class exportDatabaseModel {
             MaxStepsForTransformScript: 10 * 1000,
             ReadLegacyEtag: undefined,
             SkipRevisionCreation: undefined,
-            AuthorizationStatus: undefined
+            AuthorizationStatus: undefined,
+            CompressionAlgorithm: this.compressionAlgorithm(),
+            SkipCorruptedData: this.skipCorruptedData()
         };
     }
     
@@ -188,6 +204,7 @@ class exportDatabaseModel {
                 || this.includeCounters() 
                 || this.includeRevisionDocuments()
                 || this.includeTimeSeries()
+                || this.includeTimeSeriesDeletedRanges()
                 || this.includeDocuments()
                 || this.includeArtificialDocuments();
         });

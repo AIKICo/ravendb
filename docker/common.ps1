@@ -35,30 +35,25 @@ function GetUbuntuImageTags($repo, $version, $arch) {
     switch ($arch) {
         "x64" { 
             return @(
-                "$($repo):latest",
-                "$($repo):ubuntu-latest",
-                "$($repo):latest-lts",
                 "$($repo):ubuntu-latest-lts",
                 "$($repo):5.4-ubuntu-latest",
-                "$($repo):$($version)-ubuntu.20.04-x64"
+                "$($repo):$($version)-ubuntu.22.04-x64"
             )
             break;
         }
         "arm32v7" {
             return @(
-                "$($repo):ubuntu-arm32v7-latest",
                 "$($repo):ubuntu-arm32v7-latest-lts",
                 "$($repo):5.4-ubuntu-arm32v7-latest",
-                "$($repo):$($version)-ubuntu.20.04-arm32v7"
+                "$($repo):$($version)-ubuntu.22.04-arm32v7"
             )
             break;
         }
         "arm64v8" {
             return @(
-                "$($repo):ubuntu-arm64v8-latest",
                 "$($repo):ubuntu-arm64v8-latest-lts",
                 "$($repo):5.4-ubuntu-arm64v8-latest",
-                "$($repo):$($version)-ubuntu.20.04-arm64v8"
+                "$($repo):$($version)-ubuntu.22.04-arm64v8"
                 )
                 break;
         }
@@ -69,11 +64,52 @@ function GetUbuntuImageTags($repo, $version, $arch) {
         
 }
 
-function GetWindowsImageTags($repo, $version) {
+function GetWindowsImageTags($repo, $version, $WinVer) {
+    switch ($winver) {
+        "1809" {
+            return @(
+                "$($repo):$($version)-windows-1809",
+                "$($repo):windows-1809-latest-lts",
+                "$($repo):5.4-windows-1809-latest"
+            )
+            break;
+        }
+        "ltsc2022" {
+             return @(
+                "$($repo):$($version)-windows-ltsc2022",
+                "$($repo):windows-ltsc2022-latest-lts",
+                "$($repo):5.4-windows-ltsc2022-latest"
+            )
+            break;
+        }
+        Default{
+            throw "Windows Version not supported. There are 'ltsc2022' and '1809' avaliable."
+        }        
+    }
+
+}
+
+function GetManifestTags {
+    param (
+        $repo
+    )
+
     return @(
-        "$($repo):$($version)-windows",
-        "$($repo):windows-latest",
-        "$($repo):windows-latest-lts",
-        "$($repo):5.4-windows-latest"
+        "${repo}:latest-lts",
+        "${repo}:5.4-latest"
+    )
+}
+
+function GetImageTagsForManifest {
+    param (
+        [string]$repo
+    )
+
+    return @(
+        "${repo}:5.4-ubuntu-latest",
+        "${repo}:5.4-ubuntu-arm32v7-latest",
+        "${repo}:5.4-ubuntu-arm64v8-latest",
+        "${repo}:5.4-windows-1809-latest",
+        "${repo}:5.4-windows-ltsc2022-latest"
     )
 }

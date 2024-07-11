@@ -13,6 +13,8 @@ import popoverUtils = require("common/popoverUtils");
 import app = require("durandal/app");
 import feedback from "viewmodels/shell/feedback";
 
+type newVersionStatus = "available" | "latest" | "checksDisabled";
+
 class about extends viewModelBase {
 
     view = require("views/shell/about.html");
@@ -37,30 +39,33 @@ class about extends viewModelBase {
     developerLicense = license.developerLicense;
 
     static latestVersion = ko.observable<Raven.Server.ServerWide.BackgroundTasks.LatestVersionCheck.VersionInfo>();
-    currentServerVersion = ko.pureComputed(() => this.serverVersion() ? this.serverVersion().FullVersion : "");   
-    
-    isNewVersionAvailable = ko.pureComputed(() => {
+    currentServerVersion = ko.pureComputed(() => this.serverVersion() ? this.serverVersion().FullVersion : "");
+
+    newVersionStatus = ko.pureComputed((): newVersionStatus => {
         const latestVersionInfo = about.latestVersion();
         if (!latestVersionInfo) {
-            return false;
+            return "checksDisabled";
         }
 
         const serverVersion = this.serverVersion();
         if (!serverVersion) {
-            return false;
+            return "checksDisabled";
         }
 
         const isDevBuildNumber = (num: number) => num >= 40 && num < 60;
 
-        return !isDevBuildNumber(latestVersionInfo.BuildNumber) &&
-            latestVersionInfo.BuildNumber > serverVersion.BuildVersion;
+        return (!isDevBuildNumber(latestVersionInfo.BuildNumber) &&
+            latestVersionInfo.BuildNumber > serverVersion.BuildVersion) ? "available" : "latest";
     });
 
     newVersionAvailableHtml = ko.pureComputed(() => {
-        if (this.isNewVersionAvailable()) {
-            return `New version available<br/> <span class="nobr">${ about.latestVersion().Version }</span>`;
-        } else {
-            return `You are using the latest version`;
+        switch (this.newVersionStatus()) {
+            case "available":
+                return `New version available<br/> <span class="nobr">${ about.latestVersion().Version }</span>`;
+            case "latest":
+                return `You are using the latest version`;
+            default:
+                return null;
         }
     });
     
@@ -255,6 +260,8 @@ class about extends viewModelBase {
             .done(versionInfo => {
                 if (versionInfo && versionInfo.Version) {
                     about.latestVersion(versionInfo);
+                } else {
+                    about.latestVersion(null);
                 }
             })
             .always(() => this.spinners.latestVersionUpdates(false));
@@ -267,6 +274,8 @@ class about extends viewModelBase {
             .done(versionInfo => {
                 if (versionInfo && versionInfo.Version) {
                     about.latestVersion(versionInfo);
+                } else {
+                    about.latestVersion(null);
                 }
             })
             .always(() => this.spinners.latestVersionUpdates(false));
@@ -276,23 +285,27 @@ class about extends viewModelBase {
         window.open("https://ravendb.net/downloads", "_blank");
     }
 
-    forceLicenseUpdate() {
-        this.confirmationMessage(
-                "Force License Update",
-                "Are you sure that you want to force license update?")
-            .done(can => {
-                if (!can) {
-                    return;
-                }
+    async forceLicenseUpdate() {
+        const isConfirmed = await this.confirmationMessage("Force License Update", "Are you sure that you want to force license update?");
+        if (!isConfirmed) {
+            return;
+        }
 
-                this.spinners.forceLicenseUpdate(true);
-                new forceLicenseUpdateCommand().execute()
-                    .done(() => {
-                        license.fetchLicenseStatus()
-                            .done(() => license.fetchSupportCoverage());
-                    })
-                    .always(() => this.spinners.forceLicenseUpdate(false));
-            });
+        try {
+            this.spinners.forceLicenseUpdate(true);
+
+            const updateResult = await new forceLicenseUpdateCommand().execute();
+            const licenseStatus = await license.fetchLicenseStatus();
+
+            if (updateResult.Status === "NotModified") {
+                forceLicenseUpdateCommand.handleNotModifiedStatus(licenseStatus.Expired);
+            }
+
+            await license.fetchSupportCoverage();
+            
+        } finally {
+            this.spinners.forceLicenseUpdate(false);
+        }
     }
 
     renewLicense() {

@@ -23,6 +23,8 @@ import getServerCertificateRenewalDateCommand = require("commands/auth/getServer
 import fileImporter = require("common/fileImporter");
 import generalUtils = require("common/generalUtils");
 import moment = require("moment");
+import generateTwoFactorSecretCommand from "commands/auth/generateTwoFactorSecretCommand";
+import { QRCode } from "qrcodejs";
 
 type certificatesSortMode = "default" |
                             "byNameAsc"  | "byExpirationAsc"  | "byValidFromAsc" |
@@ -65,6 +67,9 @@ class certificates extends viewModelBase {
     wellKnownAdminCerts = ko.observableArray<string>([]);
     wellKnownAdminCertsVisible = ko.observable<boolean>(false);
     
+    wellKnownIssuers = ko.observableArray<string>([]);
+    wellKnownIssuersVisible = ko.observable<boolean>(false);
+    
     domainsForServerCertificate = ko.observableArray<string>([]);
     
     isSecureServer = accessManager.default.secureServer();
@@ -89,7 +94,7 @@ class certificates extends viewModelBase {
     showUserCertificates = ko.observable<boolean>(true);
 
     showValidCertificates = ko.observable<boolean>(true);
-    showExpiredCertificates = ko.observable<boolean>(true);
+    showExpiredCertificates = ko.observable<boolean>(false);
     showAboutToExpireCertificates = ko.observable<boolean>(true);
     
     databases = databasesManager.default.databases;
@@ -106,6 +111,9 @@ class certificates extends viewModelBase {
     sortModeText: KnockoutComputed<string>;
 
     deleteExistingCertificate = ko.observable<boolean>(false);
+
+    // currently displayed QR Code
+    private qrCode: any;
     
     constructor() {
         super();
@@ -113,7 +121,7 @@ class certificates extends viewModelBase {
         this.bindToCurrentInstance("onCloseEdit", "save", "enterEditCertificateMode", "enterRegenerateCertificateMode",
             "deletePermission", "fileSelected", "copyThumbprint",
             "deleteCertificateConfirm", "renewServerCertificate", "canBeAutomaticallyRenewed",
-            "sortCertificates", "clearAllFilters",
+            "sortCertificates", "clearAllFilters", "syncQrCode", 
             "addPermission","addPermissionWithBlink","addDatabase","addDatabaseWithBlink");
         
         this.initObservables();
@@ -163,10 +171,66 @@ class certificates extends viewModelBase {
         });
         
         this.model.subscribe(model => {
+            if (!model || !model.requireTwoFactor()) {
+                if (this.qrCode) {
+                    this.qrCode.clear();
+                    this.qrCode = null;
+                }
+            }
+            
             if (model) {
                 this.initPopover();
+                
+                model.name.subscribe(() => this.syncQrCode());
+                model.authenticationKey.subscribe(() => this.syncQrCode());
+                model.requireTwoFactor.subscribe(twoFactor => {
+                    if (twoFactor) {
+                        this.generateSecret(model);
+                    }
+                });
             }
         });
+    }
+    
+    syncQrCode(): void {
+        if (!this.model().requireTwoFactor() || !this.model().authenticationKey()) {
+            return;
+        }
+        
+        const secret = this.model().authenticationKey();
+        const encodedIssuer = encodeURIComponent(location.hostname);
+        const encodedName = encodeURIComponent(this.model().name() ?? "Client Certificate");
+        
+        const uri = `otpauth://totp/${encodedIssuer}:${encodedName}?secret=${secret}&issuer=${encodedIssuer}`;
+        
+        const qrContainer = document.getElementById("encryption_qrcode");
+
+        if (qrContainer.innerHTML && !this.qrCode) {
+            // clean up old instances
+            qrContainer.innerHTML = "";
+        }
+
+        if (!this.qrCode) {
+            this.qrCode = new QRCode(qrContainer, {
+                text: uri,
+                width: 256,
+                height: 256,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.Q
+            });
+        } else {
+            this.qrCode.clear();
+            this.qrCode.makeCode(uri);
+        }
+    }
+    
+    private generateSecret(model: certificateModel): void {
+        new generateTwoFactorSecretCommand()
+            .execute()
+            .done(key => {
+                model.authenticationKey(key.Secret);
+            });
     }
     
     private filterCertificates(): void {
@@ -178,13 +242,23 @@ class certificates extends viewModelBase {
         });
         
         const wellKnownAdminCerts = this.wellKnownAdminCerts();
+        const nameLower = this.nameFilter().toLocaleLowerCase();
         
         if (wellKnownAdminCerts.length && this.showAdminCertificates()) {
-            const thumbprintMatch = _.some(wellKnownAdminCerts, x => x.toLocaleLowerCase().includes(this.nameFilter().toLocaleLowerCase()));
+            const thumbprintMatch = _.some(wellKnownAdminCerts, x => x.toLocaleLowerCase().includes(nameLower));
             this.wellKnownAdminCertsVisible(thumbprintMatch);
         } else {
             this.wellKnownAdminCertsVisible(false);
         }
+
+        const wellKnownIssues = this.wellKnownIssuers();
+
+        if (wellKnownIssues.length && this.showAdminCertificates()) {
+            const thumbprintMatch = _.some(wellKnownIssues, x => x.toLocaleLowerCase().includes(nameLower));
+            this.wellKnownIssuersVisible(thumbprintMatch);
+        } else {
+            this.wellKnownIssuersVisible(false);
+    }
     }
     
     private isMatchingTextFilter(certificate: unifiedCertificateDefinitionWithCache): boolean {
@@ -569,6 +643,8 @@ class certificates extends viewModelBase {
                 const secondaryCertificates: Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition[] = [];
                 
                 certificatesInfo.Certificates.forEach(cert => {
+                    cert.HasTwoFactor = cert.HasTwoFactor ?? false; // force property to exist
+                    
                     if (cert.CollectionPrimaryKey) {
                         secondaryCertificates.push(cert);
                     } else {
@@ -584,7 +660,10 @@ class certificates extends viewModelBase {
                 secondaryCertificates.forEach(cert => {
                     const thumbprint = cert.CollectionPrimaryKey;
                     const primaryCert = mergedCertificates.find(x => x.Thumbprint === thumbprint);
-                    primaryCert.Thumbprints.push(cert.Thumbprint);
+                    
+                    if (primaryCert) {
+                        primaryCert.Thumbprints.push(cert.Thumbprint);
+                    }
                 });
                 
                 const orderedCertificates = this.sortByDefaultInternal(mergedCertificates);
@@ -593,6 +672,7 @@ class certificates extends viewModelBase {
                 this.certificates(orderedCertificates);
                 
                 this.wellKnownAdminCerts(certificatesInfo.WellKnownAdminCerts || []);
+                this.wellKnownIssuers(certificatesInfo.WellKnownIssuers || []);
                 this.filterCertificates();
                 this.sortCertificates(this.currentSortMode());
             });
@@ -689,6 +769,10 @@ class certificates extends viewModelBase {
     
     copyThumbprint(thumbprint: string): void {
         copyToClipboard.copy(thumbprint, "Thumbprint was copied to clipboard.");
+    }
+
+    copyAuthenticationKeyToClipboard(authenticationKey: string) {
+        copyToClipboard.copy(authenticationKey, "Authentication Key was copied to clipboard.");
     }
     
     canEdit(model: unifiedCertificateDefinition) {

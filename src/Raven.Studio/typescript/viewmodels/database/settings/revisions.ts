@@ -10,9 +10,9 @@ import messagePublisher = require("common/messagePublisher");
 import collectionsTracker = require("common/helpers/database/collectionsTracker");
 import getRevisionsConfigurationCommand = require("commands/database/documents/getRevisionsConfigurationCommand");
 import getRevisionsForConflictsConfigurationCommand = require("commands/database/documents/getRevisionsForConflictsConfigurationCommand");
-import enforceRevisionsConfigurationCommand = require("commands/database/settings/enforceRevisionsConfigurationCommand");
-import notificationCenter = require("common/notifications/notificationCenter");
 import popoverUtils = require("common/popoverUtils");
+import enforceRevisions from "viewmodels/database/settings/enforceRevisions";
+import app from "durandal/app";
 
 class revisions extends viewModelBase {
 
@@ -283,7 +283,8 @@ class revisions extends viewModelBase {
                               <li><small>This is the default revision configuration for <strong>conflicting documents only</strong>.</small></li>
                               <li><small>When enabled, a revision is created for each conflicting item.</small></li>
                               <li><small>A revision is also created for the conflict resolution document.</small></li>
-                              <li><small>When a collection specific configuration is defined, it <strong>overrides</strong> these defaults.</li>
+                              <li><small>When Document Defaults or a collection-specific configuration is defined,<br/>
+                                         they <strong>override</strong> the Conflicting Document Defaults.</li>
                           </ul>`,
                 html: true
             });
@@ -361,52 +362,9 @@ class revisions extends viewModelBase {
 
     enforceConfiguration() {
         const db = this.activeDatabase();
-        
-        const collectionNameItems = this.perCollectionConfigurations()
-            .map(x => `<li>${generalUtils.escapeHtml(x.collection())}</li>`)
-            .join("");
 
-        const text1 = collectionNameItems.length > 0 ?
-            `The following collections have a revision configuration defined:<br><ul>${collectionNameItems}</ul>` : "";
-
-        const text2 =
-            `<div class="margin-top margin-top-lg margin-bottom margin-bottom-lg">
-                 Clicking <strong>Enforce</strong> will enforce the current revision configuration definitions<br>
-                 <strong>on all existing revisions</strong> in the database per collection.<br>
-                 Revisions might be removed depending on the current configuration rules.
-             </div>`;
-
-        const text3 =
-            `<div class="bg-warning text-warning padding padding-sm flex-horizontal">
-                 <small class="flex-start margin-right"><i class="icon-warning"></i></small>
-                 <small>
-                     For collections without a specific revision configuration:<br><br>
-                     <ul class="no-padding-left">
-                         <li>
-                             Non-conflicting documents:<br>
-                             If Document Defaults are defined & enabled, it will be applied.<br>
-                             If not defined, or if disabled, <strong>all non-conflicting document revisions will be deleted</strong>.
-                         </li><br>
-                         <li>
-                             Conflicting documents:<br>
-                             If Conflicting Document Defaults are enabled, it will be applied to conflicting document revisions.
-                             If disabled, <strong>all conflicting document revisions will be deleted</strong>.
-                         </li>
-                     </ul>
-                 </small>
-             </div>`;
-        
-        this.confirmationMessage("Enforce Revision Configuration", text1 + text2 + text3, { buttons: ["Cancel", "Enforce Revision Configuration"], html: true })
-            .done (result => {
-                if (result.can) {
-                    new enforceRevisionsConfigurationCommand(db)
-                        .execute()
-                        .done((operationIdDto: operationIdDto) => {
-                            const operationId = operationIdDto.OperationId;
-                            notificationCenter.instance.openDetailsForOperationById(db, operationId);
-                        });
-                }
-            });
+        const dialog = new enforceRevisions(db);
+        app.showBootstrapDialog(dialog);
     }
     
     private initTooltips() {
@@ -415,7 +373,7 @@ class revisions extends viewModelBase {
                 content: `<ul class="margin-top margin-top-xs">
                               <li><small>This is the default revision configuration for all <strong>non-conflicting documents</strong>.</small></li>
                               <li><small>When enabled, a revision is created for all non-conflicting documents.</small></li>
-                              <li><small>When a collection specific configuration is defined, it <strong>overrides</strong> these defaults.</li>
+                              <li><small>When a collection specific configuration is defined, it <strong>overrides</strong> these defaults.</small></li>
                           </ul>`,
                 html: true
             });

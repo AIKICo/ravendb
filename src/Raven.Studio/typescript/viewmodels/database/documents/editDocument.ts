@@ -44,6 +44,7 @@ import studioSettings = require("common/settings/studioSettings");
 import globalSettings = require("common/settings/globalSettings");
 import fileDownloader = require("common/fileDownloader");
 import moment = require("moment");
+import generalUtils = require("common/generalUtils");
 
 class editDocument extends viewModelBase {
 
@@ -79,6 +80,9 @@ class editDocument extends viewModelBase {
     changeVector: KnockoutComputed<changeVectorItem[]>;
     changeVectorHtml: KnockoutComputed<string>;
     changeVectorFormatted: KnockoutComputed<string>;
+    
+    savedInClusterTransaction: KnockoutComputed<boolean>;
+    atomicGuardUrl: KnockoutComputed<string>;
     
     lastModifiedAsAgo: KnockoutComputed<string>;
     latestRevisionUrl: KnockoutComputed<string>;
@@ -153,6 +157,7 @@ class editDocument extends viewModelBase {
     sizeOnDiskActual = ko.observable<string>();
     sizeOnDiskAllocated = ko.observable<string>();
     documentSizeHtml: KnockoutComputed<string>;
+    isCompressed = ko.observable<boolean>(false);
     
     editedDocId: KnockoutComputed<string>;
     displayLastModifiedDate: KnockoutComputed<boolean>;
@@ -177,7 +182,8 @@ class editDocument extends viewModelBase {
         this.initValidation();
         
         this.bindToCurrentInstance("compareRevisions", "forceCreateRevision", "copyChangeVectorToClipboard", 
-                                   "togglePropertiesPanel", "activateTimeSeriesTab", "activateAttachmentsTab");
+                                   "togglePropertiesPanel", "activateTimeSeriesTab", "activateAttachmentsTab", 
+                                   "revisionNavigate");
     }
 
     canActivate(args: any) {
@@ -497,6 +503,20 @@ class editDocument extends viewModelBase {
         this.changeVectorHtml = ko.pureComputed(() => {
             return `<div><strong>Change Vector</strong></div>${this.changeVectorFormatted()}`;
         });
+        
+        this.savedInClusterTransaction = ko.pureComputed(() => {
+            const vectors = this.changeVector().find(x => x.shortFormat.startsWith("TRXN:"));
+            return !!vectors;
+        });
+        
+        this.atomicGuardUrl = ko.pureComputed(() => {
+            const id = this.document().getId();
+            if (!id) {
+                return null;
+            }
+           
+            return appUrl.forEditCmpXchg("rvn-atomic/" + id.toLocaleLowerCase(), this.activeDatabase());
+        });
 
         this.isConflictDocument = ko.computed(() => {
             const metadata = this.metadata();
@@ -523,7 +543,7 @@ class editDocument extends viewModelBase {
                 return `Computed Size: ${this.computedDocumentSize()} KB`;
             }
             
-            const text = `<div class="margin-top-sm margin-bottom-sm"><strong>Document Size on Disk</strong></div> Actual Size: ${this.sizeOnDiskActual()} <br/> Allocated Size: ${this.sizeOnDiskAllocated()}`;
+            const text = `<div class="margin-top-sm margin-bottom-sm"><strong>Document Size on Disk</strong></div> Actual Size: ${this.sizeOnDiskActual()} <br/> Allocated Size: ${this.sizeOnDiskAllocated()} <br/> Compressed: ${this.isCompressed() ? "Yes" : "No"}`;
             const hugeSizeText = this.isHugeDocument() ? `<br /><div class="text-warning bg-warning margin-top margin-bottom">Document is huge</div>` : "";
             
             return text + hugeSizeText;
@@ -709,7 +729,7 @@ class editDocument extends viewModelBase {
     }
     
     downloadDocument() {
-        fileDownloader.downloadAsJson(this.documentTextOrg(), this.document().getId());
+        fileDownloader.downloadAsTxt(this.documentTextOrg(), this.document().getId() + ".json");
     }
     
     viewRaw() {
@@ -1091,6 +1111,59 @@ class editDocument extends viewModelBase {
             });
     }
     
+    revisionNavigate(direction: "backward" | "forward", tab: "right") {
+        if (!this.canNavigateObservable(direction, tab)) {
+            return;
+        }
+        switch (tab) {
+            case "right": {
+                const currentRevision = this.comparingWith();
+                const currentRevisionIndex = this.revisionsToCompare().findIndex(x => x === currentRevision);
+                switch (direction) {
+                    case "backward": {
+                        this.compareRevisions(this.revisionsToCompare()[currentRevisionIndex - 1]);
+                        break;
+                    }
+                    case "forward": {
+                        this.compareRevisions(this.revisionsToCompare()[currentRevisionIndex + 1]);
+                        break;
+                    }
+                    default:
+                        generalUtils.assertUnreachable(direction);
+                }
+                break;
+            }
+            default:
+                generalUtils.assertUnreachable(tab);
+        }
+        
+    }
+    
+    canNavigateObservable(direction: "backward" | "forward", tab: "right") {
+        return ko.pureComputed(() => {
+            switch (tab) {
+                case "right": {
+                    const currentRevision = this.comparingWith();
+                    const currentRevisionIndex = this.revisionsToCompare().findIndex(x => x === currentRevision);
+                    switch (direction) {
+                        case "backward": {
+                            return currentRevisionIndex > 0;
+                        }
+                        case "forward": {
+                            return currentRevisionIndex < this.revisionsToCompare().length - 1;
+                        }
+                        default:
+                            generalUtils.assertUnreachable(direction);
+                    }
+                    break;
+                }
+
+                default:
+                    generalUtils.assertUnreachable(tab);
+            }
+        });
+    }
+    
     compareRevisions(item: document) {
         this.comparingWith(item);
         
@@ -1127,6 +1200,7 @@ class editDocument extends viewModelBase {
             .done((size) => {
                 this.sizeOnDiskActual(size.HumaneActualSize);
                 this.sizeOnDiskAllocated(size.HumaneAllocatedSize);
+                this.isCompressed(size.IsCompressed)
             })
             .fail(() => {
                 this.sizeOnDiskActual("Failed to get size");
@@ -1505,6 +1579,7 @@ class normalCrudActions implements editDocumentCrudActions {
                         .filter(x => x.CounterName.toLocaleLowerCase().includes(nameFilter));
                 }
                 const mappedResults = result.Counters
+                    .filter(x => x) //RavenDB-19823 - server return nulls in counters -> then ignore it
                     .map(x => normalCrudActions.resultItemToCounterItem(x));
 
                 fetchTask.resolve({

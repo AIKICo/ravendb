@@ -8,6 +8,7 @@ using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Server.Config;
+using xRetry;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -19,7 +20,7 @@ namespace SlowTests.Issues
         {
         }
 
-        [Fact]
+        [RetryFact]
         public async Task MustNotDisableThrottlingTimerOnUpdatingIndexDefinitionOfThrottledIndex()
         {
             using (var store = GetDocumentStore(new Options()
@@ -66,18 +67,27 @@ namespace SlowTests.Issues
 
                 var replacementIndex = database.IndexStore.GetIndex(Constants.Documents.Indexing.SideBySideIndexNamePrefix + updatedIndexDef.IndexName);
 
+                var mre = new ManualResetEvent(false);
+
                 using (index.ForTestingPurposesOnly().CallDuringFinallyOfExecuteIndexing(() =>
                 {
                     // stop the current index for a moment to ensure that a new thread will start - the one after renaming the replacement index
-                    Thread.Sleep(2000);
+                    mre.WaitOne(TimeSpan.FromMinutes(1));
                 }))
                 {
                     store.Maintenance.Send(new StartIndexingOperation());
                     Indexes.WaitForIndexing(store);
                 }
 
-                Assert.NotNull(replacementIndex._mre._timerTask);
-                Assert.False(replacementIndex._mre.Wait(100, CancellationToken.None));
+                try
+                {
+                    Assert.False(replacementIndex._mre.Wait(100, CancellationToken.None));
+                    Assert.NotNull(replacementIndex._mre._timerTask);
+                }
+                finally
+                {
+                    mre.Set();
+                }
 
                 using (var session = store.OpenSession())
                 {

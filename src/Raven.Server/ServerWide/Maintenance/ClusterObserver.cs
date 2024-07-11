@@ -21,17 +21,20 @@ using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Commands.Indexes;
+using Raven.Server.ServerWide.Commands.PeriodicBackup;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Json;
 using Sparrow.Logging;
+using Sparrow.Server.Extensions;
+using Sparrow.Server.Utils;
 using static Raven.Server.ServerWide.Maintenance.DatabaseStatus;
 using Index = Raven.Server.Documents.Indexes.Index;
 
 namespace Raven.Server.ServerWide.Maintenance
 {
-    internal class ClusterObserver : IDisposable
+    internal partial class ClusterObserver : IDisposable
     {
         private readonly PoolOfThreads.LongRunningWork _observe;
         private readonly CancellationTokenSource _cts;
@@ -90,7 +93,7 @@ namespace Raven.Server.ServerWide.Maintenance
                 {
                     // nothing we can do here
                 }
-            }, null, $"Cluster observer for term {_term}");
+            }, null, ThreadNames.ForClusterObserver($"Cluster observer for term {_term}", _term));
         }
 
         public bool Suspended = false; // don't really care about concurrency here
@@ -187,6 +190,7 @@ namespace Raven.Server.ServerWide.Maintenance
                 return;
 
             var updateCommands = new List<(UpdateTopologyCommand Update, string Reason)>();
+            var responsibleNodePerDatabase = new Dictionary<string, List<ResponsibleNodeInfo>>();
             var cleanUnusedAutoIndexesCommands = new List<(UpdateDatabaseCommand Update, string Reason)>();
             var cleanCompareExchangeTombstonesCommands = new List<CleanCompareExchangeTombstonesCommand>();
 
@@ -319,6 +323,10 @@ namespace Raven.Server.ServerWide.Maintenance
                                     throw new NotSupportedException($"Not supported state: '{cleanupState}'.");
                             }
                         }
+
+                        var responsibleNodeCommands = GetResponsibleNodesForBackupTasks(currentLeader, rawRecord, database, state.DatabaseTopology, context);
+                        if (responsibleNodeCommands is { Count: > 0 })
+                            responsibleNodePerDatabase[database] = responsibleNodeCommands;
                     }
                 }
             }
@@ -377,6 +385,21 @@ namespace Raven.Server.ServerWide.Maintenance
                     AddToDecisionLog(command.Update.DatabaseName,
                         $"Topology of database '{command.Update.DatabaseName}' was not changed, reason: {nameof(ConcurrencyException)}");
                 }
+            }
+
+            if (responsibleNodePerDatabase.Count > 0)
+            {
+                if (_engine.LeaderTag != _server.NodeTag)
+                {
+                    throw new NotLeadingException("This node is no longer the leader, so we abort updating the responsible node for backup tasks");
+                }
+
+                var command = new UpdateResponsibleNodeForTasksCommand(new UpdateResponsibleNodeForTasksCommand.Parameters
+                {
+                    ResponsibleNodePerDatabase = responsibleNodePerDatabase
+                }, RaftIdGenerator.NewId());
+
+                await _engine.PutAsync(command);
             }
 
             if (deletions != null)
@@ -605,13 +628,19 @@ namespace Raven.Server.ServerWide.Maintenance
 
             if (state != null)
             {
-                if (state.DatabaseTopology.Count != state.Current.Count) // we have a state change, do not remove anything
-                    return CompareExchangeTombstonesCleanupState.InvalidDatabaseObservationState;
-
-                foreach (var node in state.DatabaseTopology.AllNodes)
+                // we are checking this here, not in the main loop, to avoid returning 'NoMoreTombstones' when maxEtag is 0
+                foreach (var nodeTag in state.DatabaseTopology.AllNodes)
                 {
-                    if (state.Current.TryGetValue(node, out var nodeReport) == false)
-                        continue;
+                    if (state.Current.ContainsKey(nodeTag) == false) // we have a state change, do not remove anything
+                        return CompareExchangeTombstonesCleanupState.InvalidDatabaseObservationState;
+                }
+
+                foreach (var nodeTag in state.DatabaseTopology.AllNodes)
+                {
+                    var hasState = state.Current.TryGetValue(nodeTag, out var nodeReport);
+                    Debug.Assert(hasState, $"Could not find state for node '{nodeTag}' for database '{state.Name}'.");
+                    if (hasState == false)
+                        return CompareExchangeTombstonesCleanupState.InvalidDatabaseObservationState;
 
                     if (nodeReport.Report.TryGetValue(state.Name, out var report) == false)
                         continue;
@@ -805,7 +834,7 @@ namespace Raven.Server.ServerWide.Maintenance
 
                 if (_server.DatabasesLandlord.ForTestingPurposes?.HoldDocumentDatabaseCreation != null)
                     _server.DatabasesLandlord.ForTestingPurposes.PreventedRehabOfIdleDatabase = true;
-
+                
                 if (ShouldGiveMoreTimeBeforeMovingToRehab(nodeStats.LastSuccessfulUpdateDateTime, dbStats?.UpTime))
                 {
                     if (ShouldGiveMoreTimeBeforeRotating(nodeStats.LastSuccessfulUpdateDateTime, dbStats?.UpTime) == false)
@@ -1109,48 +1138,28 @@ namespace Raven.Server.ServerWide.Maintenance
             return true;
         }
 
-        private bool ShouldGiveMoreTimeBeforeMovingToRehab(DateTime lastSuccessfulUpdate, TimeSpan? databaseUpTime)
-        {
-            if (databaseUpTime.HasValue)
-            {
-                if (databaseUpTime.Value.TotalMilliseconds < _moveToRehabTimeMs)
-                {
-                    return true;
-                }
-            }
+        private bool ShouldGiveMoreTimeBeforeMovingToRehab(DateTime lastSuccessfulUpdate, TimeSpan? databaseUpTime) => 
+            ShouldGiveMoreGrace(lastSuccessfulUpdate, databaseUpTime, _moveToRehabTimeMs);
 
-            return ShouldGiveMoreGrace(lastSuccessfulUpdate, databaseUpTime, _moveToRehabTimeMs);
-        }
-
-        private bool ShouldGiveMoreTimeBeforeRotating(DateTime lastSuccessfulUpdate, TimeSpan? databaseUpTime)
-        {
-            if (databaseUpTime.HasValue)
-            {
-                if (databaseUpTime.Value.TotalMilliseconds > _rotateGraceTimeMs)
-                {
-                    return false;
-                }
-            }
-
-            return ShouldGiveMoreGrace(lastSuccessfulUpdate, databaseUpTime, _rotateGraceTimeMs);
-        }
+        private bool ShouldGiveMoreTimeBeforeRotating(DateTime lastSuccessfulUpdate, TimeSpan? databaseUpTime) => 
+            ShouldGiveMoreGrace(lastSuccessfulUpdate, databaseUpTime, _rotateGraceTimeMs);
 
         private bool ShouldGiveMoreGrace(DateTime lastSuccessfulUpdate, TimeSpan? databaseUpTime, long graceMs)
         {
-            var grace = DateTime.UtcNow.AddMilliseconds(-graceMs);
+            var now = DateTime.UtcNow;
+            var observerUptime = (now - StartTime).TotalMilliseconds;
 
-            if (lastSuccessfulUpdate == default) // the node hasn't send a single (good) report
+            if (graceMs > observerUptime)
+                return true;
+            
+            if (databaseUpTime.HasValue) // if this has value, it means that we have a connectivity
             {
-                if (grace < StartTime)
-                    return true;
+                return databaseUpTime.Value.TotalMilliseconds < graceMs;
             }
 
-            if (databaseUpTime.HasValue == false) // database isn't loaded
-            {
-                return grace < StartTime;
-            }
-
-            return grace < lastSuccessfulUpdate && graceMs > databaseUpTime.Value.TotalMilliseconds;
+            var lastUpdate = RavenDateTimeExtensions.Max(lastSuccessfulUpdate, StartTime);
+            var graceThreshold = lastUpdate.AddMilliseconds(graceMs);
+            return graceThreshold > now;
         }
 
         private int GetNumberOfRespondingNodes(DatabaseObservationState state)
@@ -1292,6 +1301,9 @@ namespace Raven.Server.ServerWide.Maintenance
 
         private (bool Promote, string UpdateTopologyReason) TryPromote(DatabaseObservationState state, string mentorNode, string promotable)
         {
+            if (_server.DatabasesLandlord.ForTestingPurposes?.PreventNodePromotion == true)
+                return (false, "Preventing node promotion for testing purposes.");
+
             var dbName = state.Name;
             var topology = state.DatabaseTopology;
             var current = state.Current;

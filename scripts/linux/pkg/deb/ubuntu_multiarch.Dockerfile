@@ -9,11 +9,14 @@ COPY --from=qemu /usr/bin/qemu-${QEMU_ARCH}-static /usr/bin
 ARG DISTRO_VERSION_NAME
 ARG DISTRO_VERSION
 
-RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y dos2unix devscripts dh-make wget gettext-base lintian curl dh-systemd debhelper
+RUN apt update && DEBIAN_FRONTEND=noninteractive apt install -y dos2unix devscripts dh-make wget gettext-base lintian curl debhelper
 
 RUN apt update \ 
     && apt-get -y dist-upgrade \
     && apt install -y curl wget apt-transport-https 
+
+# https://stackoverflow.com/a/70771488
+RUN for i in /etc/ssl/certs/*.pem; do HASH=$(openssl x509 -hash -noout -in $i); if [ ! -f /etc/ssl/certs/$HASH.0 ]; then ln -s $(basename $i) /etc/ssl/certs/$HASH.0; fi; done
 
 ENV DEBEMAIL=support@ravendb.net DEBFULLNAME="Hibernating Rhinos LTD" 
 ENV DEB_ARCHITECTURE="" DOTNET_RUNTIME_VERSION="" DOTNET_DEPS_VERSION=""

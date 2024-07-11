@@ -6,7 +6,6 @@ using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Client.Extensions;
 using Raven.Server.Documents.Replication;
-using Raven.Server.Documents.Subscriptions;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
 using Sparrow.Server;
@@ -47,7 +46,7 @@ namespace SlowTests.Client.Subscriptions
                 {
                     TimeToWaitBeforeConnectionRetry = TimeSpan.FromMilliseconds(100)
                 });
-                var tcs = new TaskCompletionSource<bool>();
+                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 var signalWhenForcefullyUpdatedCV = new AsyncManualResetEvent();
                 var signalWhenStartedProcessingDoc = new AsyncManualResetEvent();
 
@@ -65,7 +64,7 @@ namespace SlowTests.Client.Subscriptions
                 Assert.True(await signalWhenStartedProcessingDoc.WaitAsync(_reasonableWaitTime));
                 var database = await GetDatabase(store.Database);
 
-                SubscriptionStorage.SubscriptionGeneralDataAndStats subscriptionState;
+                SubscriptionState subscriptionState;
                 using (database.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                 using (context.OpenReadTransaction())
                 {

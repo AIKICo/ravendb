@@ -143,8 +143,15 @@ namespace Raven.Server.Config.Categories
         [DefaultValue(null)]
         [ConfigurationEntry("Security.WellKnownCertificates.Admin", ConfigurationEntryScope.ServerWideOnly)]
         public string[] WellKnownAdminCertificates { get; set; }
+        
+        
+        [Description("Well known issuer certificate in base 64 format or a file path that will be used to validate a new client certificate when the issuer's certificate has changed.")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Security.WellKnownIssuers.Admin", ConfigurationEntryScope.ServerWideOnly)]
+        public string[] WellKnownIssuers { get; set; }
 
-        [Description("Well known issuer 'Public Key Pinning Hashes' that will be used to validate a new client certificate when the issuer's certificate has changed.")]
+
+        [Description("OBSOLETE: This is no longer supported or used, use 'Security.WellKnownIssuers.Admin' instead.")]
         [DefaultValue(null)]
         [ConfigurationEntry("Security.WellKnownIssuerHashes.Admin", ConfigurationEntryScope.ServerWideOnly)]
         public string[] WellKnownIssuerHashes { get; set; }
@@ -176,6 +183,33 @@ namespace Raven.Server.Config.Categories
         [DefaultValue(true)]
         [ConfigurationEntry("Security.Certificate.Validation.KeyUsages", ConfigurationEntryScope.ServerWideOnly)]
         public bool CertificateValidationKeyUsages { get; set; }
+        
+        [Description("Indicates if CSRF filter is enabled or not. Default: true")]
+        [DefaultValue(true)]
+        [ConfigurationEntry("Security.Csrf.Enabled", ConfigurationEntryScope.ServerWideOnly)]
+        public bool EnableCsrfFilter { get; set; }
+        
+        [Description("List of Trusted Origins for CSRF filter")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Security.Csrf.TrustedOrigins", ConfigurationEntryScope.ServerWideOnly)]
+        public string[] CsrfTrustedOrigins { get; set; }
+        
+        [Description("List of Request Headers to look for Origin, ex. X-Forwarded-Host")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Security.Csrf.AdditionalOriginHeaders", ConfigurationEntryScope.ServerWideOnly)]
+        public string[] CsrfAdditionalOriginHeaders { get; set; }
+        
+        [Description("Default (in minutes) two-factor session duration")]
+        [DefaultValue(120)]
+        [TimeUnit(TimeUnit.Minutes)]
+        [ConfigurationEntry("Security.TwoFactor.DefaultSessionDurationInMin", ConfigurationEntryScope.ServerWideOnly)]
+        public TimeSetting DefaultTwoFactorSessionDuration { get; set; }
+        
+        [Description("Maximum (in minutes) two-factor session duration")]
+        [DefaultValue(1440)]
+        [TimeUnit(TimeUnit.Minutes)]
+        [ConfigurationEntry("Security.TwoFactor.MaxSessionDurationInMin", ConfigurationEntryScope.ServerWideOnly)]
+        public TimeSetting MaxTwoFactorSessionDuration { get; set; }
 
         internal bool? IsUnsecureAccessSetupValid { get; private set; }
 

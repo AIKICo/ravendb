@@ -347,7 +347,7 @@ interface replicationConflictListItemDto {
     ConflictsPerDocument: number;
 }
 
-type databaseDisconnectionCause = "Error" | "DatabaseDeleted" | "DatabaseDisabled" | "ChangingDatabase" | "DatabaseIsNotRelevant";
+type databaseDisconnectionCause = "Error" | "DatabaseDeleted" | "DatabaseDisabled" | "ChangingDatabase" | "DatabaseIsNotRelevant" | "DatabaseRestarted";
 
 type querySortType = "Ascending" | "Descending" | "Range Ascending" | "Range Descending";
 
@@ -526,6 +526,7 @@ type legacyEncryptionAlgorithms = "DES" | "RC2" | "Rijndael" | "Triple DES";
 interface unifiedCertificateDefinition extends Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition {
     Thumbprints: Array<string>;
     Visible: KnockoutObservable<boolean>;
+    HasTwoFactor: boolean;
 }
 
 type dashboardChartTooltipProviderArgs = {
@@ -687,13 +688,18 @@ interface textColumnOpts<T> {
     sortable?: "number" | "string" | valueProvider<T>;
     defaultSortOrder?: sortMode;
     customComparator?: (a: any, b: any) => number;
-    transformValue?: (a: any) => any;
+    transformValue?: ((a: any, item: T) => any) | ((a: any) => any);
 }
 
 interface hypertextColumnOpts<T> extends textColumnOpts<T> {
     handler?: (item: T, event: JQueryEventObject) => void;
     extraClassForLink?: (item: T) => string;
     openInNewTab?: (item: T) => boolean;
+}
+
+interface multiNodeTagsColumnOpts<T> extends textColumnOpts<T> {
+    nodeHrefAccessor?: (item: T, nodeTag: string) => string;
+    nodeLinkTitleAccessor?: (item: T, nodeTag: string) => string;
 }
 
 type timeSeriesColumnEventType = "plot" | "preview";
@@ -909,6 +915,12 @@ interface iconPlusText {
     text: string;
     textClass?: string;
     title?: string;
+}
+
+interface ConfigureMicrosoftLogsDialogResult {
+    isEnabled: boolean;
+    configuration: object;
+    persist: boolean;
 }
 
 interface columnPreviewFeature {

@@ -45,7 +45,6 @@ public class SpatialMatch : IQueryMatch
             ? SpatialUtils.GetGeohashesForQueriesOutsideShape(_indexSearcher, tree, allocator, spatialContext, shape).GetEnumerator() 
             : SpatialUtils.GetGeohashesForQueriesInsideShape(_indexSearcher, tree, allocator, spatialContext, shape).GetEnumerator();
         GoNextMatch();
-        DebugStuff.RenderAndShow(tree);
     }
 
     private bool GoNextMatch()
@@ -56,11 +55,11 @@ public class SpatialMatch : IQueryMatch
             _startsWithDisposeHandler?.Dispose();
             _startsWithDisposeHandler = Slice.From(_allocator, result.Geohash, out var term);
             _isTermMatch = result.isTermMatch;
-            _currentMatch = _indexSearcher.TermQuery(_tree, term);
+            _currentMatch = _indexSearcher.TermQuery(_field, term, _tree);
 
             return true;
         }
-        _currentMatch = TermMatch.CreateEmpty(_indexSearcher.Allocator);
+        _currentMatch = TermMatch.CreateEmpty(_indexSearcher, _indexSearcher.Allocator);
         return false;
     }
 
@@ -167,7 +166,7 @@ public class SpatialMatch : IQueryMatch
         return currentIdx;
     }
 
-    public void Score(Span<long> matches, Span<float> scores)
+    public void Score(Span<long> matches, Span<float> scores, float boostFactor)
     {
         throw new NotImplementedException();
     }

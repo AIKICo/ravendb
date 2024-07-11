@@ -4,12 +4,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using FastTests;
 using FastTests.Server.Replication;
 using Raven.Client.Documents.Indexes.TimeSeries;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -200,7 +200,7 @@ namespace SlowTests.Server.Documents.TimeSeries
             {
                 var backupPath = NewDataPath(suffix: "BackupFolder");
                 var config = Backup.CreateBackupConfiguration(backupPath, incrementalBackupFrequency: "0 0 1 1 *");
-                var result = await store.Maintenance.SendAsync(new UpdatePeriodicBackupOperation(config));
+                var taskId = await Backup.UpdateConfigAsync(Server, config, store);
 
                 using (var session = store.OpenSession())
                 {
@@ -256,7 +256,7 @@ namespace SlowTests.Server.Documents.TimeSeries
                 }
                 Assert.True(c > 0);
 
-                await Backup.RunBackupInClusterAsync(store, result.TaskId, isFullBackup: true);
+                await Backup.RunBackupInClusterAsync(store, taskId, isFullBackup: true);
                 await cleaner.ExecuteCleanup();
 
                 c = 0;

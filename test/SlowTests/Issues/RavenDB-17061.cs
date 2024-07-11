@@ -1,4 +1,5 @@
-﻿using System.Linq;
+﻿using System;
+using System.Linq;
 using System.Threading.Tasks;
 using FastTests;
 using Raven.Client.Documents;
@@ -6,6 +7,7 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Session;
 using SlowTests.Core.Utils.Entities;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -17,10 +19,11 @@ namespace SlowTests.Issues
         {
         }
 
-        [Fact]
-        public async Task Can_project_when_the_document_is_missing()
+        [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+        public async Task Can_project_when_the_document_is_missing(Options options)
         {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             {
                 const string name = "Grisha";
                 string userId;
@@ -52,7 +55,11 @@ namespace SlowTests.Issues
                     Assert.Equal(1, stats.TotalResults);
                     Assert.Equal(0, stats.SkippedResults);
                     Assert.Equal(1, users.Count);
-                    Assert.Equal(userId, users[0]);
+                    
+                    var idComparer = options.SearchEngineMode is RavenSearchEngineMode.Corax 
+                        ? StringComparer.OrdinalIgnoreCase 
+                        : StringComparer.Ordinal;
+                    Assert.Equal(userId, users[0], comparer: idComparer);
                 }
 
                 await store.Maintenance.SendAsync(new StopIndexOperation(stats.IndexName));
@@ -72,16 +79,18 @@ namespace SlowTests.Issues
                         .ToListAsync();
 
                     Assert.Equal(1, stats.TotalResults);
-                    Assert.Equal(1, stats.SkippedResults);
-                    Assert.Equal(0, users.Count);
+                    //Corax only: This is not valid since Corax's AutoIndexes are stored. 
+                    Assert.Equal(options.SearchEngineMode is RavenSearchEngineMode.Corax ? 0 : 1, stats.SkippedResults);
+                    Assert.Equal(options.SearchEngineMode is RavenSearchEngineMode.Corax ? 1 : 0, users.Count);
                 }
             }
         }
 
-        [Fact]
-        public async Task Can_project_when_the_document_is_missing_with_index()
+        [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+        public async Task Can_project_when_the_document_is_missing_with_index(Options options)
         {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             {
                 var index = new UserIndex();
                 await index.ExecuteAsync(store);
@@ -103,6 +112,11 @@ namespace SlowTests.Issues
 
                 Indexes.WaitForIndexing(store);
 
+                var isCorax = options.SearchEngineMode is RavenSearchEngineMode.Corax;
+                var idComparer = isCorax
+                    ? StringComparer.OrdinalIgnoreCase 
+                    : StringComparer.Ordinal;
+                
                 using (var session = store.OpenAsyncSession())
                 {
                     var users = await session.Query<User, UserIndex>()
@@ -114,7 +128,7 @@ namespace SlowTests.Issues
                     Assert.Equal(1, stats.TotalResults);
                     Assert.Equal(0, stats.SkippedResults);
                     Assert.Equal(1, users.Count);
-                    Assert.Equal(userId, users[0]);
+                    Assert.Equal(userId, users[0], comparer: idComparer);
                 }
 
                 await store.Maintenance.SendAsync(new StopIndexOperation(index.IndexName));
@@ -136,7 +150,7 @@ namespace SlowTests.Issues
                     Assert.Equal(1, stats.TotalResults);
                     Assert.Equal(0, stats.SkippedResults);
                     Assert.Equal(1, users.Count);
-                    Assert.Equal(name, users[0]);
+                    Assert.Equal(name, users[0], idComparer);
                 }
 
                 using (var session = store.OpenAsyncSession())
@@ -146,10 +160,10 @@ namespace SlowTests.Issues
                         .Where(x => x.Name == name)
                         .Select(x => x.Id) // projected from the document
                         .ToListAsync();
-
+                    WaitForUserToContinueTheTest(store);
                     Assert.Equal(1, stats.TotalResults);
-                    Assert.Equal(1, stats.SkippedResults);
-                    Assert.Equal(0, users.Count);
+                    Assert.Equal(isCorax ? 0 : 1, stats.SkippedResults);
+                    Assert.Equal(isCorax ? 1 : 0, users.Count);
                 }
 
                 using (var session = store.OpenAsyncSession())
@@ -165,16 +179,17 @@ namespace SlowTests.Issues
                         .ToListAsync();
 
                     Assert.Equal(1, stats.TotalResults);
-                    Assert.Equal(1, stats.SkippedResults);
-                    Assert.Equal(0, users.Count);
+                    Assert.Equal(isCorax ? 0 : 1, stats.SkippedResults);
+                    Assert.Equal(isCorax ? 1 : 0, users.Count);
                 }
             }
         }
 
-        [Fact]
-        public async Task Can_project_when_mixed_stored_options_in_index()
+        [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
+        public async Task Can_project_when_mixed_stored_options_in_index(Options options)
         {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             {
                 var index = new UserIndexPartialStore();
                 await index.ExecuteAsync(store);
@@ -233,7 +248,8 @@ namespace SlowTests.Issues
                         .Select(user => new
                         {
                             user.Name, // stored field
-                            user.LastName // not stored field
+                            user.LastName, // not stored field
+                            user.AddressId //made-up field for corax, has no impact on lucene projection
                         })
                         .ToListAsync();
 

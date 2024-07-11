@@ -46,6 +46,8 @@ namespace Raven.Server.Documents.Patch
 {
     public class ScriptRunner
     {
+        private static readonly string MaxStepsForScriptConfigurationKey = RavenConfiguration.GetKey(x => x.Patching.MaxStepsForScript);
+
         public class Holder
         {
             public ScriptRunner Parent;
@@ -105,7 +107,7 @@ namespace Raven.Server.Documents.Patch
             TimeSeriesDeclaration.Add(func.Name, func);
         }
 
-        public ReturnRun GetRunner(out SingleRun run)
+        public ReturnRun GetRunner(bool ignoreValidationErrors, out SingleRun run)
         {
             _lastRun = DateTime.UtcNow;
             Interlocked.Increment(ref Runs);
@@ -127,7 +129,7 @@ namespace Raven.Server.Documents.Patch
                 }
                 else
                 {
-                    holder.Value = new SingleRun(_db, _configuration, this, ScriptsSource);
+                    holder.Value = new SingleRun(_db, _configuration, this, ScriptsSource, ignoreValidationErrors);
                 }
             }
 
@@ -217,7 +219,7 @@ namespace Raven.Server.Documents.Patch
 
             public string OriginalDocumentId;
             public bool RefreshOriginalDocument;
-            private readonly ConcurrentLruRegexCache _regexCache = new ConcurrentLruRegexCache(1024);
+            private readonly ConcurrentLruRegexCache _regexCache;
             public HashSet<string> DocumentCountersToUpdate;
             public HashSet<string> DocumentTimeSeriesToUpdate;
             public JavaScriptUtils JavaScriptUtils;
@@ -225,10 +227,11 @@ namespace Raven.Server.Documents.Patch
             private const string _timeSeriesSignature = "timeseries(doc, name)";
             public const string GetMetadataMethod = "getMetadata";
 
-            public SingleRun(DocumentDatabase database, RavenConfiguration configuration, ScriptRunner runner, List<string> scriptsSource)
+            public SingleRun(DocumentDatabase database, RavenConfiguration configuration, ScriptRunner runner, List<string> scriptsSource, bool ignoreValidationErrors)
             {
                 _database = database;
                 _configuration = configuration;
+                _regexCache = new(ConcurrentLruRegexCache.DefaultCapacity, configuration.Queries.RegexTimeout.AsTimeSpan);
                 _runner = runner;
                 ScriptEngine = new Engine(options =>
                 {
@@ -248,6 +251,9 @@ namespace Raven.Server.Documents.Patch
                 ScriptEngine.SetValue(GetMetadataMethod, new ClrFunctionInstance(ScriptEngine, GetMetadataMethod, JavaScriptUtils.GetMetadata));
                 ScriptEngine.SetValue("metadataFor", new ClrFunctionInstance(ScriptEngine, GetMetadataMethod, JavaScriptUtils.GetMetadata));
                 ScriptEngine.SetValue("id", new ClrFunctionInstance(ScriptEngine, "id", JavaScriptUtils.GetDocumentId));
+                ScriptEngine.SetValue("count", new ClrFunctionInstance(ScriptEngine, "count", JavaScriptUtils.Count));
+                ScriptEngine.SetValue("key", new ClrFunctionInstance(ScriptEngine, "key", JavaScriptUtils.Key));
+                ScriptEngine.SetValue("sum", new ClrFunctionInstance(ScriptEngine, "sum", JavaScriptUtils.Sum));
 
                 ScriptEngine.SetValue("output", new ClrFunctionInstance(ScriptEngine, "output", OutputDebug));
 
@@ -319,7 +325,8 @@ namespace Raven.Server.Documents.Patch
                     }
                     catch (Exception e)
                     {
-                        throw new JavaScriptParseException("Failed to parse: " + Environment.NewLine + script, e);
+                        if (ignoreValidationErrors == false)
+                            throw new JavaScriptParseException("Failed to parse: " + Environment.NewLine + script, e);
                     }
                 }
 
@@ -920,10 +927,10 @@ namespace Raven.Server.Documents.Patch
                 return Undefined.Instance;
             }
 
-            private JsValue Spatial_Distance(JsValue self, JsValue[] args)
+            private static JsValue Spatial_Distance(JsValue self, JsValue[] args)
             {
-                if (args.Length < 4 && args.Length > 5)
-                    throw new ArgumentException("Called with expected number of arguments, expected: spatial.distance(lat1, lng1, lat2, lng2, kilometers | miles | cartesian)");
+                if (args.Length is < 4 or > 6)
+                    throw new ArgumentException("Called with unexpected number of arguments, expected: spatial.distance(lat1, lng1, lat2, lng2, kilometers | miles | cartesian)");
 
                 for (int i = 0; i < 4; i++)
                 {
@@ -1053,7 +1060,7 @@ namespace Raven.Server.Documents.Patch
                 {
                     reader = JsBlittableBridge.Translate(_jsonCtx, ScriptEngine, args[1].AsObject(), usageMode: BlittableJsonDocumentBuilder.UsageMode.ToDisk);
 
-                    var put = _database.DocumentsStorage.Put(
+                    var putResult = _database.DocumentsStorage.Put(
                         _docsCtx,
                         id,
                         _docsCtx.GetLazyString(changeVector),
@@ -1062,19 +1069,21 @@ namespace Raven.Server.Documents.Patch
                         nonPersistentFlags: NonPersistentDocumentFlags.ResolveAttachmentsConflict | NonPersistentDocumentFlags.ResolveCountersConflict | NonPersistentDocumentFlags.ResolveTimeSeriesConflict
                     );
 
+                    _database.HugeDocuments.AddIfDocIsHuge(putResult.Id, reader.Size);
+
                     if (DebugMode)
                     {
                         DebugActions.PutDocument.Add(new DynamicJsonValue
                         {
-                            ["Id"] = put.Id,
+                            ["Id"] = putResult.Id,
                             ["Data"] = reader
                         });
                     }
 
-                    if (RefreshOriginalDocument == false && string.Equals(put.Id, OriginalDocumentId, StringComparison.OrdinalIgnoreCase))
+                    if (RefreshOriginalDocument == false && string.Equals(putResult.Id, OriginalDocumentId, StringComparison.OrdinalIgnoreCase))
                         RefreshOriginalDocument = true;
 
-                    return put.Id;
+                    return putResult.Id;
                 }
                 finally
                 {
@@ -1937,15 +1946,23 @@ namespace Raven.Server.Documents.Patch
 
                 try
                 {
+                    JavaScriptUtils.CurrentlyProcessedObject = _args[0];
                     var call = ScriptEngine.GetValue(method).TryCast<ICallable>();
                     var result = call.Call(Undefined.Instance, _args);
                     return new ScriptRunnerResult(this, result);
+                }
+                catch (StatementsCountOverflowException e)
+                {
+                    JavaScriptUtils.Clear();
+                    throw new  Raven.Client.Exceptions.Documents.Patching.JavaScriptException(
+                        $"The maximum number of statements executed have been reached - {_configuration.Patching.MaxStepsForScript}. You can configure it by modifying the configuration option: '{MaxStepsForScriptConfigurationKey}'.",
+                        e);
                 }
                 catch (JavaScriptException e)
                 {
                     //ScriptRunnerResult is in charge of disposing of the disposable but it is not created (the clones did)
                     JavaScriptUtils.Clear();
-                    throw CreateFullError(e);
+                    throw CreateFullError(documentId, e);
                 }
                 catch (Exception)
                 {
@@ -1954,6 +1971,7 @@ namespace Raven.Server.Documents.Patch
                 }
                 finally
                 {
+                    JavaScriptUtils.CurrentlyProcessedObject = null;
                     _refResolver.ExplodeArgsOn(null, null);
                     _scope = null;
                     _loadScope = null;
@@ -1969,7 +1987,7 @@ namespace Raven.Server.Documents.Patch
                 if (_args.Length != args.Length)
                     _args = new JsValue[args.Length];
                 for (var i = 0; i < args.Length; i++)
-                    _args[i] = JavaScriptUtils.TranslateToJs(ScriptEngine, jsonCtx, args[i]);
+                    _args[i] = JavaScriptUtils.TranslateToJs(ScriptEngine, jsonCtx, args[i], needsClone: false);
 
                 if (method != QueryMetadata.SelectOutput &&
                     _args.Length == 2 &&
@@ -1985,17 +2003,17 @@ namespace Raven.Server.Documents.Patch
                 throw new ArgumentNullException("jsonCtx");
             }
 
-            private Client.Exceptions.Documents.Patching.JavaScriptException CreateFullError(JavaScriptException e)
+            private Client.Exceptions.Documents.Patching.JavaScriptException CreateFullError(string documentId, JavaScriptException e)
             {
-                string msg;
+                string msg = $"Script failed for document ID '{documentId}'. ";
                 if (e.Error.IsString())
-                    msg = e.Error.AsString();
+                    msg += e.Error.AsString();
                 else if (e.Error.IsObject())
-                    msg = JsBlittableBridge.Translate(_jsonCtx, ScriptEngine, e.Error.AsObject()).ToString();
+                    msg += JsBlittableBridge.Translate(_jsonCtx, ScriptEngine, e.Error.AsObject()).ToString();
                 else
-                    msg = e.Error.ToString();
+                    msg += e.Error.ToString();
 
-                msg = "At " + e.Column + ":" + e.LineNumber + " " + msg;
+                msg += " At " + e.Column + ":" + e.LineNumber + " " + msg;
                 var javaScriptException = new Client.Exceptions.Documents.Patching.JavaScriptException(msg, e);
                 return javaScriptException;
             }
@@ -2058,7 +2076,12 @@ namespace Raven.Server.Documents.Patch
                 {
                     if (val.IsNull())
                         return null;
-                    return JsBlittableBridge.Translate(context, ScriptEngine, val.AsObject(), modifier, usageMode, isNested);
+                    
+                    var instance = val.AsObject();
+                    if (instance is BlittableObjectInstance boi && boi.TryGetOriginalDocumentIfUnchanged(out var doc))
+                        return doc;
+                    
+                    return JsBlittableBridge.Translate(context, ScriptEngine, instance, modifier, usageMode, isNested);
                 }
                 if (val.IsNumber())
                     return val.AsNumber();

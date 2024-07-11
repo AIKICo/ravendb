@@ -41,7 +41,7 @@ namespace Raven.Client.Documents.Operations.ETL
         public List<Transformation> Transforms { get; set; } = new List<Transformation>();
 
         public bool Disabled { get; set; }
-
+        
         public virtual bool Validate(out List<string> errors, bool validateName = true, bool validateConnection = true)
         {
             if (validateConnection && _initialized == false)
@@ -127,6 +127,11 @@ namespace Raven.Client.Documents.Operations.ETL
             };
 
             return result;
+        }
+
+        public virtual DynamicJsonValue ToAuditJson()
+        {
+            return ToJson();
         }
 
         internal EtlConfigurationCompareDifferences Compare(EtlConfiguration<T> config, List<(string TransformationName, EtlConfigurationCompareDifferences Difference)> transformationDiffs = null)

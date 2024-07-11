@@ -44,7 +44,7 @@ namespace Raven.Server.Documents
                 await using (var readersItr = readers.GetAsyncEnumerator())
                 {
                     await ReadStartRecordingDetailsAsync(readersItr, context, peepingTomStream);
-                    while (await readersItr.MoveNextAsync())
+                    while (await readersItr.MoveNextAsync().ConfigureAwait(true))
                     {
                         using (readersItr.Current)
                         {
@@ -143,7 +143,7 @@ namespace Raven.Server.Documents
                     throw new ReplayTransactionsException($"Can't read {nameof(RecordingDetails.Type)} of replay detail", peepingTomStream);
                 }
 
-                if (string.IsNullOrEmpty(startDetail.Type))
+                if (string.IsNullOrEmpty(startDetail.Version))
                 {
                     throw new ReplayTransactionsException($"Can't read {nameof(StartRecordingDetails.Version)} of replay instructions", peepingTomStream);
                 }

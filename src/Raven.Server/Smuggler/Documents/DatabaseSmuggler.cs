@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Smuggler;
 using Raven.Client.ServerWide;
 using Raven.Client.Util;
@@ -87,7 +88,7 @@ namespace Raven.Server.Smuggler.Documents
 
             using (_patcher?.Initialize())
             using (var initializeResult = await _source.InitializeAsync(_options, result))
-            await using (_destination.InitializeAsync(_options, result, initializeResult.BuildNumber))
+            await using (_destination.InitializeAsync(_options, result, _onProgress, initializeResult.BuildNumber))
             {
                 ModifyV41OperateOnTypes(initializeResult.BuildNumber, isLastFile);
 
@@ -131,7 +132,7 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        public static void EnsureProcessed(SmugglerResult result, bool skipped = true)
+        public static void EnsureProcessed(SmugglerResult result, bool skipped = true, bool? indexesSkipped = null)
         {
             EnsureStepProcessed(result.DatabaseRecord, skipped);
             EnsureStepProcessed(result.Documents, skipped);
@@ -141,7 +142,7 @@ namespace Raven.Server.Smuggler.Documents
             EnsureStepProcessed(result.Counters, skipped);
             EnsureStepProcessed(result.Tombstones, skipped);
             EnsureStepProcessed(result.Conflicts, skipped);
-            EnsureStepProcessed(result.Indexes, skipped);
+            EnsureStepProcessed(result.Indexes, indexesSkipped ?? skipped);
             EnsureStepProcessed(result.Identities, skipped);
             EnsureStepProcessed(result.CompareExchange, skipped);
             EnsureStepProcessed(result.CompareExchangeTombstones, skipped);
@@ -185,7 +186,7 @@ namespace Raven.Server.Smuggler.Documents
                 }
             }
 
-            result.AddInfo($"Started processing {type}.");
+            result.StartProcessingForType(type);
             _onProgress.Invoke(result.Progress);
 
             SmugglerProgressBase.Counts counts;
@@ -261,6 +262,10 @@ namespace Raven.Server.Smuggler.Documents
                     counts = await ProcessTimeSeriesAsync(result);
                     break;
 
+                case DatabaseItemType.TimeSeriesDeletedRanges:
+                    counts = await ProcessTimeSeriesDeletedRangesAsync(result);
+                    break;
+
                 default:
                     throw new ArgumentOutOfRangeException(nameof(type), type, null);
             }
@@ -286,7 +291,7 @@ namespace Raven.Server.Smuggler.Documents
                 }
             }
 
-            result.AddInfo($"Finished processing {type}. {counts}");
+            result.StopProcessingActualType(counts);
             _onProgress.Invoke(result.Progress);
         }
 
@@ -376,6 +381,10 @@ namespace Raven.Server.Smuggler.Documents
 
                 case DatabaseItemType.ReplicationHubCertificates:
                     counts = result.ReplicationHubCertificates;
+                    break;
+
+                case DatabaseItemType.TimeSeriesDeletedRanges:
+                    counts = result.TimeSeriesDeletedRanges;
                     break;
 
                 default:
@@ -626,7 +635,7 @@ namespace Raven.Server.Smuggler.Documents
 
                 try
                 {
-                    await actions.WriteDatabaseRecordAsync(databaseRecord, result.DatabaseRecord, _options.AuthorizationStatus, _options.OperateOnDatabaseRecordTypes);
+                    await actions.WriteDatabaseRecordAsync(databaseRecord, result, _options.AuthorizationStatus, _options.OperateOnDatabaseRecordTypes);
                 }
                 catch (Exception e)
                 {
@@ -660,15 +669,29 @@ namespace Raven.Server.Smuggler.Documents
 
                     Debug.Assert(item.Document.Id != null);
 
-                    item.Document.NonPersistentFlags |= NonPersistentDocumentFlags.FromSmuggler;
+                    var shouldSkip = ShouldSkip(item, _patcher);
 
-                    await actions.WriteDocumentAsync(item, result.RevisionDocuments);
+                    if (shouldSkip == false)
+                    {
+                        item.Document.NonPersistentFlags |= NonPersistentDocumentFlags.FromSmuggler;
+
+                        await actions.WriteDocumentAsync(item, result.RevisionDocuments);
+                    }
+                    else
+                    {
+                        SkipDocument(item, result.RevisionDocuments);
+                    }
 
                     result.RevisionDocuments.LastEtag = item.Document.Etag;
                 }
             }
 
             return result.RevisionDocuments;
+
+            static bool ShouldSkip(DocumentItem item, SmugglerPatcher patcher)
+            {
+                return patcher != null && patcher.ShouldSkip(item.Document.Id);
+            }
         }
 
         private async Task<SmugglerProgressBase.Counts> ProcessDocumentsAsync(SmugglerResult result, BuildVersionType buildType)
@@ -682,6 +705,7 @@ namespace Raven.Server.Smuggler.Documents
             await using (var compareExchangeActions = _destination.CompareExchange(context, BackupKind, withDocuments: true))
             {
                 List<string> legacyIdsToDelete = null;
+                Func<ValueTask> beforeFlush = compareExchangeActions == null ? null : compareExchangeActions.FlushAsync;
 
                 await foreach (DocumentItem item in _source.GetDocumentsAsync(_options.Collections, documentActions))
                 {
@@ -720,33 +744,36 @@ namespace Raven.Server.Smuggler.Documents
 
                     if (CanSkipDocument(item.Document, buildType))
                     {
-                        SkipDocument(item, result);
+                        SkipDocument(item, result.Documents);
                         continue;
                     }
 
                     if (_options.IncludeExpired == false &&
                         ExpirationStorage.HasPassed(item.Document.Data, _time.GetUtcNow()))
                     {
-                        SkipDocument(item, result);
+                        SkipDocument(item, result.Documents);
                         continue;
                     }
 
                     if (_options.IncludeArtificial == false && item.Document.Flags.HasFlag(DocumentFlags.Artificial))
                     {
-                        SkipDocument(item, result);
+                        SkipDocument(item, result.Documents);
                         continue;
                     }
 
                     if (_patcher != null)
                     {
-                        item.Document = _patcher.Transform(item.Document);
-                        if (item.Document == null)
+                        var patchedDocument = _patcher.Transform(item.Document);
+                        if (patchedDocument == null)
                         {
-                            result.Documents.SkippedCount++;
+                            SkipDocument(item, result.Documents);
+
                             if (result.Documents.SkippedCount % 1000 == 0)
                                 AddInfoToSmugglerResult(result, $"Skipped {result.Documents.SkippedCount:#,#;;0} documents.");
                             continue;
                         }
+
+                        item.Document = patchedDocument;
                     }
 
                     SetDocumentOrTombstoneFlags(ref item.Document.Flags, ref item.Document.NonPersistentFlags, buildType);
@@ -761,7 +788,7 @@ namespace Raven.Server.Smuggler.Documents
                         continue;
                     }
 
-                    await documentActions.WriteDocumentAsync(item, result.Documents);
+                    await documentActions.WriteDocumentAsync(item, result.Documents, beforeFlush);
                 }
 
                 await TryHandleLegacyDocumentTombstonesAsync(legacyIdsToDelete, documentActions, result);
@@ -898,13 +925,25 @@ namespace Raven.Server.Smuggler.Documents
                     if (result.Counters.ReadCount % 1000 == 0)
                         AddInfoToSmugglerResult(result, $"Read {result.Counters.ReadCount:#,#;;0} counters.");
 
-                    await actions.WriteCounterAsync(counterGroup);
+                    var shouldSkip = ShouldSkip(counterGroup, _patcher);
+
+                    if (shouldSkip == false)
+                        await actions.WriteCounterAsync(counterGroup);
+                    else
+                    {
+                        result.Counters.SkippedCount++;
+                    }
 
                     result.Counters.LastEtag = counterGroup.Etag;
                 }
             }
 
             return result.Counters;
+
+            static bool ShouldSkip(CounterGroupDetail counterGroup, SmugglerPatcher patcher)
+            {
+                return patcher != null && patcher.ShouldSkip(counterGroup.DocumentId);
+            }
         }
 
         private async Task<SmugglerProgressBase.Counts> ProcessLegacyCountersAsync(SmugglerResult result)
@@ -1164,7 +1203,7 @@ namespace Raven.Server.Smuggler.Documents
             await using (var actions = _destination.TimeSeries())
             {
                 var isFullBackup = _source.GetSourceType() == SmugglerSourceType.FullExport;
-                await foreach (var ts in _source.GetTimeSeriesAsync(_options.Collections))
+                await foreach (var ts in _source.GetTimeSeriesAsync(actions, _options.Collections))
                 {
                     _token.ThrowIfCancellationRequested();
                     result.TimeSeries.ReadCount += ts.Segment.NumberOfEntries;
@@ -1172,20 +1211,65 @@ namespace Raven.Server.Smuggler.Documents
                     if (result.TimeSeries.ReadCount % 1000 == 0)
                         AddInfoToSmugglerResult(result, $"Read {result.TimeSeries.ReadCount:#,#;;0} time series.");
 
-                    result.TimeSeries.LastEtag = ts.Etag;
-
-                    var shouldSkip = isFullBackup && ts.Segment.NumberOfLiveEntries == 0;
+                    var shouldSkip = ShouldSkip(ts, _patcher, isFullBackup);
                     if (shouldSkip == false)
                         await actions.WriteTimeSeriesAsync(ts);
+                    else
+                    {
+                        result.TimeSeries.SkippedCount += ts.Segment.NumberOfEntries;
+                    }
+
+                    result.TimeSeries.LastEtag = ts.Etag;
                 }
             }
 
             return result.TimeSeries;
+
+            static bool ShouldSkip(TimeSeriesItem ts, SmugglerPatcher patcher, bool isFullBackup)
+            {
+                if (isFullBackup && ts.Segment.NumberOfLiveEntries == 0)
+                    return true;
+
+                return patcher != null && patcher.ShouldSkip(ts.DocId);
+            }
         }
 
-        private static void SkipDocument(DocumentItem item, SmugglerResult result)
+        protected virtual async Task<SmugglerProgressBase.Counts> ProcessTimeSeriesDeletedRangesAsync(SmugglerResult result)
         {
-            result.Documents.SkippedCount++;
+            result.TimeSeriesDeletedRanges.Start();
+
+            await using (var actions = _destination.TimeSeriesDeletedRanges())
+            {
+                await foreach (var deletedRange in _source.GetTimeSeriesDeletedRangesAsync(actions, _options.Collections))
+                {
+                    _token.ThrowIfCancellationRequested();
+                    result.TimeSeriesDeletedRanges.ReadCount++;
+
+                    if (result.TimeSeriesDeletedRanges.ReadCount % 1000 == 0)
+                        AddInfoToSmugglerResult(result, $"Time Series deleted ranges entries {result.TimeSeriesDeletedRanges}");
+
+                    if (ShouldSkip(deletedRange, _patcher) == false) 
+                        await actions.WriteTimeSeriesDeletedRangeAsync(deletedRange);
+                    
+                    else
+                        result.TimeSeriesDeletedRanges.SkippedCount++;
+                    
+                    result.TimeSeriesDeletedRanges.LastEtag = deletedRange.Etag;
+                }
+            }
+
+            return result.TimeSeriesDeletedRanges;
+
+            static bool ShouldSkip(TimeSeriesDeletedRangeItemForSmuggler deletedRange, SmugglerPatcher patcher)
+            {
+                return patcher != null && patcher.ShouldSkip(deletedRange.DocId);
+            }
+        }
+
+
+        private static void SkipDocument(DocumentItem item, SmugglerProgressBase.CountsWithSkippedCountAndLastEtagAndAttachments counts)
+        {
+            counts.SkippedCount++;
 
             if (item.Document != null)
             {

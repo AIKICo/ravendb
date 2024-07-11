@@ -25,6 +25,8 @@ namespace Raven.Server.NotificationCenter
 
         private readonly ConcurrentQueue<(string indexName, IndexingReferenceLoadWarning.WarningDetails warningDetails)> _warningReferenceDocumentLoadsQueue =  new();
 
+        private MismatchedReferencesLoadWarning _mismatchedReferencesLoadWarning;
+
         private Timer _indexingTimer;
         private readonly Logger _logger;
         private readonly object _locker = new object();
@@ -66,6 +68,16 @@ namespace Raven.Server.NotificationCenter
 
             EnsureTimer();
         }
+        
+        public void AddWarning(MismatchedReferencesLoadWarning mismatchedReferenceLoadWarningDetails)
+        {
+            if (CanAdd(out DateTime now) == false)
+                return;
+            
+            _mismatchedReferencesLoadWarning = mismatchedReferenceLoadWarningDetails;
+
+            EnsureTimer();
+        }
 
         private bool CanAdd(out DateTime now)
         {
@@ -98,7 +110,7 @@ namespace Raven.Server.NotificationCenter
         {
             try
             {
-                if (_warningIndexOutputsPerDocumentQueue.IsEmpty && _warningReferenceDocumentLoadsQueue.IsEmpty)
+                if (_warningIndexOutputsPerDocumentQueue.IsEmpty && _warningReferenceDocumentLoadsQueue.IsEmpty && _mismatchedReferencesLoadWarning == null)
                     return;
 
                 PerformanceHint indexOutputPerDocumentHint = null;
@@ -126,6 +138,12 @@ namespace Raven.Server.NotificationCenter
 
                 if (referenceLoadsHint != null)
                     _notificationCenter.Add(referenceLoadsHint);
+                
+                if (_mismatchedReferencesLoadWarning != null)
+                {
+                    AlertRaised mismatchedReferencesAlert = GetMismatchedReferencesAlert();
+                    _notificationCenter.Add(mismatchedReferencesAlert);
+                }
             }
             catch (Exception e)
             {
@@ -165,6 +183,13 @@ namespace Raven.Server.NotificationCenter
                     "Please see Indexing Performance graph to check the performance of your indexes.",
                     PerformanceHintType.Indexing_References, NotificationSeverity.Warning, Source, details);
             }
+        }
+        
+        private AlertRaised GetMismatchedReferencesAlert()
+        {
+            return AlertRaised.Create(_database, $"Loading documents with mismatched collection name in '{_mismatchedReferencesLoadWarning.IndexName}' index",
+                "We have detected usage of LoadDocument(doc, collectionName) where loaded document collection is different than given parameter.",
+                AlertType.MismatchedReferenceLoad, NotificationSeverity.Warning, Source, _mismatchedReferencesLoadWarning);
         }
 
         public void Dispose()

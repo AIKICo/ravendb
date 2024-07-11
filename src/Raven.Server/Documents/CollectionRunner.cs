@@ -47,7 +47,7 @@ namespace Raven.Server.Documents
             BlittableJsonReaderObject patchArgs, Action<IOperationProgress> onProgress, OperationCancelToken token)
         {
             return ExecuteOperation(collectionName, start, take, options, Context, onProgress,
-                key => new PatchDocumentCommand(Context, key, expectedChangeVector: null, skipPatchIfChangeVectorMismatch: false, patch: (patch, patchArgs), patchIfMissing: (null, null), createIfMissing: null, Database, isTest: false, debugMode: false, collectResultsNeeded: false, returnDocument: false), token);
+                key => new PatchDocumentCommand(Context, key, expectedChangeVector: null, skipPatchIfChangeVectorMismatch: false, patch: (patch, patchArgs), patchIfMissing: (null, null), createIfMissing: null, Database, isTest: false, debugMode: false, collectResultsNeeded: false, returnDocument: false, options.IgnoreMaxStepsForScript), token);
         }
 
         protected async Task<IOperationResult> ExecuteOperation(string collectionName, long start, long take, CollectionOperationOptions options, DocumentsOperationContext context,
@@ -136,7 +136,6 @@ namespace Raven.Server.Documents
                     do
                     {
                         var command = new ExecuteRateLimitedOperations<string>(ids, action, rateGate, token,
-                            maxTransactionSize: 16 * Voron.Global.Constants.Size.Megabyte,
                             batchSize: OperationBatchSize);
 
                         await Database.TxMerger.Enqueue(command);
@@ -170,8 +169,8 @@ namespace Raven.Server.Documents
 
                 isStartsWithOrIdQuery = true;
 
-                return new CollectionQueryEnumerable(Database, Database.DocumentsStorage, SearchEngineType.None, new FieldsToFetch(_operationQuery, null),
-                    collectionName, _operationQuery, null, context, null, null, null, new Reference<int>(), new Reference<int>(), new Reference<long>(), token)
+                return new CollectionQueryEnumerable(Database, Database.DocumentsStorage, new FieldsToFetch(_operationQuery, null, IndexType.None),
+                    collectionName, _operationQuery, null, context, null, null, null, new Reference<long>(), new Reference<int>(), new Reference<long>(), token)
                 {
                     Fields = fields, StartAfterId = startAfterId, AlreadySeenIdsCount = alreadySeenIdsCount
                 };

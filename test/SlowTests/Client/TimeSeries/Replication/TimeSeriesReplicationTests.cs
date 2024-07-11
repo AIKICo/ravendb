@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using FastTests;
 using FastTests.Server.Replication;
 using Raven.Client;
 using Raven.Client.Documents;
@@ -12,6 +11,7 @@ using Raven.Server.Documents;
 using Raven.Server.ServerWide.Context;
 using SlowTests.Core.Utils.Entities;
 using Sparrow;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -1125,14 +1125,14 @@ namespace SlowTests.Client.TimeSeries.Replication
                 }
 
                 await SetupReplicationAsync(storeA, storeB);
-                EnsureReplicating(storeA, storeB);
+                await EnsureReplicatingAsync(storeA, storeB);
 
                 using (var session = storeB.OpenAsyncSession())
                 {
                     var user = await session.LoadAsync<User>("users/1");
 
                     var flags = session.Advanced.GetMetadataFor(user)[Constants.Documents.Metadata.Flags];
-                    Assert.Equal((DocumentFlags.HasTimeSeries).ToString(), flags);
+                    Assert.Equal((DocumentFlags.HasTimeSeries | DocumentFlags.Resolved).ToString(), flags);
                     var list = session.Advanced.GetTimeSeriesFor(user);
                     Assert.Equal(2, list.Count);
                 }
@@ -1166,7 +1166,7 @@ namespace SlowTests.Client.TimeSeries.Replication
                     var user = await session.LoadAsync<User>("users/1");
 
                     var flags = session.Advanced.GetMetadataFor(user)[Constants.Documents.Metadata.Flags];
-                    Assert.Equal((DocumentFlags.HasTimeSeries | DocumentFlags.HasCounters).ToString(), flags);
+                    Assert.Equal((DocumentFlags.HasTimeSeries | DocumentFlags.HasCounters | DocumentFlags.Resolved).ToString(), flags);
 
                     var ts = session.Advanced.GetTimeSeriesFor(user);
                     Assert.Equal(1, ts.Count);

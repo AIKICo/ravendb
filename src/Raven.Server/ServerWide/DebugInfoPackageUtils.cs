@@ -51,7 +51,7 @@ namespace Raven.Server.ServerWide
                 if (server.Certificate.Certificate != null)
                 {
                     Debug.Assert(feature != null);
-                    if (server.Router.CanAccessRoute(route, httpContext, databaseName, feature, out _))
+                    if (server.Router.CanAccessRoute(route, httpContext, databaseName, feature))
                     {
                         yield return route;
                     }
@@ -78,10 +78,10 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        public static async Task WriteDebugInfoTimesAsZipEntryAsync(Dictionary<string, TimeSpan> debugInfoTimeSpans, ZipArchive archive, string databaseName)
+        public static async Task WriteDebugInfoTimesAsZipEntryAsync(Dictionary<string, TimeSpan> debugInfoTimeSpans, ZipArchive archive, string prefix)
         {
-            var entryName = databaseName == null ? "server-wide-requestTimes" : $"{databaseName}-requestTimes";
-            var entry = archive.CreateEntry($"{entryName}.txt");
+            var entryName = GetOutputPathFromRouteInformation("requestTimes", prefix, "txt");
+            var entry = archive.CreateEntry(entryName);
             entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
 
             var sorted = debugInfoTimeSpans.OrderByDescending(o => o.Value);

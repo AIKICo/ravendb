@@ -547,7 +547,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         TSelf AddOrder<TValue>(Expression<Func<T, TValue>> propertySelector, bool descending = false, OrderingType ordering = OrderingType.String);
 
         /// <summary>
-        ///     Specifies a boost weight to the last where clause.
+        ///     Specifies a boost weight to the previous where clause.
         ///     The higher the boost factor, the more relevant the term will be.
         /// </summary>
         /// <param name="boost">
@@ -691,12 +691,12 @@ If you really want to do in memory filtering on the data returned from the query
         TSelf OrderByScoreDescending();
 
         /// <summary>
-        ///     Specifies a proximity distance for the phrase in the last where clause
+        ///     Specifies a proximity distance for the phrase in the last search clause
         /// </summary>
-        /// <param name="proximity">number of words within</param>
+        /// <param name="proximity">Number of terms between the search terms</param>
         /// <returns></returns>
         /// <remarks>
-        ///     http://lucene.apache.org/java/2_4_0/queryparsersyntax.html#Proximity%20Searches
+        ///     https://lucene.apache.org/core/2_9_4/queryparsersyntax.html#Proximity%20Searches
         /// </remarks>
         TSelf Proximity(int proximity);
 

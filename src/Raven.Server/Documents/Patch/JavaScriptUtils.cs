@@ -1,11 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Runtime.CompilerServices;
+using Esprima.Ast;
 using Jint;
 using Jint.Native;
 using Jint.Native.Array;
+using Jint.Native.Function;
 using Jint.Native.Global;
 using Jint.Native.Object;
 using Jint.Runtime;
@@ -13,11 +14,13 @@ using Lucene.Net.Store;
 using Raven.Client;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Queries.TimeSeries;
+using Raven.Client.Extensions;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Static;
 using Raven.Server.Documents.Indexes.Static.JavaScript;
 using Raven.Server.Documents.Queries.Results;
 using Raven.Server.Documents.Queries.Results.TimeSeries;
+using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 
@@ -38,7 +41,7 @@ namespace Raven.Server.Documents.Patch
         private readonly ScriptRunner _runner;
         private readonly List<IDisposable> _disposables = new List<IDisposable>();
         private readonly Engine _scriptEngine;
-        private static readonly Dictionary<object,object> EmptyMetadataDummy = new Dictionary<object, object>();
+        internal JsValue CurrentlyProcessedObject;
 
         public bool ReadOnly;
 
@@ -48,24 +51,114 @@ namespace Raven.Server.Documents.Patch
             _scriptEngine = engine;
         }
 
+        internal JsValue Count(JsValue self, JsValue[] args)
+        {
+            if (args.Length != 0 || (CurrentlyProcessedObject is not BlittableObjectInstance doc)) 
+            {
+                throw new InvalidOperationException("count() must be called without arguments");
+            }
+            
+            if (doc.Projection._query.Metadata.IsDynamic == false)
+            {
+                throw new InvalidOperationException("count() can only be used with dynamic index");
+            }
+            
+            var getResult = doc.TryGetValue(Constants.Documents.Indexing.Fields.CountFieldName, out var countValue);
+            
+            Debug.Assert(getResult, $"Expected to get '{Constants.Documents.Indexing.Fields.CountFieldName}' field in map-reduce result: {doc.Blittable}");
+            
+            return countValue;
+        }
+        
+        internal JsValue Key(JsValue self, JsValue[] args)
+        {
+            if (args.Length != 0 || (CurrentlyProcessedObject is not BlittableObjectInstance doc)) 
+            {
+                throw new InvalidOperationException("key() must be called without arguments");
+            }
+
+            if (doc.Projection._query.Metadata.IsDynamic == false)
+            {
+                throw new InvalidOperationException("key() can only be used with dynamic index");
+            }
+            
+            var groupByFields = doc.Projection._query.Metadata.GroupBy;
+
+            if (groupByFields.Length == 1)
+            {
+                var getResult = doc.TryGetValue(groupByFields[0].Name.Value, out var keyValue);
+                
+                Debug.Assert(getResult, $"Expected to get '{groupByFields[0].Name.Value}' field in map-reduce result: {doc.Blittable}");
+
+                return keyValue;
+            }
+
+            else
+            {
+                var res = new DynamicJsonValue();
+
+                foreach (var field in groupByFields)
+                {
+                    if (doc.Blittable.TryGetMember(field.Name.Value, out var keyValue))
+                        res.Properties.Add((field.Name.Value, keyValue));
+                }
+
+                var jsonFromCtx = Context.ReadObject(res, null);
+                JsValue resJs = TranslateToJs(_scriptEngine, Context, jsonFromCtx);
+
+                return resJs;
+            }
+        }
+        
+        internal JsValue Sum(JsValue self, JsValue[] args)
+        {
+            if (args.Length != 1 || CurrentlyProcessedObject is not BlittableObjectInstance doc)
+            {
+                throw new InvalidOperationException("sum(doc => doc.fieldName) must be called with a single arrow function expression argument");
+            }
+            
+            if (doc.Projection._query.Metadata.IsDynamic == false)
+            {
+                throw new InvalidOperationException("sum(doc => doc.fieldName) can only be used with dynamic index");
+            }
+
+            if (args[0] is ScriptFunctionInstance sfi)
+            {
+                if (sfi.FunctionDeclaration.ChildNodes[1] is StaticMemberExpression sme)
+                {
+                    if (sme.Property is Identifier identifier)
+                    { 
+                        var getResult = doc.TryGetValue(identifier.Name, out var sumValue);
+                        
+                        Debug.Assert(getResult, $"Expected to get '{identifier.Name}' field in map-reduce result: {doc.Blittable}");
+                        
+                        return sumValue;
+                    }
+                }
+            }
+
+            throw new InvalidOperationException("sum(doc => doc.fieldName) must be called with arrow function expression that points to field you want to aggregate");
+        }        
+
         internal JsValue GetMetadata(JsValue self, JsValue[] args)
         {
             if (args.Length != 1 && args.Length != 2 || //length == 2 takes into account Query Arguments that can be added to args
                 !(args[0].AsObject() is BlittableObjectInstance boi)) 
-            {
-                if (args[0].AsObject() is GlobalObject) // Supposed to happen during the initialize of the script runner  - RavenDB-19466
-                    return JsValue.FromObject(_scriptEngine, EmptyMetadataDummy);
                 throw new InvalidOperationException("metadataFor(doc) must be called with a single entity argument");
-            }
 
-            var modifiedMetadata = new DynamicJsonValue
-            {
-                [Constants.Documents.Metadata.ChangeVector] = boi.ChangeVector,
-                [Constants.Documents.Metadata.Id] = boi.DocumentId,
-                [Constants.Documents.Metadata.LastModified] = boi.LastModified,
-            };
+            if (boi.Metadata != null)
+                return boi.Metadata;
 
-            
+            var modifiedMetadata = new DynamicJsonValue();
+
+            // we need to set the metadata on the blittable itself, because we are might get the actual blittable here instead of Document
+            if (string.IsNullOrEmpty(boi.ChangeVector) == false)
+                modifiedMetadata[Constants.Documents.Metadata.ChangeVector] = boi.ChangeVector;
+            if (string.IsNullOrEmpty(boi.DocumentId) == false)
+                modifiedMetadata[Constants.Documents.Metadata.Id] = boi.DocumentId;
+            if (boi.LastModified != null)
+                modifiedMetadata[Constants.Documents.Metadata.LastModified] = boi.LastModified;
+
             if (boi.Blittable.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata))
             {
                 metadata.Modifications = modifiedMetadata;
@@ -84,8 +177,9 @@ namespace Raven.Server.Documents.Patch
                     Context.ReadObject(modifiedMetadata, boi.DocumentId) : 
                     Context.ReadObject(metadata, boi.DocumentId);
                 
-                JsValue metadataJs = TranslateToJs(_scriptEngine, Context, metadata);
+                var metadataJs = (BlittableObjectInstance)TranslateToJs(_scriptEngine, Context, metadata);
                 boi.Set(Constants.Documents.Metadata.Key, metadataJs);
+                boi.Metadata = metadataJs;
 
                 return metadataJs;
             }
@@ -276,14 +370,12 @@ namespace Raven.Server.Documents.Patch
             return value;
         }
 
-        internal JsValue TranslateToJs(Engine engine, JsonOperationContext context, object o)
+        internal JsValue TranslateToJs(Engine engine, JsonOperationContext context, object o, bool needsClone = true)
         {
             if (o is TimeSeriesRetriever.TimeSeriesStreamingRetrieverResult tsrr)
             { 
                 // we are passing a streaming value to the JS engine, so we need
-                // // to materialize all the results
-                
-                
+                // to materialize all the results
                 var results = new DynamicJsonArray(tsrr.Stream);
                 var djv = new DynamicJsonValue
                 {
@@ -292,16 +384,15 @@ namespace Raven.Server.Documents.Patch
                 };
                 return new BlittableObjectInstance(engine, null, context.ReadObject(djv, "MaterializedStreamResults"), null, null, null);
             }
-            if (o is Tuple<Document, Lucene.Net.Documents.Document, IState, Dictionary<string, IndexField>, bool?, ProjectionOptions> t)
+            if (o is Tuple<Document, RetrieverInput, Dictionary<string, IndexField>, bool?, ProjectionOptions> t)
             {
                 var d = t.Item1;
                 return new BlittableObjectInstance(engine, null, Clone(d.Data, context), d)
                 {
-                    LuceneDocument = t.Item2,
-                    LuceneState = t.Item3,
-                    LuceneIndexFields = t.Item4,
-                    LuceneAnyDynamicIndexFields = t.Item5 ?? false,
-                    Projection = t.Item6
+                    IndexRetriever = t.Item2,
+                    IndexFields = t.Item3,
+                    AnyDynamicIndexFields = t.Item4 ?? false,
+                    Projection = t.Item5
                 };
             }
             if (o is Document doc)
@@ -315,7 +406,9 @@ namespace Raven.Server.Documents.Patch
 
             if (o is BlittableJsonReaderObject json)
             {
-                return new BlittableObjectInstance(engine, null, Clone(json, context), null, null, null);
+                // check if clone is really required, we don't want to clone patch arguments
+                BlittableJsonReaderObject blittable = needsClone ? Clone(json, context) : json;
+                return new BlittableObjectInstance(engine, null, blittable, null, null, null);
             }
 
             if (o == null)
@@ -356,9 +449,10 @@ namespace Raven.Server.Documents.Patch
                 return jsArray;
             }
             // for admin
-            if (o is RavenServer || o is DocumentDatabase)
+            if (o is RavenServer || o is DocumentDatabase || o is DocumentsOperationContext || o is TransactionOperationContext || o is ClusterOperationContext)
             {
                 AssertAdminScriptInstance();
+
                 return JsValue.FromObject(engine, o);
             }
             if (o is ObjectInstance j)
@@ -416,6 +510,7 @@ namespace Raven.Server.Documents.Patch
         {
             foreach (var disposable in _disposables)
                 disposable.Dispose();
+            CurrentlyProcessedObject = null;
             _disposables.Clear();
             _context = null;
         }

@@ -16,11 +16,13 @@ using Raven.Server.Documents.Subscriptions.SubscriptionProcessor;
 using Raven.Server.Documents.TcpHandlers;
 using Raven.Server.Json;
 using Raven.Server.Routing;
+using Raven.Server.ServerWide.Commands.Subscriptions;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.TrafficWatch;
 using Raven.Server.Utils;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using static Raven.Server.Documents.Subscriptions.SubscriptionStorage;
 
 namespace Raven.Server.Documents.Handlers
 {
@@ -72,7 +74,7 @@ namespace Raven.Server.Documents.Handlers
                         case Constants.Documents.SubscriptionChangeVectorSpecialStates.LastDocument:
                             using (context.OpenReadTransaction())
                             {
-                                state.ChangeVectorForNextBatchStartingPoint = Database.DocumentsStorage.GetLastDocumentChangeVector(context.Transaction.InnerTransaction, context, sub.Collection);
+                                state.ChangeVectorForNextBatchStartingPoint = GetLastDocumentChangeVectorForSubscription(context, sub);
                             }
                             break;
                     }
@@ -231,29 +233,98 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/debug/subscriptions/resend", "GET", AuthorizationStatus.ValidUser, EndpointType.Read)]
         public async Task GetSubscriptionResend()
         {
-            var subscriptionName = GetStringQueryString("name");
+            var subscriptionName = GetStringQueryString("name", required: false);
+            var detailed = GetBoolValueQueryString("detailed", required: false) ?? false;
 
             using (ServerStore.Engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
             using (context.OpenReadTransaction())
             await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
             {
-                var subscriptionState = Database
-                    .SubscriptionStorage
-                    .GetSubscriptionFromServerStore(subscriptionName);
-
-                if (subscriptionState == null)
+                Dictionary<long, List<SubscriptionStorage.ResendItem>> result;
+                if (string.IsNullOrEmpty(subscriptionName) == false)
                 {
-                    HttpContext.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                    return;
+                    var subscriptionState = Database
+                        .SubscriptionStorage
+                        .GetSubscriptionFromServerStore(subscriptionName);
+
+                    if (subscriptionState == null)
+                    {
+                        HttpContext.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        return;
+                    }
+
+                    var items = SubscriptionStorage.GetResendItemsForSubscriptionId(context, Database.Name, subscriptionState.SubscriptionId).ToList();
+
+                    if (items.Count == 0)
+                    {
+                        result = new Dictionary<long, List<SubscriptionStorage.ResendItem>>()
+                        {
+                            { subscriptionState.SubscriptionId, new List<SubscriptionStorage.ResendItem>() }
+                        };
+                    }
+                    else
+                    {
+                        result = items.GroupBy(x => x.SubscriptionId).ToDictionary(g => g.Key, g => g.ToList());
+                    }
+                }
+                else
+                {
+                    result = SubscriptionStorage.GetResendItemsForDatabase(context, Database.Name)
+                        .GroupBy(x => x.SubscriptionId).ToDictionary(g => g.Key, g => g.ToList());
                 }
 
-                var subscriptionConnections = Database.SubscriptionStorage.GetSubscriptionConnectionsState(context, subscriptionName);
-                var items = SubscriptionStorage.GetResendItems(context, Database.Name, subscriptionState.SubscriptionId);
-
                 writer.WriteStartObject();
-                writer.WriteArray("Active", subscriptionConnections.GetActiveBatches());
-                writer.WriteComma();
-                writer.WriteArray("Results", items.Select(i => i.ToJson()), context);
+                writer.WritePropertyName("Results");
+                writer.WriteStartArray();
+                var first = true;
+
+                IDisposable disposable = null;
+                DocumentsOperationContext documentsContext = null;
+                if (detailed)
+                {
+                    disposable = ContextPool.AllocateOperationContext(out documentsContext);
+                    documentsContext.OpenReadTransaction();
+                }
+
+                using (disposable)
+                {
+                    foreach (var kvp in result)
+                    {
+                        if (first == false)
+                            writer.WriteComma();
+                        first = false;
+
+                        var name = Database.SubscriptionStorage.GetSubscriptionNameById(context, kvp.Key);
+                        var subscriptionConnections = name == null ? null : Database.SubscriptionStorage.GetSubscriptionConnectionsState(context, subscriptionName);
+
+                        var itemsJson = kvp.Value.Select(i =>
+                        {
+                            var djv = i.ToJson();
+                            if (detailed == false) 
+                                return djv;
+
+                            if (i.Type != SubscriptionType.Document) 
+                                return djv;
+
+                            djv["DocumentExists"] = Database.DocumentsStorage.Exists(documentsContext, i.Id);
+                            return djv;
+                        }).ToList();
+
+                        writer.WriteStartObject();
+                        writer.WritePropertyName("SubscriptionName");
+                        writer.WriteString(name);
+                        writer.WriteComma();
+                        writer.WritePropertyName("SubscriptionId");
+                        writer.WriteInteger(kvp.Key);
+                        writer.WriteComma();
+                        writer.WriteArray("Active", subscriptionConnections == null ? Array.Empty<long>() : subscriptionConnections.GetActiveBatches());
+                        writer.WriteComma();
+                        writer.WriteArray("ResendList", itemsJson, context);
+                        writer.WriteEndObject();
+                    }
+                }
+
+                writer.WriteEndArray();
                 writer.WriteEndObject();
             }
         }
@@ -346,26 +417,12 @@ namespace Raven.Server.Documents.Handlers
                         [nameof(SubscriptionState.Disabled)] = x.Disabled,
                         [nameof(SubscriptionState.LastClientConnectionTime)] = x.LastClientConnectionTime,
                         [nameof(SubscriptionState.LastBatchAckTime)] = x.LastBatchAckTime,
-                        ["Connection"] = GetSubscriptionConnectionJson(x.Connection),
-                        ["Connections"] = GetSubscriptionConnectionsJson(x.Connections),
-                        ["RecentConnections"] = x.RecentConnections?.Select(r => new DynamicJsonValue()
-                        {
-                            ["State"] = new DynamicJsonValue()
-                            {
-                                ["LatestChangeVectorClientACKnowledged"] = r.SubscriptionState.ChangeVectorForNextBatchStartingPoint,
-                                ["Query"] = r.SubscriptionState.Query
-                            },
-                            ["Connection"] = GetSubscriptionConnectionJson(r)
-                        }),
-                        ["FailedConnections"] = x.RecentRejectedConnections?.Select(r => new DynamicJsonValue()
-                        {
-                            ["State"] = new DynamicJsonValue()
-                            {
-                                ["LatestChangeVectorClientACKnowledged"] = r.SubscriptionState.ChangeVectorForNextBatchStartingPoint,
-                                ["Query"] = r.SubscriptionState.Query
-                            },
-                            ["Connection"] = GetSubscriptionConnectionJson(r)
-                        }).ToList()
+                        [nameof(SubscriptionState.MentorNode)] = x.MentorNode,
+                        [nameof(SubscriptionState.PinToMentorNode)] = x.PinToMentorNode,
+                        [nameof(SubscriptionGeneralDataAndStats.Connections)] = GetSubscriptionConnectionsJson(x.Connections),
+                        [nameof(SubscriptionGeneralDataAndStats.RecentConnections)] = x.RecentConnections == null ? Array.Empty<SubscriptionConnectionInfo>() : x.RecentConnections.Select(r => r.ToJson()),
+                        [nameof(SubscriptionGeneralDataAndStats.RecentRejectedConnections)] = x.RecentRejectedConnections == null ? Array.Empty<SubscriptionConnectionInfo>() : x.RecentRejectedConnections.Select(r => r.ToJson()),
+                        [nameof(SubscriptionGeneralDataAndStats.CurrentPendingConnections)] = x.CurrentPendingConnections == null ? Array.Empty<SubscriptionConnectionInfo>() : x.CurrentPendingConnections.Select(r => r.ToJson())
                     });
 
                     writer.WriteArray(context, "Results", subscriptionsAsBlittable, (w, c, subscription) => c.Write(w, subscription));
@@ -378,26 +435,37 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/subscriptions/performance/live", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, SkipUsagesCount = true)]
         public async Task PerformanceLive()
         {
-            using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
+            try
             {
-                var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
-                var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
-
-                using (var ms = new MemoryStream())
-                using (var collector = new LiveSubscriptionPerformanceCollector(Database))
+                using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
                 {
-                    // 1. Send data to webSocket without making UI wait upon opening webSocket
-                    await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+                    var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
+                    var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
 
-                    // 2. Send data to webSocket when available
-                    while (Database.DatabaseShutdown.IsCancellationRequested == false)
+                    using (var ms = new MemoryStream())
+                    using (var collector = new LiveSubscriptionPerformanceCollector(Database))
                     {
-                        if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                        // 1. Send data to webSocket without making UI wait upon opening webSocket
+                        await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+
+                        // 2. Send data to webSocket when available
+                        while (Database.DatabaseShutdown.IsCancellationRequested == false)
                         {
-                            break;
+                            if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                            {
+                                break;
+                            }
                         }
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // disposing
+            }
+            catch (ObjectDisposedException)
+            {
+                // disposing
             }
         }
 
@@ -484,6 +552,7 @@ namespace Raven.Server.Documents.Handlers
             using (context.OpenReadTransaction())
             {
                 var json = await context.ReadForMemoryAsync(RequestBodyStream(), null);
+                bool pinToMentorNodeWasSet = json.TryGet(nameof(SubscriptionUpdateOptions.PinToMentorNode), out bool pinToMentorNode);
                 var options = JsonDeserializationServer.SubscriptionUpdateOptions(json);
 
                 var id = options.Id;
@@ -549,6 +618,9 @@ namespace Raven.Server.Documents.Handlers
                 if (options.MentorNode == null)
                     options.MentorNode = state.MentorNode;
 
+                if (pinToMentorNodeWasSet == false)
+                    options.PinToMentorNode = state.PinToMentorNode;
+
                 if (options.Query == null)
                     options.Query = state.Query;
 
@@ -589,7 +661,7 @@ namespace Raven.Server.Documents.Handlers
                         break;
 
                     case Constants.Documents.SubscriptionChangeVectorSpecialStates.LastDocument:
-                        options.ChangeVector = Database.DocumentsStorage.GetLastDocumentChangeVector(context.Transaction.InnerTransaction, context, sub.Collection);
+                        options.ChangeVector = GetLastDocumentChangeVectorForSubscription(context, sub);
                         break;
                 }
             }
@@ -605,9 +677,7 @@ namespace Raven.Server.Documents.Handlers
                 // need to wait on the relevant remote node
                 var node = Database.SubscriptionStorage.GetResponsibleNode(serverContext, name);
                 if (node != null && node != ServerStore.NodeTag)
-                {
-                    await WaitForExecutionOnSpecificNode(serverContext, ServerStore.GetClusterTopology(serverContext), node, subscriptionId);
-                }
+                    await ServerStore.WaitForExecutionOnSpecificNode(serverContext, node, subscriptionId);
             }
 
             HttpContext.Response.StatusCode = (int)HttpStatusCode.Created;
@@ -619,6 +689,15 @@ namespace Raven.Server.Documents.Handlers
                     [nameof(CreateSubscriptionResult.Name)] = name
                 });
             }
+        }
+
+        private string GetLastDocumentChangeVectorForSubscription(DocumentsOperationContext context, SubscriptionConnection.ParsedSubscription sub)
+        {
+            long lastEtag = sub.Collection == Constants.Documents.Collections.AllDocumentsCollection 
+                ? DocumentsStorage.ReadLastDocumentEtag(context.Transaction.InnerTransaction) 
+                : Database.DocumentsStorage.GetLastDocumentEtag(context.Transaction.InnerTransaction, sub.Collection);
+
+            return Database.DocumentsStorage.GetNewChangeVector(context, lastEtag);
         }
     }
 

@@ -14,7 +14,6 @@ using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Documents.Operations.TimeSeries;
 using Raven.Client.Documents.Queries.Sorting;
-using Raven.Client.Documents.Subscriptions;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Client.ServerWide.Operations.Integrations.PostgreSQL;
@@ -44,8 +43,6 @@ namespace Raven.Server.ServerWide
         public static readonly Func<BlittableJsonReaderObject, IncrementClusterIdentityCommand> IncrementClusterIdentityCommand = GenerateJsonDeserializationRoutine<IncrementClusterIdentityCommand>();
 
         public static readonly Func<BlittableJsonReaderObject, IncrementClusterIdentitiesBatchCommand> IncrementClusterIdentitiesBatchCommand = GenerateJsonDeserializationRoutine<IncrementClusterIdentitiesBatchCommand>();
-
-        public static readonly Func<BlittableJsonReaderObject, SubscriptionState> SubscriptionState = GenerateJsonDeserializationRoutine<SubscriptionState>();
 
         public static readonly Func<BlittableJsonReaderObject, DeleteValueCommand> DeleteValueCommand = GenerateJsonDeserializationRoutine<DeleteValueCommand>();
 
@@ -139,7 +136,7 @@ namespace Raven.Server.ServerWide
         public static Func<BlittableJsonReaderObject, SorterDefinition> SorterDefinition = GenerateJsonDeserializationRoutine<SorterDefinition>();
 
         public static Func<BlittableJsonReaderObject, PostgreSqlConfiguration> PostgreSqlConfiguration = GenerateJsonDeserializationRoutine<PostgreSqlConfiguration>();
-
+        
         public static readonly Dictionary<string, Func<BlittableJsonReaderObject, CommandBase>> Commands = new Dictionary<string, Func<BlittableJsonReaderObject, CommandBase>>
         {
             [nameof(UnregisterReplicationHubAccessCommand)] = GenerateJsonDeserializationRoutine<UnregisterReplicationHubAccessCommand>(),
@@ -247,11 +244,15 @@ namespace Raven.Server.ServerWide
             [nameof(DeleteServerWideAnalyzerCommand)] = GenerateJsonDeserializationRoutine<DeleteServerWideAnalyzerCommand>(),
             [nameof(PutServerWideSorterCommand)] = GenerateJsonDeserializationRoutine<PutServerWideSorterCommand>(),
             [nameof(DeleteServerWideSorterCommand)] = GenerateJsonDeserializationRoutine<DeleteServerWideSorterCommand>(),
+            [nameof(DelayBackupCommand)] = GenerateJsonDeserializationRoutine<DelayBackupCommand>(),
             [nameof(EditLockModeCommand)] = GenerateJsonDeserializationRoutine<EditLockModeCommand>(),
             [nameof(EditPostgreSqlConfigurationCommand)] = GenerateJsonDeserializationRoutine<EditPostgreSqlConfigurationCommand>(),
             [nameof(PutDatabaseStudioConfigurationCommand)] = GenerateJsonDeserializationRoutine<PutDatabaseStudioConfigurationCommand>(),
             [nameof(PutDatabaseSettingsCommand)] = GenerateJsonDeserializationRoutine<PutDatabaseSettingsCommand>(),
-            [nameof(PutDatabaseClientConfigurationCommand)] = GenerateJsonDeserializationRoutine<PutDatabaseClientConfigurationCommand>()
+            [nameof(PutDatabaseClientConfigurationCommand)] = GenerateJsonDeserializationRoutine<PutDatabaseClientConfigurationCommand>(),
+            [nameof(PutIndexHistoryCommand)] = GenerateJsonDeserializationRoutine<PutIndexHistoryCommand>(),
+            [nameof(DeleteIndexHistoryCommand)] = GenerateJsonDeserializationRoutine<DeleteIndexHistoryCommand>(),
+            [nameof(UpdateResponsibleNodeForTasksCommand)] = GenerateJsonDeserializationRoutine<UpdateResponsibleNodeForTasksCommand>()
         };
     }
 }

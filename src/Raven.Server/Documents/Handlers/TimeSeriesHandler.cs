@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Threading;
@@ -10,11 +11,11 @@ using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations.TimeSeries;
 using Raven.Client.Documents.Session.TimeSeries;
+using Raven.Client.Documents.Smuggler;
 using Raven.Client.Exceptions.Documents;
-using Raven.Client.Http;
-using Raven.Client.ServerWide;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.TimeSeries;
+using Raven.Server.Exceptions;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide;
@@ -22,7 +23,6 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents;
 using Raven.Server.TrafficWatch;
-using Raven.Server.Utils;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Platform;
@@ -889,14 +889,18 @@ namespace Raven.Server.Documents.Handlers
             var editTimeSeries = new EditTimeSeriesConfigurationCommand(configuration, name, raftRequestId);
             var result = await ServerStore.SendToLeaderAsync(editTimeSeries);
 
-            DatabaseTopology topology;
-            ClusterTopology clusterTopology;
+            List<string> members;
             using (context.OpenReadTransaction())
+                members = ServerStore.Cluster.ReadDatabaseTopology(context, name).Members;
+
+            try
             {
-                topology = ServerStore.Cluster.ReadDatabaseTopology(context, name);
-                clusterTopology = ServerStore.GetClusterTopology(context);
+                await ServerStore.WaitForExecutionOnRelevantNodesAsync(context, members, result.Index);
             }
-            await WaitForExecutionOnRelevantNodes(context, name, clusterTopology, topology.Members, result.Index);
+            catch (RaftIndexWaitAggregateException e)
+            {
+                throw new InvalidDataException("TimeSeries Configuration was modified, but we couldn't send it due to errors on one or more target nodes.", e);
+            }
 
             return result;
         }
@@ -1170,18 +1174,39 @@ namespace Raven.Server.Documents.Handlers
             FromSmuggler = true
         };
 
-        internal class SmugglerTimeSeriesBatchCommand : TransactionOperationsMerger.MergedTransactionCommand
+        internal class SmugglerTimeSeriesBatchCommand : TransactionOperationsMerger.MergedTransactionCommand, IDisposable
         {
             private readonly DocumentDatabase _database;
 
             private readonly Dictionary<string, List<TimeSeriesItem>> _dictionary;
 
+            private readonly Dictionary<string, List<TimeSeriesDeletedRangeItemForSmuggler>> _deletedRanges;
+
+            private readonly DocumentsOperationContext _context;
+
+            public DocumentsOperationContext Context => _context;
+            
+            private IDisposable _releaseContext;
+            
+            private bool _isDisposed;
+            
+            private readonly List<IDisposable> _toDispose;
+            
+            private readonly List<AllocatedMemoryData> _toReturn;
+
             public string LastChangeVector;
+
+            private BlittableJsonDocumentBuilder _builder;
+            private BlittableMetadataModifier _metadataModifier;
 
             public SmugglerTimeSeriesBatchCommand(DocumentDatabase database)
             {
                 _database = database;
-                _dictionary = new Dictionary<string, List<TimeSeriesItem>>();
+                _dictionary = new Dictionary<string, List<TimeSeriesItem>>(StringComparer.OrdinalIgnoreCase);
+                _toDispose = new();
+                _toReturn = new();
+                _releaseContext = _database.DocumentsStorage.ContextPool.AllocateOperationContext(out _context);
+                _deletedRanges = new Dictionary<string, List<TimeSeriesDeletedRangeItemForSmuggler>>(StringComparer.OrdinalIgnoreCase);
             }
 
             protected override long ExecuteCmd(DocumentsOperationContext context)
@@ -1189,6 +1214,27 @@ namespace Raven.Server.Documents.Handlers
                 var tss = _database.DocumentsStorage.TimeSeriesStorage;
 
                 var changes = 0L;
+
+                foreach (var (docId, items) in _deletedRanges)
+                {
+                    foreach (var item in items)
+                    {
+                        using (item)
+                        {
+                            var deletionRangeRequest = new TimeSeriesStorage.DeletionRangeRequest
+                            {
+                                DocumentId = docId,
+                                Collection = item.Collection,
+                                Name = item.Name,
+                                From = item.From,
+                                To = item.To
+                            };
+                            tss.DeleteTimestampRange(context, deletionRangeRequest, remoteChangeVector: null, updateMetadata: false);
+                        }
+                    }
+
+                    changes += items.Count;
+                }
 
                 foreach (var (docId, items) in _dictionary)
                 {
@@ -1232,9 +1278,72 @@ namespace Raven.Server.Documents.Handlers
                 return newItem;
             }
 
+            public bool AddToDeletedRanges(TimeSeriesDeletedRangeItemForSmuggler item)
+            {
+                bool newItem = false;
+
+                if (_deletedRanges.TryGetValue(item.DocId, out var deletedRangesList) == false)
+                {
+                    _deletedRanges[item.DocId] = deletedRangesList = [];
+                    newItem = true;
+                }
+
+                deletedRangesList.Add(item);
+                return newItem;
+            }
+
             public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto<TTransaction>(TransactionOperationContext<TTransaction> context)
             {
                 throw new System.NotImplementedException();
+            }
+
+            public void AddToDisposal(IDisposable disposable)
+            {
+                _toDispose.Add(disposable);
+            }
+            
+            public void AddToReturn(AllocatedMemoryData allocatedMemoryData)
+            {
+                _toReturn.Add(allocatedMemoryData);
+            }
+
+            public BlittableJsonDocumentBuilder GetOrCreateBuilder(UnmanagedJsonParser parser, JsonParserState state, string debugTag, BlittableMetadataModifier modifier = null)
+            {
+                return _builder ??= new BlittableJsonDocumentBuilder(_context, BlittableJsonDocumentBuilder.UsageMode.ToDisk, debugTag, parser, state, modifier: modifier);
+            }
+
+            public BlittableMetadataModifier GetOrCreateMetadataModifier(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false,
+                bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None)
+            {
+                _metadataModifier ??= new BlittableMetadataModifier(_context, legacyImport, readLegacyEtag, operateOnTypes);
+                _metadataModifier.FirstEtagOfLegacyRevision = firstEtagOfLegacyRevision;
+                _metadataModifier.LegacyRevisionsCount = legacyRevisionsCount;
+
+                return _metadataModifier;
+            }
+
+            public void Dispose()
+            {
+                if (_isDisposed)
+                    return;
+
+                _isDisposed = true;
+                
+                foreach (var disposable in _toDispose)
+                {
+                    disposable.Dispose();
+                }
+                _toDispose.Clear();
+                
+                foreach (var returnable in _toReturn)
+                    _context.ReturnMemory(returnable);
+                _toReturn.Clear();
+
+                _builder?.Dispose();
+                _metadataModifier?.Dispose();
+
+                _releaseContext?.Dispose();
+                _releaseContext = null;
             }
         }
 

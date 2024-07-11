@@ -1,4 +1,4 @@
-﻿using Sparrow;
+using Sparrow;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -6,7 +6,6 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -22,8 +21,6 @@ using Voron.Data;
 using Voron.Data.BTrees;
 using Voron.Data.CompactTrees;
 using Voron.Data.Compression;
-using Voron.Data.Fixed;
-using Voron.Data.PostingLists;
 using Voron.Data.Tables;
 using Voron.Debugging;
 using Voron.Exceptions;
@@ -37,7 +34,6 @@ using Voron.Schema;
 using Voron.Util;
 using Voron.Util.Conversion;
 using Constants = Voron.Global.Constants;
-using Container = Voron.Data.Containers.Container;
 using NativeMemory = Sparrow.Utils.NativeMemory;
 
 namespace Voron
@@ -71,15 +67,15 @@ namespace Voron
         /// This is the shared storage where we are going to store all the static constants for names.
         /// WARNING: This context will never be released, so only static constants should be added here.
         /// </summary>
-        private static readonly ByteStringContext _labelsContext = new ByteStringContext(SharedMultipleUseFlag.None, ByteStringContext.MinBlockSizeInBytes);
+        private static readonly ByteStringContext _staticContext = new ByteStringContext(SharedMultipleUseFlag.None, ByteStringContext.MinBlockSizeInBytes);
 
         public static IDisposable GetStaticContext(out ByteStringContext ctx)
         {
-            Monitor.Enter(_labelsContext);
+            Monitor.Enter(_staticContext);
 
-            ctx = _labelsContext;
+            ctx = _staticContext;
 
-            return new DisposableAction(() => Monitor.Exit(_labelsContext));
+            return new DisposableAction(() => Monitor.Exit(_staticContext));
         }
 
         private readonly StorageEnvironmentOptions _options;
@@ -436,7 +432,9 @@ namespace Voron
             _options.SetEnvironmentId(databaseGuidId);
         }
 
-        public string Base64Id { get; } = new string(' ', 22);
+        public const int Base64IdLength = 22;
+
+        public string Base64Id { get; } = new string(' ', Base64IdLength);
 
         private void CreateNewDatabase()
         {
@@ -731,6 +729,10 @@ namespace Voron
                         tx.CurrentTransactionHolder = _currentWriteTransactionHolder;
                         tx.AfterCommitWhenNewTransactionsPrevented += AfterCommitWhenNewTransactionsPrevented;
                     }
+                    else
+                    {
+                        tx.CurrentTransactionHolder = NativeMemory.CurrentThreadStats;
+                    }
 
                     ActiveTransactions.Add(tx);
 
@@ -766,6 +768,16 @@ namespace Voron
                 }
                 throw;
             }
+        }
+
+        internal void InvokeNewTransactionCreated(LowLevelTransaction tx)
+        {
+            NewTransactionCreated?.Invoke(tx);
+        }
+
+        internal void InvokeAfterCommitWhenNewTransactionsPrevented(LowLevelTransaction tx)
+        {
+            AfterCommitWhenNewTransactionsPrevented?.Invoke(tx);
         }
 
         [Conditional("DEBUG")]
@@ -900,6 +912,8 @@ namespace Voron
         public event Action<LowLevelTransaction> AfterCommitWhenNewTransactionsPrevented;
         internal void TransactionAfterCommit(LowLevelTransaction tx)
         {
+            tx._forTestingPurposes?.ActionToCallOnTransactionAfterCommit?.Invoke();
+
             if (ActiveTransactions.Contains(tx) == false)
             {
                 if (tx.Committed && tx.FlushedToJournal)
@@ -1082,6 +1096,14 @@ namespace Voron
 
         public unsafe DetailedStorageReport GenerateDetailedReport(Transaction tx, bool includeDetails = false)
         {
+            DetailedReportInput detailedReportInput = CreateDetailedReportInput(tx, includeDetails);
+
+            var generator = new StorageReportGenerator(tx.LowLevelTransaction);
+            return generator.Generate(detailedReportInput);
+        }
+
+        public unsafe DetailedReportInput CreateDetailedReportInput(Transaction tx, bool includeDetails)
+        {
             var numberOfAllocatedPages = Math.Max(_dataPager.NumberOfAllocatedPages, NextPageNumber - 1); // async apply to data file task
             var numberOfFreePages = _freeSpaceHandling.AllPages(tx.LowLevelTransaction).Count;
 
@@ -1100,18 +1122,17 @@ namespace Voron
                 Trees = new(),
                 FixedSizeTrees = new(),
                 Tables = new(),
-                Containers =  new(),
-                Sets = new(),
+                Containers = new(),
+                PostingLists = new(),
                 PersistentDictionaries = new(),
                 CompactTrees = new(),
                 IncludeDetails = includeDetails,
-                ScratchBufferPoolInfo = _scratchBufferPool.InfoForDebug(PossibleOldestReadTransaction(tx.LowLevelTransaction)),
                 TempPath = Options.TempPath,
                 JournalPath = (Options as StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)?.JournalPath,
                 TotalEncryptionBufferSize = totalCryptoBufferSize,
                 InMemoryStorageState = GetInMemoryStorageState(tx.LowLevelTransaction)
             };
-            
+
             using (var rootIterator = tx.LowLevelTransaction.RootObjects.Iterate(false))
             {
                 if (rootIterator.Seek(Slices.BeforeAllKeys))
@@ -1149,7 +1170,7 @@ namespace Voron
                                 break;
                             case RootObjectType.Set:
                                 var set = tx.OpenPostingList(currentKey);
-                                detailedReportInput.Sets.Add(set);
+                                detailedReportInput.PostingLists.Add(set);
                                 break;
                             case RootObjectType.CompactTree:
                                 var ct = tx.CompactTreeFor(currentKey);
@@ -1162,13 +1183,11 @@ namespace Voron
                             default:
                                 throw new ArgumentOutOfRangeException(nameof(type), type.ToString());
                         }
-                    }
-                    while (rootIterator.MoveNext());
+                    } while (rootIterator.MoveNext());
                 }
             }
 
-            var generator = new StorageReportGenerator(tx.LowLevelTransaction);
-            return generator.Generate(detailedReportInput);
+            return detailedReportInput;
         }
 
         public InMemoryStorageState GetInMemoryStorageState(LowLevelTransaction tx)
@@ -1274,19 +1293,31 @@ namespace Voron
             _endOfDiskSpace = new EndOfDiskSpaceEvent(exception.DirectoryPath, exception.CurrentFreeSpace, ExceptionDispatchInfo.Capture(exception));
         }
 
+        public unsafe void ValidateInMemoryPageChecksum(long pageNumber, PageHeader* current)
+        {
+            // Since we are forcing the validation there is no need to update the _validPages 
+            if (pageNumber != current->PageNumber)
+                ThrowInvalidPageNumber(pageNumber, current);
+
+            ulong checksum = CalculatePageChecksum((byte*)current, current->PageNumber, current->Flags, current->OverflowSize);
+
+            if (checksum != current->Checksum)
+                ThrowInvalidChecksum(pageNumber, current, checksum);
+        }
+
         public unsafe void ValidatePageChecksum(long pageNumber, PageHeader* current)
         {
-            long old;
             var index = pageNumber / (8 * sizeof(long));
             var bitIndex = (int)(pageNumber % (8 * sizeof(long)));
             var bitToSet = 1L << bitIndex;
 
             // If the page is beyond the initial size of the file we don't validate it. 
             // We assume that it is valid since we wrote it in this run.
+
             if (index >= _validPages.Length)
                 return;
 
-            old = _validPages[index];
+            long old = _validPages[index];
             if ((old & bitToSet) != 0)
                 return;
 
@@ -1305,15 +1336,15 @@ namespace Voron
             if (checksum != current->Checksum)
                 ThrowInvalidChecksum(pageNumber, current, checksum);
 
-            var spinner = new SpinWait();
             while (true)
             {
+                // PERF: This code used to have a spin-wait. While it makes sense where threads are competing on tight loops for
+                // for resources, the spin-wait here serves no purpose as the thread is going to bail out immediately after completion.
                 long modified = Interlocked.CompareExchange(ref _validPages[index], old | bitToSet, old);
                 if (modified == old || (modified & bitToSet) != 0)
                     break;
 
                 old = modified;
-                spinner.SpinOnce();
             }
         }
 
@@ -1528,6 +1559,23 @@ namespace Voron
         internal class TestingStuff
         {
             internal Action ActionToCallDuringFullBackupRighAfterCopyHeaders;
+        }
+
+
+        // We create a single thread-safe persistent dictionary locator with enough state to deal with almost any scenario.
+        internal PersistentDictionaryLocator DictionaryLocator { get; } = new PersistentDictionaryLocator(1024);
+
+        public PersistentDictionary CreateEncodingDictionary(Page dictionaryPage)
+        {
+            // Since when a dictionary is created it will never be removed or reclaimed, we can create a cache of dictionaries
+            // as soon as we are asked to retrieve them. 
+            var dictionary = new PersistentDictionary(dictionaryPage);
+
+            // Since the construction of new dictionaries happen at the end of the commit phase, we can safely
+            // add the dictionary to the global shared cache as it is the current one. 
+            DictionaryLocator.Set(dictionary.DictionaryId, dictionary);
+
+            return dictionary;
         }
     }
 

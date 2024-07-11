@@ -4,11 +4,11 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Sparrow;
 using Sparrow.Platform;
 using Sparrow.Server;
-using Sparrow.Server.Collections;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron.Data;
@@ -37,8 +37,6 @@ namespace Voron.Impl
         private bool _disposeAllocator;
         internal long DecompressedBufferBytes;
         internal TestingStuff _forTestingPurposes;
-        
-        internal WeakSmallSet<long, PersistentDictionary> _persistentDictionariesForCompactTrees; 
 
         public object ImmutableExternalState;
 
@@ -97,6 +95,8 @@ namespace Voron.Impl
         public event Action<IPagerLevelTransactionState> BeforeCommitFinalization;
 
         public event Action<LowLevelTransaction> LastChanceToReadFromWriteTransactionBeforeCommit;
+
+        public Size TransactionSize => new Size(NumberOfModifiedPages * Constants.Storage.PageSize, SizeUnit.Bytes) + AdditionalMemoryUsageSize;
 
         public Size AdditionalMemoryUsageSize
         {
@@ -195,6 +195,7 @@ namespace Voron.Impl
             _allocator.AllocationFailed += MarkTransactionAsFailed;
             _disposeAllocator = allocator == null;
             _pagerStates = new HashSet<PagerState>(ReferenceEqualityComparer<PagerState>.Default);
+
             Flags = TransactionFlags.Read;
             ImmutableExternalState = previous.ImmutableExternalState;
 
@@ -236,6 +237,11 @@ namespace Voron.Impl
 
             var env = previous._env;
             env.Options.AssertNoCatastrophicFailure();
+
+            Debug.Assert(env.Options.Encryption.IsEnabled == false,
+                $"Async commit isn't supported in encrypted environments. We don't carry {nameof(IPagerLevelTransactionState.CryptoPagerTransactionState)} from previous tx");
+            Debug.Assert((PlatformDetails.Is32Bits || env.Options.ForceUsing32BitsPager) == false,
+                $"Async commit isn't supported in 32bits environments. We don't carry {nameof(IPagerLevelTransactionState.PagerTransactionState32Bits)} from previous tx");
 
             FlushInProgressLockTaken = previous.FlushInProgressLockTaken;
             CurrentTransactionHolder = previous.CurrentTransactionHolder;
@@ -568,7 +574,7 @@ namespace Voron.Impl
 
         private const int InvalidScratchFile = -1;
         private PagerStateCacheItem _lastScratchFileUsed = new PagerStateCacheItem(InvalidScratchFile, null);
-        private TxState _disposed;
+        private TxState _txState;
 
         [Flags]
         private enum TxState
@@ -581,11 +587,24 @@ namespace Voron.Impl
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public Page GetPage(long pageNumber)
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             if (_pageLocator.TryGetReadOnlyPage(pageNumber, out Page result))
                 return result;
+
+            var p = GetPageInternal(pageNumber);
+
+            _pageLocator.SetReadable(p.PageNumber, p);
+
+            return p;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Page GetPageWithoutCache(long pageNumber)
+        {
+            if (_txState != TxState.None)
+                ThrowObjectDisposed();
 
             return GetPageInternal(pageNumber);
         }
@@ -638,19 +657,82 @@ namespace Voron.Impl
 
             TrackReadOnlyPage(p);
 
-            _pageLocator.SetReadable(p.PageNumber, p);
             return p;
+        }
+
+        public T GetPageHeaderForDebug<T>(long pageNumber) where T : unmanaged
+        {
+            if (_txState != TxState.None)
+                ThrowObjectDisposed();
+
+            if (_pageLocator.TryGetReadOnlyPage(pageNumber, out Page page))
+                return *(T*)page.Pointer;
+
+            T result;
+            PageFromScratchBuffer value;
+            if (_scratchPagesTable != null && _scratchPagesTable.TryGetValue(pageNumber, out value)) // Scratch Pages Table will be null in read transactions
+            {
+                Debug.Assert(value != null);
+                PagerState state = null;
+                if (_scratchPagerStates != null)
+                {
+                    var lastUsed = _lastScratchFileUsed;
+                    if (lastUsed.FileNumber == value.ScratchFileNumber)
+                    {
+                        state = lastUsed.State;
+                    }
+                    else
+                    {
+                        state = _scratchPagerStates[value.ScratchFileNumber];
+                        _lastScratchFileUsed = new PagerStateCacheItem(value.ScratchFileNumber, state);
+                    }
+                }
+
+                result = _env.ScratchBufferPool.ReadPageHeaderForDebug<T>(this, value.ScratchFileNumber, value.PositionInScratchBuffer, state);
+            }
+            else
+            {
+                var pageFromJournal = _journal.ReadPageHeaderForDebug<T>(this, pageNumber, _scratchPagerStates);
+                if (pageFromJournal != null)
+                {
+                    result = pageFromJournal.Value;
+                }
+                else
+                {
+                    result = DataPager.AcquirePagePointerHeaderForDebug<T>(this, pageNumber);
+                }
+            }
+
+            return result;
+        }
+
+        public void TryReleasePage(long pageNumber)
+        {
+            if (_scratchPagesTable != null && _scratchPagesTable.TryGetValue(pageNumber, out _))
+            {
+                // we don't release pages from the scratch buffers
+                return;
+            }
+
+            var pageFromJournalExists = _journal.PageExists(this, pageNumber);
+            if (pageFromJournalExists)
+            {
+                // we don't release pages from the scratch buffers that we found through the journals
+                return;
+            }
+
+            DataPager.TryReleasePage(this, pageNumber);
         }
 
         private void ThrowObjectDisposed()
         {
-            if (_disposed.HasFlag(TxState.Disposed))
+            if (_txState.HasFlag(TxState.Disposed))
                 throw new ObjectDisposedException("Transaction is already disposed");
 
-            if (_disposed.HasFlag(TxState.Errored))
+            if (_txState.HasFlag(TxState.Errored))
                 throw new InvalidDataException("The transaction is in error state, and cannot be used further");
 
-            throw new ObjectDisposedException("Transaction state is invalid: " + _disposed);
+            throw new ObjectDisposedException("Transaction state is invalid: " + _txState);
         }
 
         public Page AllocatePage(int numberOfPages, long? pageNumber = null, Page? previousPage = null, bool zeroPage = true)
@@ -685,7 +767,7 @@ namespace Voron.Impl
 
         private Page AllocatePage(int numberOfPages, long pageNumber, Page? previousVersion, bool zeroPage)
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             try
@@ -745,7 +827,7 @@ namespace Voron.Impl
             }
             catch
             {
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 throw;
             }
         }
@@ -762,7 +844,7 @@ namespace Voron.Impl
 
         internal void BreakLargeAllocationToSeparatePages(long pageNumber)
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             PageFromScratchBuffer value;
@@ -791,7 +873,7 @@ namespace Voron.Impl
 
         internal void ShrinkOverflowPage(long pageNumber, int newSize, TreeMutableState treeState)
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             PageFromScratchBuffer value;
@@ -842,20 +924,25 @@ namespace Voron.Impl
         }
 
 
-        public bool IsDisposed => _disposed != TxState.None;
+        public bool IsValid => _txState == TxState.None;
+        
+        public bool IsDisposed => _txState.HasFlag(TxState.Disposed);
+
         public NativeMemory.ThreadStats CurrentTransactionHolder { get; set; }
 
         public void Dispose()
         {
-            if (_disposed.HasFlag(TxState.Disposed))
+            if (_txState.HasFlag(TxState.Disposed))
                 return;
+
+            EnsureDisposeOfWriteTxIsOnTheSameThreadThatCreatedIt();
 
             try
             {
                 if (!Committed && !RolledBack && Flags == TransactionFlags.ReadWrite)
                     Rollback();
 
-                _disposed |= TxState.Disposed;
+                _txState |= TxState.Disposed;
 
                 PersistentContext.FreePageLocator(_pageLocator);
             }
@@ -898,7 +985,7 @@ namespace Voron.Impl
 
         public void MarkTransactionAsFailed()
         {
-            _disposed |= TxState.Errored;
+            _txState |= TxState.Errored;
         }
 
         internal void FreePageOnCommit(long pageNumber)
@@ -934,7 +1021,7 @@ namespace Voron.Impl
 
         public void FreePage(long pageNumber)
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             try
@@ -951,11 +1038,19 @@ namespace Voron.Impl
             }
             catch
             {
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 throw;
             }
         }
 
+        public CompactKey AcquireCompactKey()
+        {
+            // Originally the low level transaction would allow to handle the reuse of compact keys.
+            // However, the implementation of reuse has been creating issues when indexing. The ability
+            // to reuse keys will be disable until we are able to resolve the underlying cause for it.
+            // https://issues.hibernatingrhinos.com/issue/RavenDB-20143
+            return new CompactKey(this);
+        }
 
         private class PagerStateCacheItem
         {
@@ -1033,6 +1128,8 @@ namespace Voron.Impl
                 _env.ActiveTransactions.Add(nextTx);
                 _env.WriteTransactionStarted();
 
+                nextTx.AfterCommitWhenNewTransactionsPrevented += _env.InvokeAfterCommitWhenNewTransactionsPrevented;
+                _env.InvokeNewTransactionCreated(nextTx);
 
                 return nextTx;
             }
@@ -1053,7 +1150,7 @@ namespace Voron.Impl
                     AsyncCommit = null;
                 }
 
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
 
                 throw;
             }
@@ -1078,7 +1175,7 @@ namespace Voron.Impl
         {
             if (AsyncCommit == null)
             {
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 ThrowInvalidAsyncEndWithoutBegin();
                 return;// never reached
             }
@@ -1093,7 +1190,7 @@ namespace Voron.Impl
                 // of writing to the journal means that we don't know what the current
                 // state of the journal is. We have to shut down and run recovery to 
                 // come to a known good state
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 _env.Options.SetCatastrophicFailure(ExceptionDispatchInfo.Capture(e));
 
                 throw;
@@ -1127,30 +1224,29 @@ namespace Voron.Impl
 
             try
             {
-                var numberOfWrittenPages = _journal.WriteToJournal(this, out var journalFilePath, out var writeToJournalDuration);
+                var numberOfWrittenPages = _journal.WriteToJournal(this);
                 FlushedToJournal = true;
                 _updatePageTranslationTableAndUnusedPages = numberOfWrittenPages.UpdatePageTranslationTableAndUnusedPages;
+
                 if (_forTestingPurposes?.SimulateThrowingOnCommitStage2 == true)
                     _forTestingPurposes.ThrowSimulateErrorOnCommitStage2();
 
-                if (_requestedCommitStats != null)
-                {
-                    _requestedCommitStats.WriteToJournalDuration = writeToJournalDuration;
-                    _requestedCommitStats.NumberOfModifiedPages = numberOfWrittenPages.NumberOfUncompressedPages;
-                    _requestedCommitStats.NumberOf4KbsWrittenToDisk = numberOfWrittenPages.NumberOf4Kbs;
-                    _requestedCommitStats.JournalFilePath = journalFilePath;
-                }
+                if (_requestedCommitStats == null) 
+                    return;
+
+                _requestedCommitStats.NumberOfModifiedPages = numberOfWrittenPages.NumberOfUncompressedPages;
+                _requestedCommitStats.NumberOf4KbsWrittenToDisk = numberOfWrittenPages.NumberOf4Kbs;
             }
             catch
             {
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 throw;
             }
         }
 
         private void CommitStage1_CompleteTransaction()
         {
-            if (_disposed != TxState.None)
+            if (_txState != TxState.None)
                 ThrowObjectDisposed();
 
             if (Committed)
@@ -1213,7 +1309,7 @@ namespace Voron.Impl
             }
             catch (Exception e)
             {
-                _disposed |= TxState.Errored;
+                _txState |= TxState.Errored;
                 _env.Options.SetCatastrophicFailure(ExceptionDispatchInfo.Capture(e));
                 throw;
             }
@@ -1229,11 +1325,22 @@ namespace Voron.Impl
             throw new InvalidOperationException("Cannot commit already committed transaction.");
         }
 
+        [Conditional("DEBUG")]
+        private void EnsureDisposeOfWriteTxIsOnTheSameThreadThatCreatedIt()
+        {
+            if (Flags == TransactionFlags.ReadWrite && NativeMemory.CurrentThreadStats != CurrentTransactionHolder)
+            {
+                throw new InvalidOperationException($"Dispose of the write transaction must be called from the same thread that created it. " +
+                                                    $"Transaction {Id} (Flags: {Flags}) was created by {CurrentTransactionHolder.Name}, thread Id: {CurrentTransactionHolder.ManagedThreadId}. " +
+                                                    $"The dispose was called from {NativeMemory.CurrentThreadStats.Name}, thread Id: {NativeMemory.CurrentThreadStats.ManagedThreadId}. " +
+                                                    $"Do you have any await call in the scope of the write transaction?");
+            }
+        }
 
         public void Rollback()
         {
             // here we allow rolling back of errored transaction
-            if (_disposed.HasFlag(TxState.Disposed))
+            if (_txState.HasFlag(TxState.Disposed))
                 ThrowObjectDisposed();
 
 
@@ -1273,7 +1380,7 @@ namespace Voron.Impl
 
         public string GetTxState()
         {
-            return _disposed.ToString();
+            return _txState.ToString();
         }
 
         private PagerState _lastState;
@@ -1454,6 +1561,7 @@ namespace Voron.Impl
             internal Action ActionToCallDuringEnsurePagerStateReference;
             internal Action ActionToCallJustBeforeWritingToJournal;
             internal Action ActionToCallDuringBeginAsyncCommitAndStartNewTransaction;
+            internal Action ActionToCallOnTransactionAfterCommit;
 
             public TestingStuff(LowLevelTransaction tx)
             {
@@ -1486,10 +1594,27 @@ namespace Voron.Impl
                 return new DisposableAction(() => ActionToCallDuringBeginAsyncCommitAndStartNewTransaction = null);
             }
 
+            internal IDisposable CallOnTransactionAfterCommit(Action action)
+            {
+                ActionToCallOnTransactionAfterCommit = action;
+
+                return new DisposableAction(() => ActionToCallOnTransactionAfterCommit = null);
+            }
+
             internal HashSet<PagerState> GetPagerStates()
             {
                 return _tx._pagerStates;
             }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal PersistentDictionary GetEncodingDictionary(long dictionaryId)
+        {
+            var dictionaryLocator = _env.DictionaryLocator;
+            if (dictionaryLocator.TryGet(dictionaryId, out var dictionary))
+                return dictionary;
+
+            return _env.CreateEncodingDictionary(GetPage(dictionaryId));
         }
     }
 }

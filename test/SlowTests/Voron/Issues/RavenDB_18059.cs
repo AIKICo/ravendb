@@ -2,6 +2,9 @@
 using System.IO;
 using System.Threading;
 using FastTests.Voron;
+using Raven.Client.Documents.Operations.Backups;
+using Sparrow.Backups;
+using Tests.Infrastructure;
 using Voron;
 using Voron.Global;
 using Voron.Impl.Backup;
@@ -25,8 +28,10 @@ public class RavenDB_18059 : StorageTest
         options.ManualSyncing = true;
     }
 
-    [Fact]
-    public void RaceConditionBetweenFullBackupAndUpdateDatabaseStateAfterSync()
+    [RavenTheory(RavenTestCategory.BackupExportImport)]
+    [InlineData(SnapshotBackupCompressionAlgorithm.Deflate)]
+    [InlineData(SnapshotBackupCompressionAlgorithm.Zstd)]
+    public void RaceConditionBetweenFullBackupAndUpdateDatabaseStateAfterSync(SnapshotBackupCompressionAlgorithm compressionAlgorithm)
     {
         RequireFileBasedPager();
         var random = new Random(2);
@@ -50,26 +55,34 @@ public class RavenDB_18059 : StorageTest
 
         var voronDataDir = new VoronPathSetting(DataDir);
 
+        Thread syncOperationThread = null;
+        bool syncResult = false;
+
         Env.ForTestingPurposesOnly().ActionToCallDuringFullBackupRighAfterCopyHeaders += () =>
         {
             // here we remove 0000000000000000000.journal file while during backup we'll try to backup it
 
-            Thread syncOperation = new Thread(() =>
+            syncOperationThread = new Thread(() =>
             {
                 using (var operation = new WriteAheadJournal.JournalApplicator.SyncOperation(Env.Journal.Applicator))
                 {
-                    var syncResult = operation.SyncDataFile();
-
-                    Assert.True(syncResult);
+                    syncResult = operation.SyncDataFile();
                 }
             });
 
-            syncOperation.Start();
+            syncOperationThread.Start();
 
-            Assert.False(syncOperation.Join(TimeSpan.FromSeconds(5)));
+            // ActionToCallDuringFullBackupRighAfterCopyHeaders() is called under the flushing lock
+            // the sync operation is trying to get the same lock
+            // it means that as long as we wait here the lock won't be released so the thread won't be terminated
+            Assert.False(syncOperationThread.Join(TimeSpan.FromSeconds(5))); 
         };
 
-        BackupMethods.Full.ToFile(Env, voronDataDir.Combine("voron-test.backup"));
+        BackupMethods.Full.ToFile(Env, voronDataDir.Combine("voron-test.backup"), compressionAlgorithm);
+
+        Assert.True(syncOperationThread.Join(TimeSpan.FromMinutes(1))); // let's wait for the sync operation thread to complete
+
+        Assert.True(syncResult); // at this point we should be after the successful sync 
 
         BackupMethods.Full.Restore(voronDataDir.Combine("voron-test.backup"), voronDataDir.Combine("backup-test.data"));
 
@@ -94,8 +107,10 @@ public class RavenDB_18059 : StorageTest
     }
 
 
-    [Fact]
-    public void FullBackupMustNotDeadlockWithFlush()
+    [RavenTheory(RavenTestCategory.BackupExportImport)]
+    [InlineData(SnapshotBackupCompressionAlgorithm.Deflate)]
+    [InlineData(SnapshotBackupCompressionAlgorithm.Zstd)]
+    public void FullBackupMustNotDeadlockWithFlush(SnapshotBackupCompressionAlgorithm compressionAlgorithm)
     {
         RequireFileBasedPager();
         var random = new Random(2);
@@ -123,7 +138,7 @@ public class RavenDB_18059 : StorageTest
         {
             try
             {
-                BackupMethods.Full.ToFile(Env, voronDataDir.Combine("voron-test.backup"));
+                BackupMethods.Full.ToFile(Env, voronDataDir.Combine("voron-test.backup"), compressionAlgorithm);
 
                 backupCompleted = true;
             }

@@ -85,6 +85,7 @@ using Raven.Server.Documents.Studio;
 using Raven.Server.Documents.Subscriptions;
 using Raven.Server.Documents.TcpHandlers;
 using Raven.Server.Integrations.PostgreSQL.Handlers;
+using Raven.Server.NotificationCenter;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.NotificationCenter.Notifications.Server;
@@ -98,6 +99,7 @@ using Raven.Server.SqlMigration.Model;
 using Raven.Server.SqlMigration.Schema;
 using Raven.Server.Utils;
 using Raven.Server.Utils.IoMetrics;
+using Raven.Server.Web.Authentication;
 using Raven.Server.Web.Studio;
 using Raven.Server.Web.System;
 using Sparrow.Json;
@@ -143,6 +145,7 @@ namespace TypingsGenerator
                 .WithTypeMapping(TsPrimitive.Number, typeof(UInt64))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(HashSet<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(List<>))
+                .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(LinkedList<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(IEnumerable<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(Queue<>))
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(ConcurrentQueue<>))
@@ -239,9 +242,12 @@ namespace TypingsGenerator
             scripter.AddType(typeof(PagingPerformanceDetails));
             scripter.AddType(typeof(HugeDocumentsDetails));
             scripter.AddType(typeof(HugeDocumentInfo));
+            scripter.AddType(typeof(MismatchedReferencesLoadWarning));
+            scripter.AddType(typeof(BlockingTombstoneDetails));
             scripter.AddType(typeof(RequestLatencyDetail));
             scripter.AddType(typeof(WarnIndexOutputsPerDocument));
             scripter.AddType(typeof(IndexingReferenceLoadWarning));
+            scripter.AddType(typeof(ConflictPerformanceDetails));
 
             // subscriptions
             scripter.AddType(typeof(SubscriptionConnectionStats));
@@ -268,7 +274,8 @@ namespace TypingsGenerator
             // alerts
             scripter.AddType(typeof(EtlErrorsDetails));
             scripter.AddType(typeof(SlowSqlDetails));
-            scripter.AddType(typeof(SlowWritesDetails));
+            scripter.AddType(typeof(SlowIoDetails));
+            scripter.AddType(typeof(ServerLimitsDetails));
 
             // indexes
             scripter.AddType(typeof(IndexDefinition));
@@ -330,6 +337,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(RevisionsConfiguration));
             scripter.AddType(typeof(RevertRevisionsRequest));
             scripter.AddType(typeof(RevertResult));
+            scripter.AddType(typeof(EnforceRevisionsConfigurationRequest));
             scripter.AddType(typeof(EnforceConfigurationResult));
             scripter.AddType(typeof(GetRevisionsCountOperation.DocumentRevisionsCount));
 
@@ -384,6 +392,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(LicenseRenewalResult));
             scripter.AddType(typeof(LicenseConfiguration));
             scripter.AddType(typeof(LicenseHandler.ConnectivityToLicenseServer));
+            scripter.AddType(typeof(LicenseLeaseResult));
 
             // feedback form
             scripter.AddType(typeof(FeedbackForm));
@@ -574,6 +583,7 @@ namespace TypingsGenerator
             scripter.AddType(typeof(CompareExchangeValue<object>));
 
             // debug
+            scripter.AddType(typeof(ServerWideDebugInfoPackageHandler.DebugInfoPackageContentType));
             scripter.AddType(typeof(ThreadsInfo));
             scripter.AddType(typeof(MemoryDebugHandler.MemoryInfo));
             scripter.AddType(typeof(TombstoneCleaner.TombstonesState));
@@ -597,6 +607,9 @@ namespace TypingsGenerator
 
             // version info
             scripter.AddType(typeof(LatestVersionCheck.VersionInfo));
+            
+            // two-factor
+            scripter.AddType(typeof(TwoFactorAuthenticationHandler.TotpServerConfiguration));
 
             // time series
             scripter.AddType(typeof(TimeSeriesStatistics));

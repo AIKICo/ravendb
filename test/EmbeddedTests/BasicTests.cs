@@ -8,6 +8,7 @@ using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Smuggler;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Embedded;
+using Sparrow.Json.Parsing;
 using Xunit;
 
 namespace EmbeddedTests
@@ -17,15 +18,11 @@ namespace EmbeddedTests
         [Fact]
         public void TestEmbedded()
         {
-            var paths = CopyServer();
+            var options = CopyServerAndCreateOptions();
 
             using (var embedded = new EmbeddedServer())
             {
-                embedded.StartServer(new ServerOptions
-                {
-                    ServerDirectory = paths.ServerDirectory,
-                    DataDirectory = paths.DataDirectory,
-                });
+                embedded.StartServer(options);
 
                 using (var store = embedded.GetDocumentStore(new DatabaseOptions("Test")
                 {
@@ -43,21 +40,23 @@ namespace EmbeddedTests
                     {
                         session.Store(new Person
                         {
-                            Name = "John"
+                            Name = "John",
+                            Amount = 55.5m
                         }, "people/1");
 
                         session.SaveChanges();
+
+                        session.Advanced.Context.ReadObject(new DynamicJsonValue
+                        {
+                            ["Value"] = 55.5m
+                        }, "");
                     }
                 }
             }
 
             using (var embedded = new EmbeddedServer())
             {
-                embedded.StartServer(new ServerOptions
-                {
-                    ServerDirectory = paths.ServerDirectory,
-                    DataDirectory = paths.DataDirectory,
-                });
+                embedded.StartServer(options);
 
                 using (var store = embedded.GetDocumentStore("Test"))
                 {
@@ -71,6 +70,7 @@ namespace EmbeddedTests
 
                         Assert.NotNull(person);
                         Assert.Equal("John", person.Name);
+                        Assert.Equal(55.5m, person.Amount);
                     }
                 }
             }
@@ -79,15 +79,11 @@ namespace EmbeddedTests
         [Fact]
         public async Task TestEmbeddedRestart()
         {
-            var paths = CopyServer();
+            var options = CopyServerAndCreateOptions();
 
             using (var embedded = new EmbeddedServer())
             {
-                embedded.StartServer(new ServerOptions
-                {
-                    ServerDirectory = paths.ServerDirectory,
-                    DataDirectory = paths.DataDirectory,
-                });
+                embedded.StartServer(options);
 
                 var pid1 = await embedded.GetServerProcessIdAsync();
                 Assert.True(pid1 > 0);
@@ -130,16 +126,10 @@ namespace EmbeddedTests
         [Fact]
         public async Task TestEmbedded_RuntimeFrameworkVersionMatcher()
         {
-            var paths = CopyServer();
+            var options = CopyServerAndCreateOptions();
 
             using (var embedded = new EmbeddedServer())
             {
-                var options = new ServerOptions
-                {
-                    ServerDirectory = paths.ServerDirectory,
-                    DataDirectory = paths.DataDirectory,
-                };
-
                 var frameworkVersion = new RuntimeFrameworkVersionMatcher.RuntimeFrameworkVersion(options.FrameworkVersion)
                 {
                     Patch = null
@@ -206,6 +196,8 @@ namespace EmbeddedTests
             public string Id { get; set; }
 
             public string Name { get; set; }
+
+            public decimal Amount { get; set; }
         }
     }
 }

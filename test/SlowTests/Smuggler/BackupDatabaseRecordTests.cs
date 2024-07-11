@@ -19,6 +19,7 @@ using Raven.Client.Documents.Operations.ETL.OLAP;
 using Raven.Client.Documents.Operations.ETL.Queue;
 using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Documents.Operations.Expiration;
+using Raven.Client.Documents.Operations.Refresh;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Documents.Queries.Sorting;
@@ -140,7 +141,7 @@ namespace SlowTests.Smuggler
                     {
                         Name = "connection",
                         ConnectionString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3" + $";Initial Catalog=SqlReplication-{store1.Database};",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
 
                     var result2 = store1.Maintenance.Send(new PutConnectionStringOperation<SqlConnectionString>(sqlConnectionString));
@@ -344,7 +345,7 @@ namespace SlowTests.Smuggler
                     {
                         Name = "connection",
                         ConnectionString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3" + $";Initial Catalog=SqlReplication-{store1.Database};",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
 
                     var result2 = store1.Maintenance.Send(new PutConnectionStringOperation<SqlConnectionString>(sqlConnectionString));
@@ -401,6 +402,7 @@ namespace SlowTests.Smuggler
                         }
                     }, Server.ServerStore);
                     await migrate.UpdateBuildInfoIfNeeded();
+                    var database = await Databases.GetDocumentDatabaseInstanceFor(store2);
                     var operationId = migrate.StartMigratingSingleDatabase(new DatabaseMigrationSettings
                     {
                         DatabaseName = store1.Database,
@@ -417,7 +419,7 @@ namespace SlowTests.Smuggler
                                                        DatabaseRecordItemType.SqlEtls |
                                                        DatabaseRecordItemType.RavenConnectionStrings |
                                                        DatabaseRecordItemType.Analyzers
-                    }, Databases.GetDocumentDatabaseInstanceFor(store2).Result);
+                    }, database);
 
                     WaitForValue(() =>
                     {
@@ -613,6 +615,19 @@ namespace SlowTests.Smuggler
                     await store1.Maintenance.SendAsync(new ConfigureExpirationOperation(exConfig));
                     await store2.Maintenance.SendAsync(new ConfigureExpirationOperation(exConfig2));
 
+                    var refConfig = new RefreshConfiguration
+                    {
+                        RefreshFrequencyInSec = 66,
+                        Disabled = false
+                    };
+                    var refConfig2 = new RefreshConfiguration
+                    {
+                        RefreshFrequencyInSec = 33,
+                        Disabled = true
+                    };
+                    await store1.Maintenance.SendAsync(new ConfigureRefreshOperation(refConfig));
+                    await store2.Maintenance.SendAsync(new ConfigureRefreshOperation(refConfig2));
+
                     var hub1 = new PullReplicationDefinition
                     {
                         Name = "hub1",
@@ -787,25 +802,25 @@ namespace SlowTests.Smuggler
                     {
                         Name = "scon1",
                         ConnectionString = "http://127.0.0.1:8081",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
                     var scon2 = new SqlConnectionString()
                     {
                         Name = "scon2",
                         ConnectionString = "http://127.0.0.1:8082",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
                     var scon3 = new SqlConnectionString()
                     {
                         Name = "scon3",
                         ConnectionString = "http://127.0.0.1:8083",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
                     var scon4 = new SqlConnectionString()
                     {
                         Name = "scon4",
                         ConnectionString = "http://127.0.0.1:8084",
-                        FactoryName = "System.Data.SqlClient"
+                        FactoryName = "Microsoft.Data.SqlClient"
                     };
                     var putResult1 = await store1.Maintenance.SendAsync(new PutConnectionStringOperation<SqlConnectionString>(scon1));
                     var putResult2 = await store1.Maintenance.SendAsync(new PutConnectionStringOperation<SqlConnectionString>(scon2));
@@ -926,6 +941,8 @@ namespace SlowTests.Smuggler
                     Assert.Equal(10, rcc.MinimumRevisionsToKeep);
 
                     Assert.Equal(60, record.Expiration.DeleteFrequencyInSec);
+
+                    Assert.Equal(66, record.Refresh.RefreshFrequencyInSec);
 
                     disabled = 0;
                     Assert.Equal(3, record.HubPullReplications.Count);
@@ -1085,7 +1102,7 @@ namespace SlowTests.Smuggler
                 {
                     Name = "connection",
                     ConnectionString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3" + $";Initial Catalog=SqlReplication-{store.Database};",
-                    FactoryName = "System.Data.SqlClient"
+                    FactoryName = "Microsoft.Data.SqlClient"
                 };
 
                 var result2 = store.Maintenance.Send(new PutConnectionStringOperation<SqlConnectionString>(sqlConnectionString));
@@ -1300,7 +1317,7 @@ namespace SlowTests.Smuggler
                 {
                     Name = "sql-cs",
                     ConnectionString = "http://127.0.0.1:8081",
-                    FactoryName = "System.Data.SqlClient"
+                    FactoryName = "Microsoft.Data.SqlClient"
                 }));
 
                 await store.Maintenance.SendAsync(new PutConnectionStringOperation<OlapConnectionString>(new OlapConnectionString
@@ -1310,7 +1327,8 @@ namespace SlowTests.Smuggler
 
                 await store.Maintenance.SendAsync(new PutConnectionStringOperation<ElasticSearchConnectionString>(new ElasticSearchConnectionString
                 {
-                    Name = "elasticsearch-cs"
+                    Name = "elasticsearch-cs",
+                    Nodes = new[]{"http://127.0.0.1:8080" }
                 }));
 
                 await store.Maintenance.SendAsync(new PutConnectionStringOperation<QueueConnectionString>(new QueueConnectionString

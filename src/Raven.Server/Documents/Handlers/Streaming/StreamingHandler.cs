@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
+using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Exceptions.Documents;
 using Raven.Client.Exceptions.Documents.Indexes;
@@ -18,6 +19,7 @@ using Raven.Server.TrafficWatch;
 using Raven.Server.Utils;
 using Raven.Server.Utils.Enumerators;
 using Sparrow.Json;
+using Sparrow.Logging;
 
 namespace Raven.Server.Documents.Handlers.Streaming
 {
@@ -28,6 +30,7 @@ namespace Raven.Server.Documents.Handlers.Streaming
         {
             var start = GetStart();
             var pageSize = GetPageSize();
+            var format = GetStringQueryString("format", false);
 
             using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
@@ -47,7 +50,7 @@ namespace Raven.Server.Documents.Handlers.Streaming
                     initialState.Skip = new Reference<long>();
                 }
 
-                var documentsEnumerator = new PulsedTransactionEnumerator<Document, DocsStreamingIterationState>(context, state =>
+                var documentsEnumerator = new TransactionForgetAboutDocumentEnumerator(new PulsedTransactionEnumerator<Document, DocsStreamingIterationState>(context, state =>
                     {
                         if (string.IsNullOrEmpty(state.StartsWith) == false)
                         {
@@ -62,17 +65,19 @@ namespace Raven.Server.Documents.Handlers.Streaming
 
                         return Database.DocumentsStorage.GetDocumentsInReverseEtagOrder(context, state.Start, state.Take);
                     },
-                    initialState);
+                    initialState), context);
 
-                using (var token = CreateOperationToken())
-                await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+                using (var token = CreateHttpRequestBoundOperationToken())
+                await using (var writer = GetLoadDocumentsResultsWriter(format, context, ResponseBodyStream()))
                 {
-                    writer.WriteStartObject();
-                    writer.WritePropertyName("Results");
+                    writer.StartResponse();
+                    writer.StartResults();
 
-                    await writer.WriteDocumentsAsync(context, documentsEnumerator, metadataOnly: false, token.Token);
-
-                    writer.WriteEndObject();
+                    foreach (var document in documentsEnumerator)
+                        await writer.AddResultAsync(document, token.Token);
+                    
+                    writer.EndResults();
+                    writer.EndResponse();
                 }
             }
         }
@@ -97,7 +102,7 @@ namespace Raven.Server.Documents.Handlers.Streaming
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
             {
-                using (var token = CreateOperationToken())
+                using (var token = CreateHttpRequestBoundOperationToken())
                 await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
                     var reader = new TimeSeriesReader(context, documentId, name, from, to, offset, token.Token);
@@ -132,7 +137,7 @@ namespace Raven.Server.Documents.Handlers.Streaming
         {
             // ReSharper disable once ArgumentsStyleLiteral
             using (var tracker = new RequestTimeTracker(HttpContext, Logger, Database, "StreamQuery", doPerformanceHintIfTooLong: false))
-            using (var token = CreateTimeLimitedQueryToken())
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationTokenForQuery())
             using (var queryContext = QueryOperationContext.Allocate(Database))
             {
                 var documentId = GetStringQueryString("fromDocument", false);
@@ -161,6 +166,10 @@ namespace Raven.Server.Documents.Handlers.Streaming
                 var ignoreLimit = GetBoolValueQueryString("ignoreLimit", required: false) ?? false;
                 var properties = GetStringValuesQueryString("field", false);
                 var propertiesArray = properties.Count == 0 ? null : properties.ToArray();
+
+                if (LoggingSource.AuditLog.IsInfoEnabled && query.Metadata.CollectionName == Constants.Documents.Collections.AllDocumentsCollection)
+                    LogAuditFor(Database.Name, "QUERY", $"Streaming all documents (query: {query}, format: {format}, debug: {debug}, ignore limit: {ignoreLimit})");
+
                 // set the exported file name prefix
                 var fileNamePrefix = query.Metadata.IsCollectionQuery ? query.Metadata.CollectionName + "_collection" : "query_result";
                 fileNamePrefix = $"{Database.Name}_{fileNamePrefix}";
@@ -225,7 +234,7 @@ namespace Raven.Server.Documents.Handlers.Streaming
         {
             // ReSharper disable once ArgumentsStyleLiteral
             using (var tracker = new RequestTimeTracker(HttpContext, Logger, Database, "StreamQuery", doPerformanceHintIfTooLong: false))
-            using (var token = CreateTimeLimitedQueryToken())
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationTokenForQuery())
             using (var queryContext = QueryOperationContext.Allocate(Database))
             {
                 var stream = TryGetRequestFromStream("ExportOptions") ?? RequestBodyStream();
@@ -244,11 +253,15 @@ namespace Raven.Server.Documents.Handlers.Streaming
                     AddStringToHttpContext(sb.ToString(), TrafficWatchChangeType.Streams);
                 }
 
+
                 var format = GetStringQueryString("format", false);
                 var debug = GetStringQueryString("debug", false);
                 var ignoreLimit = GetBoolValueQueryString("ignoreLimit", required: false) ?? false;
                 var properties = GetStringValuesQueryString("field", false);
                 var propertiesArray = properties.Count == 0 ? null : properties.ToArray();
+
+                if (LoggingSource.AuditLog.IsInfoEnabled && query.Metadata.CollectionName == Constants.Documents.Collections.AllDocumentsCollection)
+                    LogAuditFor(Database.Name, "QUERY", $"Streaming all documents (query: {query}, format: {format}, debug: {debug}, ignore limit: {ignoreLimit})");
 
                 // set the exported file name prefix
                 var fileNamePrefix = query.Metadata.IsCollectionQuery ? query.Metadata.CollectionName + "_collection" : "query_result";
@@ -323,6 +336,13 @@ namespace Raven.Server.Documents.Handlers.Streaming
             return new StreamJsonDocumentQueryResultWriter(responseBodyStream, context);
         }
 
+        private IStreamResultsWriter<Document> GetLoadDocumentsResultsWriter(string format, DocumentsOperationContext context, Stream responseBodyStream)
+        {
+            if (string.IsNullOrEmpty(format) == false && string.Equals(format, "jsonl", StringComparison.OrdinalIgnoreCase))
+                return new StreamJsonlResultsWriter(responseBodyStream, context);
+            return new StreamResultsWriter(responseBodyStream, context);
+        }
+        
         private void ThrowUnsupportedException(string message)
         {
             throw new NotSupportedException(message);

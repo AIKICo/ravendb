@@ -16,7 +16,8 @@ namespace Raven.Client.Documents.Smuggler
         private List<string> _messages;
         protected SmugglerProgress _progress;
         private readonly Stopwatch _sw;
-
+        private DatabaseItemType _itemTypeInProgress;
+        
         public SmugglerResult()
         {
             _sw = Stopwatch.StartNew();
@@ -31,18 +32,20 @@ namespace Raven.Client.Documents.Smuggler
             */
 
             DatabaseRecord = new DatabaseRecordProgress();
-            Documents = new CountsWithSkippedCountAndLastEtag();
-            RevisionDocuments = new CountsWithLastEtagAndAttachments();
+            Documents = new CountsWithSkippedCountAndLastEtagAndAttachments();
+            RevisionDocuments = new CountsWithSkippedCountAndLastEtagAndAttachments();
             Tombstones = new CountsWithLastEtag();
             Conflicts = new CountsWithLastEtag();
             Identities = new CountsWithLastEtag();
             Indexes = new Counts();
             CompareExchange = new CountsWithLastEtag();
-            Counters = new CountsWithLastEtag();
+            Counters = new CountsWithSkippedCountAndLastEtag();
             CompareExchangeTombstones = new Counts();
             Subscriptions = new Counts();
             ReplicationHubCertificates = new Counts();
-            TimeSeries = new CountsWithLastEtag();
+            TimeSeries = new CountsWithSkippedCountAndLastEtag();
+            TimeSeriesDeletedRanges = new CountsWithSkippedCountAndLastEtag();
+
             _progress = new SmugglerProgress(this);
         }
 
@@ -84,6 +87,35 @@ namespace Raven.Client.Documents.Smuggler
         public void AddError(string message)
         {
             AddMessage("ERROR", message);
+        }
+
+        public void StartProcessingForType(DatabaseItemType type)
+        {
+            _itemTypeInProgress = type;
+            AddInfo($"Started processing {_itemTypeInProgress}.");
+        }
+
+        public void StopProcessingActualType(Counts counts)
+        {
+            AddInfo($"Finished processing {_itemTypeInProgress}. {counts}");
+            _itemTypeInProgress = DatabaseItemType.None;
+        }
+
+        public void OnCorruptedData(object sender, InvalidOperationException e)
+        {
+            switch (_itemTypeInProgress)
+            {
+                case DatabaseItemType.Documents:
+                    Documents.ErroredCount++;
+                    break;
+                case DatabaseItemType.RevisionDocuments:
+                    RevisionDocuments.ErroredCount++;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException($"Handling corrupted data of such DatabaseItemType '{nameof(_itemTypeInProgress)}' is not provided for.", e);
+            }
+
+            AddError(e.Message);
         }
 
         internal void AddMessage(string message)
@@ -151,6 +183,7 @@ namespace Raven.Client.Documents.Smuggler
                 Subscriptions = _result?.Subscriptions;
                 TimeSeries = _result?.TimeSeries;
                 ReplicationHubCertificates = _result?.ReplicationHubCertificates;
+                TimeSeriesDeletedRanges = _result?.TimeSeriesDeletedRanges;
             }
 
             private string Message { get; set; }
@@ -182,6 +215,9 @@ namespace Raven.Client.Documents.Smuggler
             if (TimeSeries.LastEtag > lastEtag)
                 lastEtag = TimeSeries.LastEtag;
 
+            if (TimeSeriesDeletedRanges.LastEtag > lastEtag)
+                lastEtag = TimeSeriesDeletedRanges.LastEtag;
+
             return lastEtag;
         }
 
@@ -200,9 +236,9 @@ namespace Raven.Client.Documents.Smuggler
     {
         public DatabaseRecordProgress DatabaseRecord { get; set; }
 
-        public CountsWithSkippedCountAndLastEtag Documents { get; set; }
+        public CountsWithSkippedCountAndLastEtagAndAttachments Documents { get; set; }
 
-        public CountsWithLastEtagAndAttachments RevisionDocuments { get; set; }
+        public CountsWithSkippedCountAndLastEtagAndAttachments RevisionDocuments { get; set; }
 
         public CountsWithLastEtag Tombstones { get; set; }
 
@@ -218,11 +254,13 @@ namespace Raven.Client.Documents.Smuggler
 
         public Counts ReplicationHubCertificates { get; set; }
 
-        public CountsWithLastEtag Counters { get; set; }
+        public CountsWithSkippedCountAndLastEtag Counters { get; set; }
 
-        public CountsWithLastEtag TimeSeries { get; set; }
+        public CountsWithSkippedCountAndLastEtag TimeSeries { get; set; }
 
         public Counts CompareExchangeTombstones { get; set; }
+
+        public CountsWithSkippedCountAndLastEtag TimeSeriesDeletedRanges { get; set; }
 
         public virtual DynamicJsonValue ToJson()
         {
@@ -241,6 +279,8 @@ namespace Raven.Client.Documents.Smuggler
                 [nameof(CompareExchangeTombstones)] = CompareExchangeTombstones.ToJson(),
                 [nameof(TimeSeries)] = TimeSeries.ToJson(),
                 [nameof(ReplicationHubCertificates)] = ReplicationHubCertificates.ToJson(),
+                [nameof(TimeSeriesDeletedRanges)] = TimeSeriesDeletedRanges.ToJson(),
+
             };
         }
 
@@ -287,7 +327,7 @@ namespace Raven.Client.Documents.Smuggler
             public bool OlapEtlsUpdated { get; set; }
 
             public bool OlapConnectionStringsUpdated { get; set; }
-            
+
             public bool ElasticSearchEtlsUpdated { get; set; }
 
             public bool ElasticSearchConnectionStringsUpdated { get; set; }
@@ -297,6 +337,8 @@ namespace Raven.Client.Documents.Smuggler
             public bool QueueEtlsUpdated { get; set; }
 
             public bool QueueConnectionStringsUpdated { get; set; }
+
+            public bool IndexesHistoryUpdated { get; set; }
 
             public override DynamicJsonValue ToJson()
             {
@@ -364,7 +406,7 @@ namespace Raven.Client.Documents.Smuggler
 
                 if (OlapEtlsUpdated)
                     json[nameof(OlapEtlsUpdated)] = OlapEtlsUpdated;
-                
+
                 if (ElasticSearchConnectionStringsUpdated)
                     json[nameof(ElasticSearchConnectionStringsUpdated)] = ElasticSearchConnectionStringsUpdated;
 
@@ -379,6 +421,9 @@ namespace Raven.Client.Documents.Smuggler
 
                 if (PostreSQLConfigurationUpdated)
                     json[nameof(PostreSQLConfigurationUpdated)] = PostreSQLConfigurationUpdated;
+
+                if (IndexesHistoryUpdated)
+                    json[nameof(IndexesHistoryUpdated)] = IndexesHistoryUpdated;
 
                 return json;
             }
@@ -448,7 +493,7 @@ namespace Raven.Client.Documents.Smuggler
 
                 if (OlapEtlsUpdated)
                     sb.AppendLine("- OLAP ETLs");
-                
+
                 if (ElasticSearchConnectionStringsUpdated)
                     sb.AppendLine("- ElasticSearch Connection Strings");
 
@@ -464,6 +509,8 @@ namespace Raven.Client.Documents.Smuggler
                 if (PostreSQLConfigurationUpdated)
                     sb.AppendLine("- PostgreSQL Integration");
 
+                if (IndexesHistoryUpdated)
+                    sb.AppendLine("- Indexes History");
 
                 if (sb.Length == 0)
                     return string.Empty;
@@ -471,6 +518,23 @@ namespace Raven.Client.Documents.Smuggler
                 sb.Insert(0, "Following configurations were updated:" + Environment.NewLine);
 
                 return sb.ToString();
+            }
+        }
+
+        public class FileCounts
+        {
+            public string CurrentFileName { get; set; }
+            public long CurrentFile { get; set; }
+            public long FileCount { get; set; }
+
+            public DynamicJsonValue ToJson()
+            {
+                return new DynamicJsonValue
+                {
+                    [nameof(CurrentFileName)] = CurrentFileName,
+                    [nameof(CurrentFile)] = CurrentFile,
+                    [nameof(FileCount)] = FileCount
+                };
             }
         }
 
@@ -502,7 +566,7 @@ namespace Raven.Client.Documents.Smuggler
 
             internal void Start()
             {
-                StartTime = SystemTime.UtcNow;
+                StartTime ??= SystemTime.UtcNow;
             }
         }
 
@@ -535,7 +599,24 @@ namespace Raven.Client.Documents.Smuggler
             }
         }
 
-        public class CountsWithSkippedCountAndLastEtag : CountsWithLastEtagAndAttachments
+        public class CountsWithSkippedCountAndLastEtag : CountsWithLastEtag
+        {
+            public long SkippedCount { get; set; }
+
+            public override DynamicJsonValue ToJson()
+            {
+                var json = base.ToJson();
+                json[nameof(SkippedCount)] = SkippedCount;
+                return json;
+            }
+
+            public override string ToString()
+            {
+                return $"Skipped: {SkippedCount}. {base.ToString()}";
+            }
+        }
+
+        public class CountsWithSkippedCountAndLastEtagAndAttachments : CountsWithLastEtagAndAttachments
         {
             public long SkippedCount { get; set; }
 

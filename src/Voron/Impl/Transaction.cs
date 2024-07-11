@@ -15,6 +15,7 @@ using Voron.Data.Containers;
 using Voron.Data.RawData;
 using Voron.Data.PostingLists;
 using Constants = Voron.Global.Constants;
+using System.IO;
 
 namespace Voron.Impl
 {
@@ -38,7 +39,8 @@ namespace Voron.Impl
 
         private Dictionary<Slice, PostingList> _postingLists;
         
-        private Dictionary<Slice, Table> _tables;
+        private Dictionary<TableKey, Table> _tables;
+        private Dictionary<Slice, TableSchemaStatsReference> _tableSchemaStats;
 
         private Dictionary<Slice, Tree> _trees;
 
@@ -213,21 +215,37 @@ namespace Voron.Impl
 
         public Table OpenTable(TableSchema schema, Slice name)
         {
-            _tables ??= new Dictionary<Slice, Table>(SliceStructComparer.Instance);
+            _tables ??= new Dictionary<TableKey, Table>();
 
-            if (_tables.TryGetValue(name, out Table value))
+            var key = new TableKey(name, schema.Compressed);
+            if (_tables.TryGetValue(key, out Table value))
                 return value;
 
             var clonedName = name.Clone(Allocator);
+            key = new TableKey(clonedName, schema.Compressed);
 
             var tableTree = ReadTree(clonedName, RootObjectType.Table);
 
             if (tableTree == null)
                 return null;
 
+            _tableSchemaStats ??= new Dictionary<Slice, TableSchemaStatsReference>(SliceComparer.Instance);
 
-            value = new Table(schema, clonedName, this, tableTree, schema.TableType);
-            _tables[clonedName] = value;
+            if (_tableSchemaStats.TryGetValue(clonedName, out var tableStatsRef) == false)
+            {
+                var stats = (TableSchemaStats*)tableTree.DirectRead(TableSchema.StatsSlice);
+                if (stats == null)
+                    throw new InvalidDataException($"Cannot find stats value for table {name}");
+
+                _tableSchemaStats[clonedName] = tableStatsRef = new TableSchemaStatsReference()
+                {
+                    NumberOfEntries = stats->NumberOfEntries,
+                    OverflowPageCount = stats->OverflowPageCount
+                };
+            }
+
+            value = new Table(schema, clonedName, this, tableTree, tableStatsRef, schema.TableType);
+            _tables[key] = value;
             return value;
         }
 
@@ -685,7 +703,7 @@ namespace Voron.Impl
 
             using (Slice.From(Allocator, name, ByteStringType.Immutable, out var nameSlice))
             {
-                _tables.Remove(nameSlice);
+                _tables.Remove(new TableKey(nameSlice, schema.Compressed));
             }
         }
 
@@ -695,7 +713,31 @@ namespace Voron.Impl
                 return;
 
             if (_cachedDecompressedBuffersByStorageId.Remove(storageId, out var t))
+            {
                 Allocator.Release(ref t);
+                _lowLevelTransaction.DecompressedBufferBytes -= t.Length;
+            }
+        }
+
+        private readonly struct TableKey
+        {
+            private readonly Slice _tableName;
+            private readonly bool _compressed;
+
+            public TableKey(Slice tableName, bool compressed)
+            {
+                _tableName = tableName;
+                _compressed = compressed;
+            }
+
+            private bool Equals(TableKey other) =>
+                SliceComparer.Equals(_tableName, other._tableName) && _compressed == other._compressed;
+
+            public override bool Equals(object obj) =>
+                obj is TableKey other && Equals(other);
+
+            public override int GetHashCode() =>
+                HashCode.Combine(_tableName.GetHashCode(), _compressed);
         }
     }
 }

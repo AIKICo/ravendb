@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,7 +21,6 @@ using Raven.Server.Smuggler.Documents;
 using Raven.Server.Smuggler.Documents.Data;
 using Raven.Server.Smuggler.Migration;
 using Raven.Server.TrafficWatch;
-using Raven.Server.Utils.Features;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
@@ -59,7 +57,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 var isReplicatedQueryString = GetStringQueryString("is-replicated", required: false);
                 if (isReplicatedQueryString != null && bool.TryParse(isReplicatedQueryString, out var result) && result)
                 {
-                    await HandleLegacyIndexesAsync();
+                    await HandleIndexesFromLegacyReplicationAsync();
                     return;
                 }
 
@@ -72,14 +70,18 @@ namespace Raven.Server.Documents.Handlers.Admin
                     var indexDefinition = JsonDeserializationServer.IndexDefinition(indexToAdd);
                     indexDefinition.Name = indexDefinition.Name?.Trim();
 
-                    var source = IsLocalRequest(HttpContext) ? Environment.MachineName : HttpContext.Connection.RemoteIpAddress.ToString();
+                    var clientCert = GetCurrentCertificate();
+                    
+                    string source;
 
+                    if (clientCert != null)
+                        source = $"{RequestIp} | {clientCert.Subject} [{clientCert.Thumbprint}]";
+                    else
+                        source = $"{RequestIp}";
+                    
                     if (LoggingSource.AuditLog.IsInfoEnabled)
                     {
-                        var clientCert = GetCurrentCertificate();
-
-                        var auditLog = LoggingSource.AuditLog.GetLogger(Database.Name, "Audit");
-                        auditLog.Info($"Index {indexDefinition.Name} PUT by {clientCert?.Subject} {clientCert?.Thumbprint} with definition: {indexToAdd} from {source} at {DateTime.UtcNow}");
+                        LogAuditFor(Database.Name, "PUT", $"Index '{indexDefinition.Name}' with definition: {indexToAdd}");
                     }
 
                     if (indexDefinition.Maps == null || indexDefinition.Maps.Count == 0)
@@ -136,8 +138,14 @@ namespace Raven.Server.Documents.Handlers.Admin
             }
         }
 
-        private async Task HandleLegacyIndexesAsync()
+        private async Task HandleIndexesFromLegacyReplicationAsync()
         {
+            if (HttpContext.Features.Get<IHttpAuthenticationFeature>() is RavenServer.AuthenticateConnection feature &&
+                feature.CanAccess(Database.Name, requireAdmin: true, requireWrite: true) == false)
+            {
+                throw new UnauthorizedAccessException("Deploying indexes from legacy replication requires admin privileges.");
+            }
+
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             await using (var stream = new ArrayStream(RequestBodyStream(), nameof(DatabaseItemType.Indexes)))
             using (var source = new StreamSource(stream, context, Database))
@@ -151,23 +159,6 @@ namespace Raven.Server.Documents.Handlers.Admin
                 var smuggler = new DatabaseSmuggler(Database, source, destination, Database.Time, options);
                 await smuggler.ExecuteAsync();
             }
-        }
-
-        public static bool IsLocalRequest(HttpContext context)
-        {
-            if (context.Connection.RemoteIpAddress == null && context.Connection.LocalIpAddress == null)
-            {
-                return true;
-            }
-            if (context.Connection.RemoteIpAddress.Equals(context.Connection.LocalIpAddress))
-            {
-                return true;
-            }
-            if (IPAddress.IsLoopback(context.Connection.RemoteIpAddress))
-            {
-                return true;
-            }
-            return false;
         }
 
         [RavenAction("/databases/*/admin/indexes/stop", "POST", AuthorizationStatus.DatabaseAdmin)]
@@ -318,7 +309,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             }
 
             var operationId = Database.Operations.GetNextOperationId();
-            var token = CreateTimeLimitedQueryOperationToken();
+            var token = CreateTimeLimitedBackgroundOperationTokenForQueryOperation();
 
             _ = Database.Operations.AddOperation(
                 Database,
@@ -385,8 +376,8 @@ namespace Raven.Server.Documents.Handlers.Admin
                 var index = Database.IndexStore.GetIndex(name);
                 if (index == null)
                     IndexDoesNotExistException.ThrowFor(name);
-                
-                var token = CreateOperationToken();
+
+                var token = CreateBackgroundOperationToken();
                 var result = new IndexOptimizeResult(index.Name);
                 var operationId = Database.Operations.GetNextOperationId();
                 var t = Database.Operations.AddOperation(

@@ -5,7 +5,6 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using FastTests;
 using FastTests.Server.Replication;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations.ConnectionStrings;
@@ -22,6 +21,7 @@ using Raven.Server.Documents.Replication;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -1238,7 +1238,7 @@ namespace SlowTests.Issues
             Assert.True(WaitForDocument<Propagation>(sinkStore1, "foo", x => x.Completed == true));
 
             using (var token = new OperationCancelToken(hubDb.Configuration.Databases.OperationTimeout.AsTimeSpan, hubDb.DatabaseShutdown, CancellationToken.None))
-                await hubDb.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                await hubDb.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
             using (var s = hubStore.OpenAsyncSession())
             {

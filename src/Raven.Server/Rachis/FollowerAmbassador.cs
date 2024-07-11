@@ -16,6 +16,7 @@ using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Binary;
 using Sparrow.Json;
+using Sparrow.Server.Utils;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron;
@@ -213,7 +214,9 @@ namespace Raven.Server.Rachis
                         }
                         catch (Exception e)
                         {
-                            NotifyOnException(ref obtainConnectionFailure, $"Failed to create a connection to node {_tag} at {_url}", e);
+                            if (e is not ParentStateChangedConcurrencyException)
+                                NotifyOnException(ref obtainConnectionFailure, $"Failed to create a connection to node {_tag} at {_url}", e);
+
                             _leader.WaitForNewEntries().Wait(TimeSpan.FromMilliseconds(_engine.ElectionTimeout.TotalMilliseconds / 2));
                             continue; // we'll retry connecting
                         }
@@ -250,6 +253,7 @@ namespace Raven.Server.Rachis
                         var readWatcher = Stopwatch.StartNew();
                         while (_leader.Running && _running)
                         {
+                            var myLastCommittedIndex = 0L;
                             entries.Clear();
                             _engine.ValidateTerm(_term);
 
@@ -286,6 +290,8 @@ namespace Raven.Server.Rachis
                                             TimeAsLeader = _leader.LeaderShipDuration,
                                             MinCommandVersion = ClusterCommandsVersionManager.CurrentClusterMinimalVersion
                                         };
+
+                                        myLastCommittedIndex = appendEntries.LeaderCommit;
                                     }
                                 }
 
@@ -377,6 +383,9 @@ namespace Raven.Server.Rachis
                             {
                                 if (_engine.GetLastEntryIndex(context) != _followerMatchIndex)
                                     continue; // instead of waiting, we have new entries, start immediately
+
+                                if (_engine.GetLastCommitIndex(context) != myLastCommittedIndex)
+                                    continue; // there is a new committed command, continue to let the leader know immediately
                             }
 
                             // either we have new entries to send, or we waited for long enough 
@@ -967,7 +976,7 @@ namespace Raven.Server.Rachis
         {
             UpdateLastMatchFromFollower(0);
             _followerAmbassadorLongRunningOperation =
-                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, ToString());
+                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, ThreadNames.ForFollowerAmbassador(ToString(), _tag, $"{_term:#,#;;0}"));
         }
 
         public override string ToString()

@@ -17,10 +17,10 @@ using Raven.Client.Documents.Indexes.Spatial;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Exceptions.Corax;
-using Raven.Client.Exceptions.Database;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Client.Extensions;
 using Raven.Client.ServerWide.Operations;
+using Raven.Client.ServerWide.Operations.OngoingTasks;
 using Raven.Client.Util;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
@@ -47,6 +47,7 @@ using Raven.Server.Documents.Queries.Suggestions;
 using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.Exceptions;
 using Raven.Server.Indexing;
+using Raven.Server.NotificationCenter;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.ServerWide;
@@ -64,9 +65,12 @@ using Sparrow.Logging;
 using Sparrow.LowMemory;
 using Sparrow.Server;
 using Sparrow.Server.Exceptions;
+using Sparrow.Server.Utils;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron;
+using Voron.Data.Containers;
+using Voron.Data.PostingLists;
 using Voron.Debugging;
 using Voron.Exceptions;
 using Voron.Impl;
@@ -366,11 +370,11 @@ namespace Raven.Server.Documents.Indexes
             exceptionAggregator.ThrowIfNeeded();
         }
 
-        public static Index Open(string path, DocumentDatabase documentDatabase, bool generateNewDatabaseId)
+        public static Index Open(string path, DocumentDatabase documentDatabase, bool generateNewDatabaseId, out SearchEngineType searchEngineType)
         {
             var logger = LoggingSource.Instance.GetLogger<Index>(documentDatabase.Name);
-
             StorageEnvironment environment = null;
+            searchEngineType = SearchEngineType.None;
 
             var name = new DirectoryInfo(path).Name;
             var indexPath = path;
@@ -394,6 +398,15 @@ namespace Raven.Server.Documents.Indexes
                 {
                     type = IndexStorage.ReadIndexType(name, environment);
                     sourceType = IndexStorage.ReadIndexSourceType(name, environment);
+                    try
+                    {
+                        searchEngineType = IndexStorage.ReadSearchEngineType(name, environment);
+                    }
+                    catch
+                    {
+                        // Since we only want to present the index search engine to the user when it's possible, we can simply ignore it when it's not possible
+                        // (for instance, if the index dates back to the pre-Corax era).
+                    }
                 }
                 catch (Exception e)
                 {
@@ -729,7 +742,9 @@ namespace Raven.Server.Documents.Indexes
 
             try
             {
-                currentlyRunningQueriesWriteLock = _currentlyRunningQueriesLock.WriterLock(new CancellationTokenSource(TimeSpan.FromSeconds(10)).Token);
+                using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+                    currentlyRunningQueriesWriteLock = _currentlyRunningQueriesLock.WriterLock(cts.Token);
+
                 _isRunningQueriesWriteLockTaken.Value = true;
             }
             catch (OperationCanceledException)
@@ -779,7 +794,7 @@ namespace Raven.Server.Documents.Indexes
                 _environment = environment;
                 var safeName = IndexDefinitionBaseServerSide.GetIndexNameSafeForFileSystem(Name);
                 _unmanagedBuffersPool = new UnmanagedBuffersPoolWithLowMemoryHandling($"Indexes//{safeName}");
-
+                _regexCache = new(ConcurrentLruRegexCache.DefaultCapacity, documentDatabase.Configuration.Queries.RegexTimeout.AsTimeSpan);
                 InitializeComponentsUsingEnvironment(documentDatabase, _environment);
 
                 LoadValues();
@@ -928,7 +943,7 @@ namespace Raven.Server.Documents.Indexes
                 {
                     ReportUnexpectedIndexingError(e);
                 }
-            }, null, IndexingThreadName);
+            }, null, ThreadNames.ForIndex(IndexingThreadName, Name, _indexStorage.DocumentDatabase.Name));
 
             RollIfNeeded();
         }
@@ -1147,7 +1162,6 @@ namespace Raven.Server.Documents.Indexes
 
             configuration.InitializeAnalyzers(DocumentDatabase.Name);
             InitializeMetrics(configuration);
-            var startIndex = false;
 
             using (DrainRunningQueries())
             {
@@ -1157,22 +1171,7 @@ namespace Raven.Server.Documents.Indexes
 
                 _indexStorage.WriteDefinition(definition);
 
-                if (definition.ClusterState?.LastStateIndex > (Definition.ClusterState?.LastStateIndex ?? -1))
-                {
-                    switch (definition.State)
-                    {
-                        case IndexState.Disabled:
-                            Disable();
-                            break;
-                        case IndexState.Normal:
-                            startIndex = true;
-                            SetState(definition.State);
-                            break;
-                        case IndexState.Error:
-                            SetState(definition.State);// Just in case we change to error manually ==> indexState == error and the index is paused
-                            break;
-                    }
-                }
+                bool startIndex = UpdateIndexState(definition);
 
                 Definition = definition;
                 Configuration = configuration;
@@ -1187,6 +1186,38 @@ namespace Raven.Server.Documents.Indexes
                 if (status == IndexRunningStatus.Running || startIndex)
                     Start();
             }
+        }
+
+        internal bool UpdateIndexState(IndexDefinitionBaseServerSide definition, bool autoIndex = false)
+        {
+            var startIndex = false;
+            if (definition.ClusterState?.LastStateIndex > (Definition.ClusterState?.LastStateIndex ?? -1))
+            {
+                switch (definition.State)
+                {
+                    case IndexState.Disabled:
+                        Disable();
+                        break;
+                    case IndexState.Normal:
+                        startIndex = true;
+                        if (autoIndex)
+                        {
+                            Definition.ClusterState ??= new ClusterState();
+                            Definition.ClusterState.LastStateIndex = definition.ClusterState.LastStateIndex;
+                        }
+                        SetState(definition.State);
+                        break;
+                    case IndexState.Error:
+                        SetState(definition.State); // Just in case we change to error manually ==> indexState == error and the index is paused
+                        break;
+                    case IndexState.Idle:
+                        if (autoIndex)
+                            SetState(definition.State);
+                        break;
+                }
+            }
+
+            return startIndex;
         }
 
         private DisposeOnce<SingleAttempt> _disposeOnce;
@@ -1765,6 +1796,10 @@ namespace Raven.Server.Documents.Indexes
                                 }
                             }
                         }
+                        catch (Exception e) when (e.IsOutOfMemory())
+                        {
+                            HandleOutOfMemoryException(null, storageEnvironment, e);
+                        }
                         catch (OperationCanceledException)
                         {
                             return;
@@ -1815,8 +1850,8 @@ namespace Raven.Server.Documents.Indexes
                         Size totalSizeOfJournals = Size.Zero;
                         foreach (var journalSize in _environment.Journal.Files.Select(i => i.JournalSize))
                             totalSizeOfJournals += journalSize;
-                        
-                        
+
+
                         if (totalSizeOfJournals >= Configuration.MinimumTotalSizeOfJournalsToRunFlushAndSyncWhenReplacingSideBySideIndex)
                             FlushAndSync(_environment, (int)Configuration.MaxTimeToWaitAfterFlushAndSyncWhenReplacingSideBySideIndex.AsTimeSpan.TotalMilliseconds, tryCleanupRecycledJournals: true);
 
@@ -2162,7 +2197,7 @@ namespace Raven.Server.Documents.Indexes
                     exception = new OutOfMemoryException("The paging file is too small for this operation to complete, consider increasing the size of the page file", exception);
                 }
 
-                scope.AddMemoryError(exception);
+                scope?.AddMemoryError(exception);
                 var outOfMemoryErrors = Interlocked.Add(ref _lowMemoryPressure, LowMemoryPressure);
                 _lowMemoryFlag.Raise();
 
@@ -2328,6 +2363,8 @@ namespace Raven.Server.Documents.Indexes
 
                             IndexFieldsPersistence.Persist(indexContext);
                             HandleReferences(tx);
+
+                            HandleMismatchedReferences();
                         }
 
                         using (stats.For(IndexingOperation.Storage.Commit))
@@ -2363,7 +2400,6 @@ namespace Raven.Server.Documents.Indexes
                             tx.InnerTransaction.LowLevelTransaction.OnDispose += _ => IndexPersistence.CleanWritersIfNeeded();
 
                             tx.Commit();
-                            SlowWriteNotification.Notify(commitStats, DocumentDatabase);
                             stats.RecordCommitStats(commitStats.NumberOfModifiedPages, commitStats.NumberOf4KbsWrittenToDisk);
                         }
                     }
@@ -2388,6 +2424,18 @@ namespace Raven.Server.Documents.Indexes
             DocumentDatabase.NotificationCenter.Indexing.AddWarning(Name, _referenceLoadWarning);
 
             _updateReferenceLoadWarning = false;
+        }
+
+        private void HandleMismatchedReferences()
+        {
+            if (CurrentIndexingScope.Current.MismatchedReferencesWarningHandler == null || CurrentIndexingScope.Current.MismatchedReferencesWarningHandler.IsEmpty)
+                return;
+
+            MismatchedReferencesLoadWarning warning = new(Name, CurrentIndexingScope.Current.MismatchedReferencesWarningHandler.GetLoadFailures());
+
+            DocumentDatabase.NotificationCenter.Indexing.AddWarning(warning);
+
+            CurrentIndexingScope.Current.MismatchedReferencesWarningHandler = null;
         }
 
         private void DisposeIndexWriterOnError(Lazy<IndexWriteOperationBase> writeOperation)
@@ -2906,7 +2954,8 @@ namespace Raven.Server.Documents.Indexes
                         Priority = Definition?.Priority ?? IndexPriority.Normal,
                         State = State,
                         Status = Status,
-                        Collections = Collections.ToDictionary(x => x, _ => new IndexStats.CollectionStats())
+                        Collections = Collections.ToDictionary(x => x, _ => new IndexStats.CollectionStats()),
+                        ReferencedCollections = GetReferencedCollectionNames()
                     };
                 }
 
@@ -2932,8 +2981,11 @@ namespace Raven.Server.Documents.Indexes
 
                     if (calculateLastBatchStats)
                         stats.LastBatchStats = _lastStats?.ToIndexingPerformanceLiveStats();
-                    
+
                     stats.LastQueryingTime = _lastQueryingTime;
+
+                    stats.ReferencedCollections = GetReferencedCollectionNames();
+
 
                     if (Type == IndexType.MapReduce || Type == IndexType.JavaScriptMapReduce)
                     {
@@ -2976,6 +3028,14 @@ namespace Raven.Server.Documents.Indexes
                     return stats;
                 }
             }
+        }
+
+        internal HashSet<string> GetReferencedCollectionNames()
+        {
+            // multiple maps can reference the same collections, we wants to return distinct names only
+            return GetReferencedCollections()?
+                .SelectMany(p => p.Value?.Select(z => z.Name))
+                .ToHashSet();
         }
 
         private IndexStats.MemoryStats GetMemoryStats()
@@ -3047,7 +3107,7 @@ namespace Raven.Server.Documents.Indexes
         public virtual async Task StreamQuery(HttpResponse response, IStreamQueryResultWriter<Document> writer,
             IndexQueryServerSide query, QueryOperationContext queryContext, OperationCancelToken token)
         {
-            var result = new StreamDocumentQueryResult(response, writer, token);
+            var result = new StreamDocumentQueryResult(response, writer, queryContext.Documents, token);
             await QueryInternal(result, query, queryContext, pulseDocsReadingTransaction: true, token);
             result.Flush();
 
@@ -3096,21 +3156,7 @@ namespace Raven.Server.Documents.Indexes
         {
             QueryInternalPreparation(query);
 
-            if (resultToFill.SupportsInclude == false
-                && (query.Metadata.Includes != null && query.Metadata.Includes.Length > 0))
-                throw new NotSupportedException("Includes are not supported by this type of query.");
-
-            if (resultToFill.SupportsHighlighting == false && query.Metadata.HasHighlightings)
-                throw new NotSupportedException("Highlighting is not supported by this type of query.");
-
-            if (query.Metadata.HasHighlightings && (query.Metadata.HasIntersect || query.Metadata.HasMoreLikeThis))
-                throw new NotSupportedException("Highlighting is not supported by this type of query.");
-
-            if (resultToFill.SupportsExplanations == false && query.Metadata.HasExplanations)
-                throw new NotSupportedException("Explanations are not supported by this type of query.");
-
-            if (query.Metadata.HasExplanations && (query.Metadata.HasIntersect || query.Metadata.HasMoreLikeThis))
-                throw new NotSupportedException("Explanations are not supported by this type of query.");
+            QueryRunner.AssertValidQuery(query, resultToFill);
 
             using (var marker = MarkQueryAsRunning(query))
             {
@@ -3186,7 +3232,7 @@ namespace Raven.Server.Documents.Indexes
                                 IncludeTimeSeriesCommand includeTimeSeriesCommand = null;
                                 IncludeRevisionsCommand includeRevisionsCommand = new(DocumentDatabase, queryContext.Documents, query.Metadata.RevisionIncludes);
 
-                                var fieldsToFetch = new FieldsToFetch(query, Definition);
+                                var fieldsToFetch = new FieldsToFetch(query, Definition, Type, SearchEngineType);
 
                                 var includeDocumentsCommand = new IncludeDocumentsCommand(
                                     DocumentDatabase.DocumentsStorage, queryContext.Documents,
@@ -3258,10 +3304,10 @@ namespace Raven.Server.Documents.Indexes
                                         token.Token);
                                 }
 
+                                long lastRaftId = DocumentDatabase.RachisLogIndexNotifications.LastModifiedIndex;
                                 try
                                 {
                                     var enumerator = documents.GetEnumerator();
-
                                     if (pulseDocsReadingTransaction)
                                     {
                                         var originalEnumerator = enumerator;
@@ -3320,7 +3366,7 @@ namespace Raven.Server.Documents.Indexes
                                 using (fillScope?.Start())
                                 {
                                     includeDocumentsCommand.Fill(resultToFill.Includes);
-                                    includeCompareExchangeValuesCommand?.Materialize();
+                                    includeCompareExchangeValuesCommand?.Materialize(lastRaftId);
                                 }
 
                                 if (includeCountersCommand != null)
@@ -3373,21 +3419,7 @@ namespace Raven.Server.Documents.Indexes
         {
             QueryInternalPreparation(query);
 
-            if (resultToFill.SupportsInclude == false
-                && (query.Metadata.Includes != null && query.Metadata.Includes.Length > 0))
-                throw new NotSupportedException("Includes are not supported by this type of query.");
-
-            if (resultToFill.SupportsHighlighting == false && query.Metadata.HasHighlightings)
-                throw new NotSupportedException("Highlighting is not supported by this type of query.");
-
-            if (query.Metadata.HasHighlightings && (query.Metadata.HasIntersect || query.Metadata.HasMoreLikeThis))
-                throw new NotSupportedException("Highlighting is not supported by this type of query.");
-
-            if (resultToFill.SupportsExplanations == false && query.Metadata.HasExplanations)
-                throw new NotSupportedException("Explanations are not supported by this type of query.");
-
-            if (query.Metadata.HasExplanations && (query.Metadata.HasIntersect || query.Metadata.HasMoreLikeThis))
-                throw new NotSupportedException("Explanations are not supported by this type of query.");
+            QueryRunner.AssertValidQuery(query, resultToFill);
 
             using (var marker = MarkQueryAsRunning(query))
             {
@@ -3924,7 +3956,7 @@ namespace Raven.Server.Documents.Indexes
 
         internal static readonly TimeSpan DefaultWaitForNonStaleResultsTimeout = TimeSpan.FromSeconds(15); // this matches default timeout from client
 
-        private readonly ConcurrentLruRegexCache _regexCache = new ConcurrentLruRegexCache(1024);
+        private ConcurrentLruRegexCache _regexCache;
 
         internal static bool WillResultBeAcceptable(bool isStale, IndexQueryBase<BlittableJsonReaderObject> query, AsyncWaitForIndexing wait)
         {
@@ -4052,7 +4084,8 @@ namespace Raven.Server.Documents.Indexes
             var length = sizeof(long) * 4 * Collections.Count + // last document etag, last tombstone etag and last mapped etags per collection
                          sizeof(int) + // definition hash
                          1 + // isStale
-                         1; // index state
+                         1 + // index state
+                         sizeof(long); // created timestamp (binary)
 
             if (q == null)
                 return length;
@@ -4094,6 +4127,8 @@ namespace Raven.Server.Documents.Indexes
             *indexEtagBytes = isStale ? (byte)0 : (byte)1;
             indexEtagBytes += sizeof(byte);
             *indexEtagBytes = (byte)indexState;
+            indexEtagBytes += sizeof(byte);
+            *(long*)indexEtagBytes = _indexStorage.CreatedTimestampAsBinary;
         }
 
         public long GetIndexEtag(QueryOperationContext context, QueryMetadata q)
@@ -4124,6 +4159,8 @@ namespace Raven.Server.Documents.Indexes
 
         public string TombstoneCleanerIdentifier => $"Index '{Name}'";
 
+        public string BlockingSourceName => TombstoneCleanerIdentifier;
+
         public virtual Dictionary<string, long> GetLastProcessedTombstonesPerCollection(ITombstoneAware.TombstoneType tombstoneType)
         {
             if (tombstoneType != ITombstoneAware.TombstoneType.Documents)
@@ -4139,6 +4176,19 @@ namespace Raven.Server.Documents.Indexes
                     }
                 }
             }
+        }
+
+        public Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> GetDisabledSubscribersCollections(HashSet<string> tombstoneCollections)
+        {
+            var dict = new Dictionary<TombstoneDeletionBlockageSource, HashSet<string>>();
+
+            if (Status is not (IndexRunningStatus.Disabled or IndexRunningStatus.Paused))
+                return dict;
+
+            var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.Index, Name);
+            dict[source] = Collections;
+
+            return dict;
         }
 
         internal Dictionary<string, long> GetLastProcessedDocumentTombstonesPerCollection(RavenTransaction tx)
@@ -4613,7 +4663,7 @@ namespace Raven.Server.Documents.Indexes
                         break;
                 }
             }
-            
+
             stats?.SetAllocatedUnmanagedBytes(threadAllocations + txAllocations);
 
             var allocatedForProcessing = threadAllocations + indexWriterAllocations +
@@ -4667,7 +4717,7 @@ namespace Raven.Server.Documents.Indexes
         public void Compact(Action<IOperationProgress> onProgress, CompactionResult result, bool shouldSkipOptimization, CancellationToken token)
         {
             if (IndexPersistence is CoraxIndexPersistence)
-                throw new NotImplementedInCoraxException($"{nameof(Compact)} is not implemented yet.");
+                throw new NotSupportedException($"{nameof(Compact)} is supported for Corax indexes.");
 
             AssertCompactionOrOptimizationIsNotInProgress(Name, nameof(Compact));
 
@@ -4917,12 +4967,33 @@ namespace Raven.Server.Documents.Indexes
                 : DocumentDatabase.DocumentsStorage.GetLastTombstoneEtag(queryContext.Documents.Transaction.InnerTransaction, collection);
         }
 
-        public virtual DetailedStorageReport GenerateStorageReport(bool calculateExactSizes)
+        public virtual unsafe DetailedStorageReport GenerateStorageReport(bool calculateExactSizes)
         {
             using (_contextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var tx = context.OpenReadTransaction())
             {
-                return _environment.GenerateDetailedReport(tx.InnerTransaction, calculateExactSizes);
+                var detailedReportInput = _environment.CreateDetailedReportInput(tx.InnerTransaction, calculateExactSizes);
+                var llt = tx.InnerTransaction.LowLevelTransaction;
+                var generator = new StorageReportGenerator(llt);
+
+                generator.HandlePostingListDetails += (postingList, report) =>
+                {
+                    if (!Corax.Constants.IndexWriter.LargePostingListsSetSlice.Equals(postingList.Name))
+                        return;
+
+                    var it = postingList.Iterate();
+                    while (it.MoveNext())
+                    {
+                        var item = Container.Get(llt, it.Current);
+                        var state = (PostingListState*)item.Address;
+                        report.BranchPages += state->BranchPages;
+                        report.LeafPages += state->LeafPages;
+                        report.PageCount += state->BranchPages + state->LeafPages;
+                        report.AllocatedSpaceInBytes += StorageReportGenerator.PagesToBytes(state->BranchPages + state->LeafPages);
+                    }
+
+                };
+                return generator.Generate(detailedReportInput);
             }
         }
 
@@ -5049,7 +5120,8 @@ namespace Raven.Server.Documents.Indexes
 
                 try
                 {
-                    _lock = _parent._currentlyRunningQueriesLock.ReaderLock(new CancellationTokenSource(timeout).Token);
+                    using (var cts = new CancellationTokenSource(timeout))
+                        _lock = _parent._currentlyRunningQueriesLock.ReaderLock(cts.Token);
                 }
                 catch (OperationCanceledException)
                 {
@@ -5068,7 +5140,8 @@ namespace Raven.Server.Documents.Indexes
 
                 try
                 {
-                    _lock = await _parent._currentlyRunningQueriesLock.ReaderLockAsync(new CancellationTokenSource(timeout).Token);
+                    using (var cts = new CancellationTokenSource(timeout))
+                        _lock = await _parent._currentlyRunningQueriesLock.ReaderLockAsync(cts.Token);
                 }
                 catch (OperationCanceledException)
                 {

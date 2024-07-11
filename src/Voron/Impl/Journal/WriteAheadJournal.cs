@@ -1,4 +1,4 @@
-﻿// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
 //  <copyright file="WriteAheadJournal.cs" company="Hibernating Rhinos LTD">
 //      Copyright (c) Hibernating Rhinos LTD. All rights reserved.
 //  </copyright>
@@ -26,11 +26,11 @@ using Sparrow.Server.Exceptions;
 using Sparrow.Server.Meters;
 using Sparrow.Server.Utils;
 using Sparrow.Threading;
-using Sparrow.Utils;
 using Voron.Data;
 using Voron.Exceptions;
 using Voron.Impl.FileHeaders;
 using Voron.Impl.Paging;
+using Voron.Impl.Scratch;
 using Voron.Util;
 using Constants = Voron.Global.Constants;
 using NativeMemory = Sparrow.Utils.NativeMemory;
@@ -192,7 +192,7 @@ namespace Voron.Impl.Journal
             var deleteLastJournal = false;
             for (var journalNumber = journalToStartReadingFrom; journalNumber <= logInfo.CurrentJournal; journalNumber++)
             {
-                addToInitLog?.Invoke($"Recovering journal {journalNumber} (upto last journal {logInfo.CurrentJournal})");
+                addToInitLog?.Invoke($"Recovering journal {journalNumber} (up to last journal {logInfo.CurrentJournal})");
                 var initialSize = _env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize;
                 var journalRecoveryName = StorageEnvironmentOptions.JournalRecoveryName(journalNumber);
                 try
@@ -311,7 +311,7 @@ namespace Voron.Impl.Journal
                                 continue;
                             }
 
-                            _env.ValidatePageChecksum(modifiedPage, ptr);
+                            _env.ValidateInMemoryPageChecksum(modifiedPage, ptr);
 
                             overflowDetector.SetPageChecked(modifiedPage);
                         }
@@ -468,7 +468,6 @@ namespace Voron.Impl.Journal
             isMoreThanMaxFileSize = false;
         }
 
-
         public Page? ReadPage(LowLevelTransaction tx, long pageNumber, Dictionary<int, PagerState> scratchPagerStates)
         {
             // read transactions have to read from journal snapshots
@@ -507,6 +506,66 @@ namespace Voron.Impl.Journal
             }
 
             return null;
+        }
+
+        public T? ReadPageHeaderForDebug<T>(LowLevelTransaction tx, long pageNumber, Dictionary<int, PagerState> scratchPagerStates) where T : unmanaged
+        {
+            // read transactions have to read from journal snapshots
+            if (tx.Flags == TransactionFlags.Read)
+            {
+                // read log snapshots from the back to get the most recent version of a page
+                for (var i = tx.JournalSnapshots.Count - 1; i >= 0; i--)
+                {
+                    if (tx.JournalSnapshots[i].PageTranslationTable.TryGetValue(tx, pageNumber, out PagePosition value))
+                    {
+                        var page = _env.ScratchBufferPool.ReadPageHeaderForDebug<T>(tx, value.ScratchNumber, value.ScratchPage, scratchPagerStates[value.ScratchNumber]);
+                        return page;
+                    }
+                }
+
+                return null;
+            }
+
+            // write transactions can read directly from journals that they got when they started up
+            var files = tx.JournalFiles;
+            for (var i = files.Count - 1; i >= 0; i--)
+            {
+                PagePosition value;
+                if (files[i].PageTranslationTable.TryGetValue(tx, pageNumber, out value))
+                {
+                    // ReSharper disable once RedundantArgumentDefaultValue
+                    var page = _env.ScratchBufferPool.ReadPageHeaderForDebug<T>(tx, value.ScratchNumber, value.ScratchPage, pagerState: null);
+                    return page;
+                }
+            }
+
+            return null;
+        }
+
+        public bool PageExists(LowLevelTransaction tx, long pageNumber)
+        {
+            // read transactions have to read from journal snapshots
+            if (tx.Flags == TransactionFlags.Read)
+            {
+                // read log snapshots from the back to get the most recent version of a page
+                for (var i = tx.JournalSnapshots.Count - 1; i >= 0; i--)
+                {
+                    if (tx.JournalSnapshots[i].PageTranslationTable.TryGetValue(tx, pageNumber, out _))
+                        return true;
+                }
+
+                return false;
+            }
+
+            // write transactions can read directly from journals that they got when they started up
+            var files = tx.JournalFiles;
+            for (var i = files.Count - 1; i >= 0; i--)
+            {
+                if (files[i].PageTranslationTable.TryGetValue(tx, pageNumber, out _))
+                    return true;
+            }
+
+            return false;
         }
 
         public void Dispose()
@@ -1418,9 +1477,10 @@ namespace Voron.Impl.Journal
                                 var scratchNumber = pagePosition.ScratchNumber;
                                 if (scratchPagerStates.TryGetValue(scratchNumber, out var pagerState) == false)
                                 {
-                                    pagerState = scratchBufferPool.GetPagerState(scratchNumber);
-                                    pagerState.AddRef();
-
+                                    // we're not under write transaction now, we need to acquire the pager state and use it for reading
+                                    var scratchBuffer = scratchBufferPool.GetScratchBufferFile(scratchNumber);
+                                    pagerState = scratchBuffer.File.Pager.GetPagerStateAndAddRefAtomically();
+                                   
                                     scratchPagerStates.Add(scratchNumber, pagerState);
                                 }
 
@@ -1428,7 +1488,7 @@ namespace Voron.Impl.Journal
                                 {
                                     using (tempTx) // release any resources, we just wanted to validate things
                                     {
-                                        var page = (PageHeader*)scratchBufferPool.AcquirePagePointerWithOverflowHandling(tempTx, scratchNumber, pagePosition.ScratchPage);
+                                        var page = (PageHeader*)scratchBufferPool.AcquirePagePointerWithOverflowHandling(tempTx, scratchNumber, pagePosition.ScratchPage, pagerState);
                                         var checksum = StorageEnvironment.CalculatePageChecksum((byte*)page, page->PageNumber, out var expectedChecksum);
                                         if (checksum != expectedChecksum)
                                             ThrowInvalidChecksumOnPageFromScratch(scratchNumber, pagePosition, page, checksum, expectedChecksum);
@@ -1450,9 +1510,9 @@ namespace Voron.Impl.Journal
                     }
 
                     if (_waj._logger.IsInfoEnabled)
-                        _waj._logger.Info($"Flushed {pagesToWrite.Count:#,#} pages to { _waj._dataPager.FileName} with {written / Constants.Size.Kilobyte:#,#} kb in {sp.Elapsed}");
+                        _waj._logger.Info($"Flushed {pagesToWrite.Count:#,#} pages to { _waj._dataPager.FileName} with {new Size(written, SizeUnit.Bytes)} in {sp.Elapsed}.");
                     else if (_waj._logger.IsOperationsEnabled && sp.Elapsed > _waj._dataPager.Options.LongRunningFlushingWarning)
-                        _waj._logger.Operations($"Very long data flushing. It took {sp.Elapsed} to flush {pagesToWrite.Count:#,#} pages to { _waj._dataPager.FileName} with {written / Constants.Size.Kilobyte:#,#} kb");
+                        _waj._logger.Operations($"Very long data flushing. It took {sp.Elapsed} to flush {pagesToWrite.Count:#,#} pages to { _waj._dataPager.FileName} with {new Size(written, SizeUnit.Bytes)}.");
 
                     Interlocked.Add(ref _totalWrittenButUnsyncedBytes, written);
                 }
@@ -1654,7 +1714,7 @@ namespace Voron.Impl.Journal
             }
         }
 
-        public CompressedPagesResult WriteToJournal(LowLevelTransaction tx, out string journalFilePath, out TimeSpan writeToJournalDuration)
+        public CompressedPagesResult WriteToJournal(LowLevelTransaction tx)
         {
             lock (_writeLock)
             {
@@ -1677,7 +1737,7 @@ namespace Voron.Impl.Journal
                     if (_logger.IsInfoEnabled)
                     {
                         _logger.Info(
-                            $"Preparing to write tx {tx.Id} to journal with {journalEntry.NumberOfUncompressedPages:#,#} pages ({(journalEntry.NumberOfUncompressedPages * Constants.Storage.PageSize) / Constants.Size.Kilobyte:#,#} kb) in {sp.Elapsed} with {Math.Round(journalEntry.NumberOf4Kbs * 4d, 1):#,#.#;;0} kb compressed.");
+                            $"Preparing to write tx {tx.Id} to journal with {journalEntry.NumberOfUncompressedPages:#,#} pages ({new Size(journalEntry.NumberOfUncompressedPages * Constants.Storage.PageSize, SizeUnit.Bytes)}) in {sp.Elapsed} with {new Size(journalEntry.NumberOf4Kbs * 4, SizeUnit.Kilobytes)} compressed.");
                     }
 
                     if (tx.IsLazyTransaction && _lazyTransactionBuffer == null)
@@ -1696,15 +1756,13 @@ namespace Voron.Impl.Journal
                     tx._forTestingPurposes?.ActionToCallJustBeforeWritingToJournal?.Invoke();
 
                     sp.Restart();
-                    journalEntry.UpdatePageTranslationTableAndUnusedPages = CurrentFile.Write(tx, journalEntry, _lazyTransactionBuffer, out writeToJournalDuration);
+                    journalEntry.UpdatePageTranslationTableAndUnusedPages = CurrentFile.Write(tx, journalEntry, _lazyTransactionBuffer);
                     sp.Stop();
                     _lastCompressionAccelerationInfo.WriteDuration = sp.Elapsed;
                     _lastCompressionAccelerationInfo.CalculateOptimalAcceleration();
 
                     if (_logger.IsInfoEnabled)
-                        _logger.Info($"Writing {journalEntry.NumberOf4Kbs * 4:#,#} kb to journal {CurrentFile.Number:D19} took {sp.Elapsed}");
-
-                    journalFilePath = CurrentFile.JournalWriter.FileName.FullPath;
+                        _logger.Info($"Writing {new Size(journalEntry.NumberOf4Kbs * 4, SizeUnit.Kilobytes)} to journal {CurrentFile.Number:D19} took {sp.Elapsed}");
 
                     if (CurrentFile.Available4Kbs == 0)
                     {
@@ -1777,7 +1835,7 @@ namespace Voron.Impl.Journal
             var pagesEncountered = 0;
             foreach (var txPage in txPages)
             {
-                var scratchPage = tx.Environment.ScratchBufferPool.AcquirePagePointerWithOverflowHandling(tx, txPage.ScratchFileNumber, txPage.PositionInScratchBuffer);
+                var scratchPage = tx.Environment.ScratchBufferPool.AcquirePagePointerWithOverflowHandling(tx, txPage.ScratchFileNumber, txPage.PositionInScratchBuffer, pagerState: null);
                 var pageHeader = (PageHeader*)scratchPage;
 
                 // When encryption is off, we do validation by checksum

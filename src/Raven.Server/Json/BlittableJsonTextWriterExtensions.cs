@@ -146,6 +146,13 @@ namespace Raven.Server.Json
                 w.WriteString(taskStats.EtlType.ToString());
                 w.WriteComma();
 
+                if (taskStats.QueueBrokerType.HasValue)
+                {
+                    w.WritePropertyName(nameof(taskStats.QueueBrokerType));
+                    w.WriteString(taskStats.QueueBrokerType.ToString());
+                    w.WriteComma();
+                }
+
                 w.WriteArray(c, nameof(taskStats.ProcessesProgress), taskStats.ProcessesProgress, (wp, cp, processProgress) =>
                 {
                     wp.WriteStartObject();
@@ -153,6 +160,13 @@ namespace Raven.Server.Json
                     wp.WritePropertyName(nameof(processProgress.TransformationName));
                     wp.WriteString(processProgress.TransformationName);
                     wp.WriteComma();
+
+                    if (processProgress.TransactionalId is not null)
+                    {
+                        wp.WritePropertyName(nameof(processProgress.TransactionalId));
+                        wp.WriteString(processProgress.TransactionalId);
+                        wp.WriteComma();
+                    }
 
                     wp.WritePropertyName(nameof(processProgress.Completed));
                     wp.WriteBool(processProgress.Completed);
@@ -235,6 +249,10 @@ namespace Raven.Server.Json
             writer.WriteInteger(result.TotalResults);
             writer.WriteComma();
 
+            writer.WritePropertyName(nameof(result.LongTotalResults));
+            writer.WriteInteger(result.LongTotalResults);
+            writer.WriteComma();
+
             if (result.CappedMaxResults != null)
             {
                 writer.WritePropertyName(nameof(result.CappedMaxResults));
@@ -259,6 +277,10 @@ namespace Raven.Server.Json
 
             writer.WritePropertyName(nameof(result.TotalResults));
             writer.WriteInteger(result.TotalResults);
+            writer.WriteComma();
+
+            writer.WritePropertyName(nameof(result.LongTotalResults));
+            writer.WriteInteger(result.LongTotalResults);
             writer.WriteComma();
 
             if (result.CappedMaxResults != null)
@@ -992,10 +1014,6 @@ namespace Raven.Server.Json
                 writer.WriteNull();
             writer.WriteComma();
 
-            writer.WritePropertyName((nameof(statistics.DatabaseChangeVector)));
-            writer.WriteString(statistics.DatabaseChangeVector);
-            writer.WriteComma();
-
             writer.WritePropertyName(nameof(statistics.LastIndexingTime));
             if (statistics.LastIndexingTime.HasValue)
                 writer.WriteDateTime(statistics.LastIndexingTime.Value, isUtc: true);
@@ -1616,14 +1634,21 @@ namespace Raven.Server.Json
                     continue;
                 }
 
-                totalDocumentsSizeInBytes += o.Size;
-
                 using (o)
                 {
                     writer.WriteObject(o);
+                    
+                    var writtenBytes = await writer.MaybeFlushAsync(token);
+                    
+                    if (o.HasParent)
+                    {
+                        // If blittable has a parent then its size is the parent's size
+                        // Let's use the number of actually written bytes then
+                        totalDocumentsSizeInBytes += writtenBytes;
+                    }
+                    else
+                        totalDocumentsSizeInBytes += o.Size;
                 }
-
-                await writer.MaybeFlushAsync(token);
             }
 
             writer.WriteEndArray();
@@ -1771,6 +1796,13 @@ namespace Raven.Server.Json
 
                 writer.WritePropertyName(nameof(kvp.Value));
                 writer.WriteObject(kvp.Value.Value);
+
+                if (kvp.Value.ChangeVector != null)
+                {
+                    writer.WriteComma();
+                    writer.WritePropertyName(nameof(kvp.Value.ChangeVector));
+                    writer.WriteString(kvp.Value.ChangeVector);
+                }
 
                 writer.WriteEndObject();
 

@@ -19,19 +19,21 @@ namespace Raven.Server.Documents.Indexes.Persistence
     {
         protected readonly QueryBuilderFactories QueryBuilderFactories;
         private readonly MemoryInfo _memoryInfo;
+        private static readonly long ThresholdForMemoryUsageLoggingInBytes = new Size(512, SizeUnit.Megabytes).GetValue(SizeUnit.Bytes);
 
         protected IndexReadOperationBase(Index index, Logger logger, QueryBuilderFactories queryBuilderFactories, IndexQueryServerSide query) : base(index, logger)
         {
             QueryBuilderFactories = queryBuilderFactories;
 
-
-            if (_logger.IsInfoEnabled && query != null)
+            if (query != null && (logger.IsInfoEnabled || logger.IsOperationsEnabled))
             {
                 _memoryInfo = new MemoryInfo
                 {
-                    AllocatedBefore = GC.GetAllocatedBytesForCurrentThread(),
+                    AllocatedManagedBefore = GC.GetAllocatedBytesForCurrentThread(),
+                    AllocatedUnmanagedBefore = NativeMemory.ThreadAllocations.Value.TotalAllocated,
                     ManagedThreadId = NativeMemory.CurrentThreadStats.ManagedThreadId,
-                    Query = query.Metadata.Query
+                    Query = query.Metadata.Query,
+                    PageSize = query.PageSize
                 };
             }
         }
@@ -58,19 +60,40 @@ namespace Raven.Server.Documents.Indexes.Persistence
             Func<string, SpatialField> getSpatialField, bool ignoreLimit, CancellationToken token);
 
         public abstract IEnumerable<string> DynamicEntriesFields(HashSet<string> staticFields);
-        
+
         public override void Dispose()
         {
-            if (_logger.IsInfoEnabled && _memoryInfo != null && _memoryInfo.ManagedThreadId == NativeMemory.CurrentThreadStats.ManagedThreadId)
+            if ((_logger.IsInfoEnabled || (_logger.IsOperationsEnabled && _index.IsLowMemory)) &&
+                _memoryInfo != null && _memoryInfo.ManagedThreadId == NativeMemory.CurrentThreadStats.ManagedThreadId)
             {
-                var diff = GC.GetAllocatedBytesForCurrentThread() - _memoryInfo.AllocatedBefore;
-                if (diff > 0)
+                // information logs are enabled or we're in a low memory state and operations logs are enabled
+
+                var mangedDiff = GC.GetAllocatedBytesForCurrentThread() - _memoryInfo.AllocatedManagedBefore;
+                var unmanagedDiff = Math.Max(0, NativeMemory.ThreadAllocations.Value.TotalAllocated - _memoryInfo.AllocatedUnmanagedBefore);
+
+                if (_logger.IsOperationsEnabled && mangedDiff < ThresholdForMemoryUsageLoggingInBytes && unmanagedDiff < ThresholdForMemoryUsageLoggingInBytes)
                 {
-                    _logger.Info($"Query for index `{_indexName}` for query: `{_memoryInfo.Query}`, allocated: {new Size(diff, SizeUnit.Bytes)}");
+                    // we don't want to spam the logs when we are in a low memory state and operations logs are enabled
+                    return;
+                }
+
+                var msg = $"Query for index `{_indexName}` for query: `{_memoryInfo.Query}`, " +
+                          $"page size: {_memoryInfo.PageSize:#,#;;0}, " +
+                          $"allocated managed: {new Size(mangedDiff, SizeUnit.Bytes)}, " +
+                          $"allocated unmanaged: {new Size(unmanagedDiff, SizeUnit.Bytes)}, " +
+                          $"managed thread id: {_memoryInfo.ManagedThreadId}";
+
+                if (_logger.IsOperationsEnabled)
+                {
+                    _logger.Operations(msg);
+                }
+                else
+                {
+                    _logger.Info(msg);
                 }
             }
         }
-        
+
         public struct QueryResult
         {
             public Document Result;
@@ -80,9 +103,11 @@ namespace Raven.Server.Documents.Indexes.Persistence
 
         private class MemoryInfo
         {
-            public long AllocatedBefore { get; init; }
+            public long AllocatedManagedBefore { get; init; }
+            public long AllocatedUnmanagedBefore { get; init; }
             public int ManagedThreadId { get; init; }
             public Queries.AST.Query Query { get; init; }
+            public int PageSize { get; init; }
         }
     }
 }

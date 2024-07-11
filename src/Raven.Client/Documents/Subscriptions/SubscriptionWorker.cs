@@ -480,12 +480,13 @@ namespace Raven.Client.Documents.Subscriptions
 
         private async Task ProcessSubscriptionAsync()
         {
+            Task notifiedSubscriber = Task.CompletedTask;
+
             try
             {
                 _processingCts.Token.ThrowIfCancellationRequested();
 
                 var contextPool = _store.GetRequestExecutor(_dbName).ContextPool;
-
                 using (contextPool.AllocateOperationContext(out JsonOperationContext context))
                 using (context.GetMemoryBuffer(out var buffer))
                 using (var tcpStream = await ConnectToServer(_processingCts.Token).ConfigureAwait(false))
@@ -507,8 +508,6 @@ namespace Raven.Client.Documents.Subscriptions
                         return;
 
                     OnEstablishedSubscriptionConnection?.Invoke();
-
-                    Task notifiedSubscriber = Task.CompletedTask;
 
                     var batch = new SubscriptionBatch<T>(_subscriptionLocalRequestExecutor, _store, _dbName, _logger);
 
@@ -538,10 +537,28 @@ namespace Raven.Client.Documents.Subscriptions
                             throw;
                         }
                         var incomingBatch = await readFromServer.ConfigureAwait(false); // wait for batch reading to end
+                        string lastReceivedChangeVector;
 
-                        _processingCts.Token.ThrowIfCancellationRequested();
+                        try
+                        {
+                            _processingCts.Token.ThrowIfCancellationRequested();
+                            lastReceivedChangeVector = batch.Initialize(incomingBatch);
+                        }
+                        catch (Exception)
+                        {
+                            try
+                            {
+                                using (incomingBatch.ReturnContext)
+                                {
+                                }
+                            }
+                            catch (Exception)
+                            {
+                                // nothing to be done here
+                            }
 
-                        var lastReceivedChangeVector = batch.Initialize(incomingBatch);
+                            throw;
+                        }
 
                         notifiedSubscriber = Task.Run(async () => // the 2'nd thread
                         {
@@ -591,6 +608,20 @@ namespace Raven.Client.Documents.Subscriptions
 
                 // otherwise this is thrown when shutting down,
                 // it isn't an error, so we don't need to treat it as such
+            }
+            finally
+            {
+                try
+                {
+                    if (notifiedSubscriber is { IsCompleted: false })
+                    {
+                        await notifiedSubscriber.WaitWithTimeout(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    // ignored
+                }
             }
         }
 

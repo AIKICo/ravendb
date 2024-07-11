@@ -9,10 +9,10 @@ using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Operations.ETL;
-using Raven.Client.Documents.Operations.ETL.OLAP;
-using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Documents.Operations.ETL.ElasticSearch;
+using Raven.Client.Documents.Operations.ETL.OLAP;
 using Raven.Client.Documents.Operations.ETL.Queue;
+using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Json.Serialization;
@@ -97,6 +97,8 @@ namespace Raven.Server.Dashboard
             var trafficWatch = new TrafficWatch();
             var drivesUsage = new DrivesUsage();
 
+            var rate = (int)RefreshRate.TotalSeconds;
+            trafficWatch.RequestsPerSecond = (int)Math.Ceiling(serverStore.Server.Metrics.Requests.RequestsPerSec.GetRate(rate));
             trafficWatch.AverageRequestDuration = serverStore.Server.Metrics.Requests.AverageDuration.GetRate();
 
             using (serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -128,8 +130,6 @@ namespace Raven.Server.Dashboard
                             continue;
                         }
 
-                        var rate = (int)RefreshRate.TotalSeconds;
-                        
                         var indexingSpeedItem = new IndexingSpeedItem
                         {
                             Database = database.Name,
@@ -319,10 +319,7 @@ namespace Raven.Server.Dashboard
                 task => EtlLoader.GetProcessState(task.Transforms, database, task.Name), task => task.BrokerType == QueueBrokerType.RabbitMq);
             
             var periodicBackupCount = database.PeriodicBackupRunner.PeriodicBackups.Count;
-            long periodicBackupCountOnNode = GetTaskCountOnNode<PeriodicBackupConfiguration>(database, dbRecord, serverStore,
-                database.PeriodicBackupRunner.PeriodicBackups.Select(x => x.Configuration),
-                task => database.PeriodicBackupRunner.GetBackupStatus(task.TaskId),
-                task => task.Name.StartsWith("Server Wide") == false);
+            long periodicBackupCountOnNode = BackupUtils.GetTasksCountOnNode(serverStore, database.Name, context);
             
             var subscriptionCount = database.SubscriptionStorage.GetAllSubscriptionsCount();
             long subscriptionCountOnNode = GetSubscriptionCountOnNode(database, dbRecord, serverStore, context);
@@ -359,7 +356,7 @@ namespace Raven.Server.Dashboard
                     continue;
 
                 var state = getTaskStatus((T)task);
-                var taskTag = database.WhoseTaskIsIt(dbRecord.Topology, task, state);
+                var taskTag = OngoingTasksUtils.WhoseTaskIsIt(serverStore, dbRecord.Topology, task, state, database.NotificationCenter);
                 if (serverStore.NodeTag == taskTag)
                 {
                     taskCountOnNode++;
@@ -374,7 +371,7 @@ namespace Raven.Server.Dashboard
             foreach (var keyValue in ClusterStateMachine.ReadValuesStartingWith(context, SubscriptionState.SubscriptionPrefix(database.Name)))
             {
                 var subscriptionState = JsonDeserializationClient.SubscriptionState(keyValue.Value);
-                var taskTag = database.WhoseTaskIsIt(dbRecord.Topology, subscriptionState, subscriptionState);
+                var taskTag = OngoingTasksUtils.WhoseTaskIsIt(serverStore, dbRecord.Topology, subscriptionState, subscriptionState, database.NotificationCenter);
                 if (serverStore.NodeTag == taskTag)
                 {
                     taskCountOnNode++;

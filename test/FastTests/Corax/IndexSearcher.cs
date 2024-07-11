@@ -126,6 +126,7 @@ namespace FastTests.Corax
             var entry1 = new IndexEntry {Id = "entry/1", Content = new string[] {"road", "lake"},};
             var entry2 = new IndexEntry {Id = "entry/2", Content = new string[] {"road", "mountain"},};
 
+            
             using var bsc = new ByteStringContext(SharedMultipleUseFlag.None);
             IndexEntries(bsc, new[] {entry1, entry2}, CreateKnownFields(bsc));
 
@@ -365,6 +366,7 @@ namespace FastTests.Corax
 
 
         [Theory]
+        [InlineData(new object[] {10, 3})]
         [InlineData(new object[] {8000, 18})]
         [InlineData(new object[] {1000, 8})]
         [InlineData(new object[] {1020, 7})]
@@ -810,9 +812,14 @@ namespace FastTests.Corax
                 var match = searcher.StartWithQuery("Content", "a");
 
                 Span<long> ids = stackalloc long[2];
-                Assert.Equal(1, match.Fill(ids));
-                Assert.Equal(2, match.Fill(ids));
+
+                int idCount = match.Fill(ids);
+                Assert.NotEqual(0, idCount);
+                idCount += match.Fill(ids);
+                Assert.NotEqual(0, idCount);
                 Assert.Equal(0, match.Fill(ids));
+
+                Assert.Equal(3, idCount);
             }
         }
 
@@ -832,7 +839,7 @@ namespace FastTests.Corax
             OrderMetadata orderMetadata = new OrderMetadata(contentMetadata, true, MatchCompareFieldType.Sequence);
             {
                 var match1 = searcher.StartWithQuery("Id", "e");
-                var match = searcher.OrderByAscending(match1, orderMetadata);
+                var match = searcher.OrderByAscending(match1, orderMetadata, take: 16);
 
                 Span<long> ids = stackalloc long[16];
                 Assert.Equal(3, match.Fill(ids));
@@ -857,10 +864,11 @@ namespace FastTests.Corax
             OrderMetadata orderMetadata = new OrderMetadata(contentMetadata, true, MatchCompareFieldType.Sequence);
             {
                 var match1 = searcher.StartWithQuery("Id", "e");
-                var match = searcher.OrderByAscending(match1, orderMetadata, take: 2);
+                var match = searcher.OrderByAscending(match1, orderMetadata);
 
                 Span<long> ids = stackalloc long[2];
                 Assert.Equal(2, match.Fill(ids));
+                Assert.Equal(1, match.Fill(ids));
                 Assert.Equal(0, match.Fill(ids));
 
                 Assert.Equal(3, match.TotalResults);
@@ -923,17 +931,26 @@ namespace FastTests.Corax
                 Span<long> ids = stackalloc long[16];
                 Assert.Equal(3, match.Fill(ids));
                 Assert.Equal(0, match.Fill(ids));
+
+                Assert.Equal("entry/3", searcher.GetIdentityFor(ids[0]));
+                Assert.Equal("entry/2", searcher.GetIdentityFor(ids[1]));
+                Assert.Equal("entry/1", searcher.GetIdentityFor(ids[2]));
             }
 
             {
                 var match1 = searcher.StartWithQuery("Id", "e");
-                var match = searcher.OrderByAscending(match1, orderMetadata);
+                var match = searcher.OrderByAscending(match1, orderMetadata, take: 16);
 
-                Span<long> ids = stackalloc long[2];
-                Assert.Equal(2, match.Fill(ids));
-                Assert.Equal(0, match.Fill(ids));
+                Span<long> ids1 = stackalloc long[2];
+                Assert.Equal(2, match.Fill(ids1));
+                Assert.Equal("entry/3", searcher.GetIdentityFor(ids1[0]));
+                Assert.Equal("entry/2", searcher.GetIdentityFor(ids1[1]));
+                
+                Span<long> ids2 = stackalloc long[2];
+                Assert.Equal(1, match.Fill(ids2));
+                Assert.Equal("entry/1", searcher.GetIdentityFor(ids2[0]));
 
-                Assert.Equal("entry/3", searcher.GetIdentityFor(ids[0]));
+                Assert.Equal(0, match.Fill(ids2));
             }
         }
 
@@ -1138,7 +1155,7 @@ namespace FastTests.Corax
             }
 
             {
-                var match = searcher.ContainsQuery(contentMetadata, "er", true);
+                var match = searcher.ContainsQuery(contentMetadata, "er");
                 Span<long> ids = stackalloc long[16];
                 Assert.Equal(1, match.Fill(ids));
                 Assert.Equal("entry/3", searcher.GetIdentityFor(ids[0]));
@@ -1195,7 +1212,7 @@ namespace FastTests.Corax
             }
 
             {
-                var match = searcher.EndsWithQuery(contentMetadata, "ing", default(ConstantScoreFunction));
+                var match = searcher.EndsWithQuery(contentMetadata, "ing");
                 Span<long> ids = stackalloc long[16];
                 Assert.Equal(2, match.Fill(ids));
             }
@@ -1934,7 +1951,7 @@ namespace FastTests.Corax
             foreach (var entry in list)
             {
                 using var __ = CreateIndexEntry(ref entryWriter, entry, out var data);
-                entry.IndexEntryId = indexWriter.Index(entry.Id, data.ToSpan());
+                entry.IndexEntryId = EntryIdEncodings.DecodeAndDiscardFrequency(indexWriter.Index(entry.Id, data.ToSpan()));
             }
             indexWriter.Commit();
             mapping.Dispose();

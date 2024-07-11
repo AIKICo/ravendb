@@ -5,10 +5,12 @@ using System.Linq;
 using System.Net;
 using System.Net.WebSockets;
 using System.Threading.Tasks;
+using NuGet.Protocol;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Replication;
 using Raven.Client.ServerWide;
 using Raven.Server.Documents.Replication;
+using Raven.Server.Documents.Replication.ReplicationItems;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
@@ -38,6 +40,38 @@ namespace Raven.Server.Documents.Handlers
                 context.Write(writer, new DynamicJsonValue
                 {
                     ["Results"] = array
+                });
+            }
+        }
+        
+        [RavenAction("/databases/*/debug/replication/all-items", "GET", AuthorizationStatus.ValidUser, EndpointType.Read)]
+        public async Task GetAllItems()
+        {
+            var etag = GetLongQueryString("etag", required: false) ?? 0L;
+            var pageSize = GetPageSize();
+
+            using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+            await using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream()))
+            using (context.OpenReadTransaction())
+            {
+                var runStats = new OutgoingReplicationRunStats();
+                var stats = new ReplicationDocumentSender.ReplicationStats
+                {
+                    Network = new OutgoingReplicationStatsScope(runStats),
+                    Storage = new OutgoingReplicationStatsScope(runStats),
+                    AttachmentRead = new OutgoingReplicationStatsScope(runStats),
+                    CounterRead = new OutgoingReplicationStatsScope(runStats),
+                    DocumentRead = new OutgoingReplicationStatsScope(runStats),
+                    TombstoneRead = new OutgoingReplicationStatsScope(runStats),
+                    TimeSeriesRead = new OutgoingReplicationStatsScope(runStats),
+                };
+
+                var items = ReplicationDocumentSender.GetReplicationItems(Database, context, etag, stats, false)
+                    .Take(pageSize);
+                
+                context.Write(writer, new DynamicJsonValue
+                {
+                    ["Results"] = new DynamicJsonArray(items.Select(x=>x.ToDebugJson()))
                 });
             }
         }
@@ -179,52 +213,74 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/replication/performance/live", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, SkipUsagesCount = true)]
         public async Task PerformanceLive()
         {
-            using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
+            try
             {
-                var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
-                var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
-
-                await using (var ms = new MemoryStream())
-                using (var collector = new LiveReplicationPerformanceCollector(Database))
+                using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
                 {
-                    // 1. Send data to webSocket without making UI wait upon opening webSocket
-                    await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+                    var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
+                    var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
 
-                    // 2. Send data to webSocket when available
-                    while (Database.DatabaseShutdown.IsCancellationRequested == false)
+                    await using (var ms = new MemoryStream())
+                    using (var collector = new LiveReplicationPerformanceCollector(Database))
                     {
-                        if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                        // 1. Send data to webSocket without making UI wait upon opening webSocket
+                        await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 100);
+
+                        // 2. Send data to webSocket when available
+                        while (Database.DatabaseShutdown.IsCancellationRequested == false)
                         {
-                            break;
+                            if (await collector.SendStatsOrHeartbeatToWebSocket(receive, webSocket, ContextPool, ms, 4000) == false)
+                            {
+                                break;
+                            }
                         }
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // disposing
+            }
+            catch (ObjectDisposedException)
+            {
+                // disposing
             }
         }
 
         [RavenAction("/databases/*/replication/pulses/live", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, SkipUsagesCount = true)]
         public async Task PulsesLive()
         {
-            using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
+            try
             {
-                var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
-                var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
-
-                await using (var ms = new MemoryStream())
-                using (var collector = new LiveReplicationPulsesCollector(Database))
+                using (var webSocket = await HttpContext.WebSockets.AcceptWebSocketAsync())
                 {
-                    // 1. Send data to webSocket without making UI wait upon opening webSocket
-                    await SendPulsesOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 100);
+                    var receiveBuffer = new ArraySegment<byte>(new byte[1024]);
+                    var receive = webSocket.ReceiveAsync(receiveBuffer, Database.DatabaseShutdown);
 
-                    // 2. Send data to webSocket when available
-                    while (Database.DatabaseShutdown.IsCancellationRequested == false)
+                    await using (var ms = new MemoryStream())
+                    using (var collector = new LiveReplicationPulsesCollector(Database))
                     {
-                        if (await SendPulsesOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 4000) == false)
+                        // 1. Send data to webSocket without making UI wait upon opening webSocket
+                        await SendPulsesOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 100);
+
+                        // 2. Send data to webSocket when available
+                        while (Database.DatabaseShutdown.IsCancellationRequested == false)
                         {
-                            break;
+                            if (await SendPulsesOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 4000) == false)
+                            {
+                                break;
+                            }
                         }
                     }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // disposing
+            }
+            catch (ObjectDisposedException)
+            {
+                // disposing
             }
         }
 

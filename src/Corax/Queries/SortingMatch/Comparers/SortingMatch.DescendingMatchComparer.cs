@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using Corax.Mappings;
 using Corax.Utils;
@@ -23,6 +24,9 @@ unsafe partial struct SortingMatch
             _field = orderMetadata.Field;
             _fieldType = orderMetadata.FieldType;
 
+            if (orderMetadata.Ascending == true)
+                throw new ArgumentException($"The metadata for field '{orderMetadata.Field.FieldName}' is not marked as 'Ascending == false' ");
+
             static int CompareWithLoadSequence(ref DescendingMatchComparer comparer, long x, long y)
             {
                 var readerX = comparer._searcher.GetEntryReaderFor(x);
@@ -41,7 +45,7 @@ unsafe partial struct SortingMatch
                 return 1;
             }
 
-            static int CompareWithLoadNumerical<T>(ref DescendingMatchComparer comparer, long x, long y) where T : unmanaged
+            static int CompareWithLoadNumerical<T>(ref DescendingMatchComparer comparer, long x, long y) where T : unmanaged, INumber<T>
             {
                 var readerX = comparer._searcher.GetEntryReaderFor(x);
                 var readX = readerX.GetFieldReaderFor(comparer._field).Read<T>(out var resultX);
@@ -70,13 +74,7 @@ unsafe partial struct SortingMatch
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public int CompareById(long idx, long idy)
-        {
-            return _compareFunc(ref this, idx, idy);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public int CompareNumerical<T>(T sx, T sy) where T : unmanaged
+        public int CompareNumerical<T>(T sx, T sy) where T : unmanaged, INumber<T>
         {
             return -BasicComparers.CompareAscending(sx, sy);
         }

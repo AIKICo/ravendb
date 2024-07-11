@@ -82,6 +82,7 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
                     return false;
 
                 case SqlProvider.MySqlClient:
+                case SqlProvider.MySqlConnectorFactory:
                     encrypt = SqlConnectionStringParser.GetConnectionStringValue(Connection.ConnectionString, new[] { "Encrypt", "UseSSL" });
 
                     if (string.IsNullOrEmpty(encrypt) == false)
@@ -148,6 +149,11 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
             result[nameof(SqlTables)] = new DynamicJsonArray(SqlTables.Select(x => x.ToJson()));
 
             return result;
+        }
+
+        public override DynamicJsonValue ToAuditJson()
+        {
+            return ToJson();
         }
     }
 

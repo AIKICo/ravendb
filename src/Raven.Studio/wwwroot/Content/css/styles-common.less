@@ -2016,7 +2016,7 @@ ul.properties {
 }
 
 .no-padding-left {
-    padding-left: 0px;
+    padding-left: 0px!important;
 }
 
 .no-padding-right {
@@ -2110,6 +2110,124 @@ ul.properties {
     gap: @gutter-xs;
 }
 
+.justify-content-center {
+    justify-content: center;
+}
+
+.justify-content-between {
+    justify-content: space-between;
+}
+
+.align-items-start {
+    align-items: start;
+}
+
+.align-items-center {
+    align-items: center;
+}
+
+.w-100 {
+    width: 100%;
+}
+
+.item-disabled {
+    filter: contrast(75%) brightness(0.75);
+    mix-blend-mode: luminosity;
+}
+
+.break-spaces {
+    white-space: break-spaces;
+}
+
+.m-0 {
+    margin: 0!important;
+}
+
+.gap-3 {
+    gap: @gutter-sm;
+}
+
+.gap-4 {
+    gap: @gutter;
+}
+
+.lh-base {
+    line-height: 1.5!important;
+}
+
+.license-restricted-badge {
+    font-weight: 600 !important;
+    letter-spacing: 0;
+    text-transform: capitalize;
+    background-color: @bg-faded-primary;
+    color: @text-faded-primary;
+}
+
+.pe-none {
+    pointer-events: none;
+}
+
+.hub-btn {
+    font-size: 0.875rem;
+    color: var(--text-color);
+    background-color: var(--panel-bg-2);
+    &:before {
+        inset: -0.1rem;
+    }
+    &:focus, &:hover {
+        background-color: var(--panel-bg-3);
+    }
+}
+
+.rounded-pill {
+    border-radius: 50rem;
+}
+
+.pt-0 {
+    padding-top: 0;
+}
+
+.mb-0 {
+    margin-bottom: 0;
+}
+
+.gap-2 {
+    gap: 0.5rem;
+}
+
+.lh-1 {
+    line-height: 1;
+}
+
+.btn-2fa {
+    background-color: @btn-2fa-bg;
+    border-color: @btn-2fa-border;
+    color: @btn-2fa-color !important;
+    i {
+        color: @btn-2fa-icon;
+    }
+    &:hover {
+        filter: brightness(1.2) saturate(1.1);
+    }
+    &:focus, &:active {
+        background-color: @btn-2fa-bg;
+        filter: brightness(1.2) saturate(1.1);
+    }
+}
+
+.label-2fa {
+    background-color: @btn-2fa-bg;
+    color: @btn-2fa-color !important;
+}
+
+.me-0 {
+    margin-right: 0 !important;
+}
+
+.z-1 {
+    z-index: 1;
+}
+
 @import "prism.less";
 @import "ace.less";
 @import "leaflet.less";
@@ -2130,6 +2248,7 @@ ul.properties {
 @import "pages/storage-report.less";
 @import "pages/sample-data.less";
 @import "pages/about.less";
+@import "pages/registration.less";
 @import "pages/details-providers.less";
 @import "pages/edit-index.less";
 @import "pages/query.less";
@@ -2172,3 +2291,4 @@ ul.properties {
 @import "pages/time-series-details.less";
 @import "pages/database-settings.less";
 @import "pages/databaseIDs.less";
+@import "pages/2fa.less";

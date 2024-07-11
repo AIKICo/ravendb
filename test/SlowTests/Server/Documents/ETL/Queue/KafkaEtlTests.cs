@@ -9,6 +9,7 @@ using Raven.Client.Documents.Operations.ConnectionStrings;
 using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Documents.Operations.ETL.Queue;
 using Raven.Client.Documents.Smuggler;
+using Raven.Client.Exceptions;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Documents.ETL.Providers.Queue;
 using Raven.Server.Documents.ETL.Providers.Queue.Test;
@@ -23,6 +24,30 @@ public class KafkaEtlTests : KafkaEtlTestBase
 {
     public KafkaEtlTests(ITestOutputHelper output) : base(output)
     {
+    }
+
+    [RavenFact(RavenTestCategory.Etl)]
+    public void Unique_QueueEtl_Tasks()
+    {
+        using (var store = GetDocumentStore())
+        {
+            var queueConnectionString = new QueueConnectionString { Name = store.Identifier, BrokerType = QueueBrokerType.RabbitMq, RabbitMqConnectionSettings = new RabbitMqConnectionSettings { ConnectionString = "test" } };
+            var putResult = store.Maintenance.Send(new PutConnectionStringOperation<QueueConnectionString>(queueConnectionString));
+            Assert.NotEqual(0, putResult.RaftCommandIndex);
+
+            var queueConfiguration = new QueueEtlConfiguration
+            {
+                Name = "test",
+                ConnectionStringName = queueConnectionString.Name,
+                Transforms = { new Transformation { Name = "loadAll", Collections = { "Users" }, Script = "loadToUsers(this)" } },
+                BrokerType = QueueBrokerType.RabbitMq
+            };
+            var addResult = store.Maintenance.Send(new AddEtlOperation<QueueConnectionString>(queueConfiguration));
+            Assert.NotEqual(0, addResult.TaskId);
+
+            var error = Assert.Throws<RavenException>(() => store.Maintenance.Send(new AddEtlOperation<QueueConnectionString>(queueConfiguration)));
+            Assert.Contains("there is already a Queue ETL task with that name", error.Message);
+        }
     }
 
     [RequiresKafkaRetryFact]
@@ -270,7 +295,7 @@ public class KafkaEtlTests : KafkaEtlTestBase
             }));
             Assert.NotNull(result1.RaftCommandIndex);
 
-            var database = GetDatabase(store.Database).Result;
+            var database = await GetDatabase(store.Database);
 
             using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             {

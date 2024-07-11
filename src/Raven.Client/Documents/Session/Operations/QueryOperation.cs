@@ -186,7 +186,7 @@ namespace Raven.Client.Documents.Session.Operations
                         queryResult.TimeSeriesIncludes);
                 }
                 if (queryResult.CompareExchangeValueIncludes != null)
-                    _session.GetClusterSession().RegisterCompareExchangeValues(queryResult.CompareExchangeValueIncludes);
+                    _session.GetClusterSession().RegisterCompareExchangeValues(queryResult.CompareExchangeValueIncludes, includingMissingAtomicGuards: false);
 
                 if (queryResult.RevisionIncludes != null) 
                     _session.RegisterRevisionIncludes(queryResult.RevisionIncludes);
@@ -274,7 +274,7 @@ namespace Raven.Client.Documents.Session.Operations
         {
             var wrapperType = new
             {
-                Result = Activator.CreateInstance<T>()
+                Result = default(T) 
             }.GetType();
 
             return (wrapperType, wrapperType.GetProperty(DummyPropertyName));

@@ -91,6 +91,8 @@ namespace Raven.Server.Documents.Indexes
 
         public int HandleDatabaseRecordChange(DatabaseRecord record, long raftIndex, bool startIndexes = true)
         {
+            ForTestingPurposes?.BeforeHandleDatabaseRecordChange?.Invoke();
+
             try
             {
                 if (record == null)
@@ -132,7 +134,6 @@ namespace Raven.Server.Documents.Indexes
                             catch (OperationCanceledException e)
                             {
                                 AddToIndexesToDelete(index);
-
                                 _documentDatabase.RachisLogIndexNotifications.NotifyListenersAbout(raftIndex, e);
                                 return;
                             }
@@ -319,15 +320,6 @@ namespace Raven.Server.Documents.Indexes
                         existingIndex.SetPriority(definition.Priority);
                     }
 
-                    if ((differences & IndexDefinitionCompareDifferences.State) != 0)
-                    {
-                        // this can only be set by cluster
-                        // and if local state is disabled or error
-                        // then we are ignoring this change
-                        if (existingIndex.State == IndexState.Normal || existingIndex.State == IndexState.Idle)
-                            existingIndex.SetState(definition.State);
-                    }
-
                     existingIndex.Update(definition, existingIndex.Configuration);
 
                     return null;
@@ -364,7 +356,7 @@ namespace Raven.Server.Documents.Indexes
 
             if (definition.Type == IndexType.AutoMap)
             {
-                var result = new AutoMapIndexDefinition(definition.Collection, mapFields, indexDeployment, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion);
+                var result = new AutoMapIndexDefinition(definition.Collection, mapFields, indexDeployment, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion, definition.ClusterState);
 
                 if (definition.Priority.HasValue)
                     result.Priority = definition.Priority.Value;
@@ -388,7 +380,7 @@ namespace Raven.Server.Documents.Indexes
                     })
                     .ToArray();
 
-                var result = new AutoMapReduceIndexDefinition(definition.Collection, mapFields, groupByFields, indexDeployment, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion);
+                var result = new AutoMapReduceIndexDefinition(definition.Collection, mapFields, groupByFields, indexDeployment, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion, definition.ClusterState);
 
                 if (definition.Priority.HasValue)
                     result.Priority = definition.Priority.Value;
@@ -460,7 +452,7 @@ namespace Raven.Server.Documents.Indexes
                     }
 
                     var configuration = new FaultyInMemoryIndexConfiguration(_documentDatabase.Configuration.Indexing.StoragePath, _documentDatabase.Configuration);
-                    var fakeIndex = new FaultyInMemoryIndex(exception, indexName, configuration, definition);
+                    var fakeIndex = new FaultyInMemoryIndex(exception, indexName, configuration, definition, SearchEngineType.None);
                     _indexes.Add(fakeIndex);
                 }
             }
@@ -1844,10 +1836,10 @@ namespace Raven.Server.Documents.Indexes
         private void OpenIndex(PathSetting path, string indexPath, List<Exception> exceptions, string name, bool startIndex, IndexDefinitionBase indexDefinition)
         {
             Index index = null;
-
+            SearchEngineType searchEngineType = SearchEngineType.None;
             try
             {
-                index = Index.Open(indexPath, _documentDatabase, generateNewDatabaseId: false);
+                index = Index.Open(indexPath, _documentDatabase, generateNewDatabaseId: false, out searchEngineType);
 
                 var differences = IndexDefinitionCompareDifferences.None;
 
@@ -1907,8 +1899,8 @@ namespace Raven.Server.Documents.Indexes
                 var configuration = new FaultyInMemoryIndexConfiguration(path, _documentDatabase.Configuration);
 
                 var faultyIndex = (indexDefinition is AutoIndexDefinition)
-                    ? new FaultyInMemoryIndex(e, name, configuration, CreateAutoDefinition((AutoIndexDefinition)indexDefinition, IndexDeploymentMode.Parallel))
-                    : new FaultyInMemoryIndex(e, name, configuration, (IndexDefinition)indexDefinition);
+                    ? new FaultyInMemoryIndex(e, name, configuration, CreateAutoDefinition((AutoIndexDefinition)indexDefinition, IndexDeploymentMode.Parallel), searchEngineType)
+                    : new FaultyInMemoryIndex(e, name, configuration, (IndexDefinition)indexDefinition, searchEngineType);
 
                 var message = $"Could not open index at '{indexPath}'. Created in-memory, fake instance: {faultyIndex.Name}";
 
@@ -2568,6 +2560,8 @@ namespace Raven.Server.Documents.Indexes
 
             internal Action<Index> BeforeIndexThreadExit;
             internal Action<Index> BeforeIndexStart;
+
+            internal Action BeforeHandleDatabaseRecordChange;
 
             public TestingStuff(IndexStore parent)
             {

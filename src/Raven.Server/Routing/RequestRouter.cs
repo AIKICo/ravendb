@@ -7,26 +7,31 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Raven.Client;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Routing;
 using Raven.Client.Properties;
 using Raven.Client.Util;
-using Raven.Server.Config;
 using Raven.Server.Documents;
 using Raven.Server.Extensions;
 using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Raven.Server.Web;
+using Raven.Server.Web.Authentication;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
+using static Raven.Server.RavenServer;
 using HttpMethods = Raven.Client.Util.HttpMethods;
+using MemoryExtensions = System.MemoryExtensions;
 
 namespace Raven.Server.Routing
 {
@@ -95,9 +100,9 @@ namespace Raven.Server.Routing
             return tryMatch.Value;
         }
 
-        internal async ValueTask<(bool Authorized, RavenServer.AuthenticationStatus Status)> TryAuthorizeAsync(RouteInformation route, HttpContext context, DocumentDatabase database)
+        internal async ValueTask<(bool Authorized, AuthenticationStatus Status)> TryAuthorizeAsync(RouteInformation route, HttpContext context, DocumentDatabase database)
         {
-            var feature = context.Features.Get<IHttpAuthenticationFeature>() as RavenServer.AuthenticateConnection;
+            var feature = context.Features.Get<IHttpAuthenticationFeature>() as AuthenticateConnection;
 
             if (feature.WrittenToAuditLog == 0) // intentionally racy, we'll check it again later
             {
@@ -139,26 +144,53 @@ namespace Raven.Server.Routing
                     }
                 }
             }
-
-            if (CanAccessRoute(route, context, database?.Name, feature, out var authenticationStatus) == false)
+            
+            if (CanAccessRoute(route, context, database?.Name, feature) == false)
             {
+                if (ShouldRetryToAuthenticateConnection(feature))
+                {
+                    var httpConnectionFeature = context.Features.Get<IHttpConnectionFeature>();
+                    
+                    feature = _ravenServer.AuthenticateConnectionCertificate(feature.Certificate, httpConnectionFeature);
+                    context.Features.Set<IHttpAuthenticationFeature>(feature);
+
+                    if (CanAccessRoute(route, context, database?.Name, feature))
+                        return (true, feature.Status);
+                }
+                
+                
                 await UnlikelyFailAuthorizationAsync(context, database?.Name, feature, route.AuthorizationStatus);
-                return (false, authenticationStatus);
+                return (false, feature.Status);
             }
 
-            return (true, authenticationStatus);
+            if (feature.RequiresTwoFactor && _ravenServer.TwoFactor.ValidateTwoFactorRequestLimits(route, context, feature.TwoFactorAuthRegistration, out var twoFactorMsg) == false)
+            {
+                if (LoggingSource.AuditLog.IsInfoEnabled)
+                {
+                    var auditLog = LoggingSource.AuditLog.GetLogger("RequestRouter", "Audit");
+                    auditLog.Info($"Rejected request {context.Request.Method} {context.Request.GetFullUrl()} because: {twoFactorMsg}");
+                }
+
+                feature.WaitingForTwoFactorAuthentication();
+
+                await UnlikelyFailAuthorizationAsync(context, database?.Name, feature, route.AuthorizationStatus);
+
+                return (false, RavenServer.AuthenticationStatus.TwoFactorAuthFromInvalidLimit);
+            }
+
+            return (true, feature.Status);
         }
 
-        internal bool CanAccessRoute(RouteInformation route, HttpContext context, string databaseName, RavenServer.AuthenticateConnection feature, out RavenServer.AuthenticationStatus authenticationStatus)
+
+        internal bool CanAccessRoute(RouteInformation route, HttpContext context, string databaseName, RavenServer.AuthenticateConnection feature)
         {
-            authenticationStatus = feature?.Status ?? RavenServer.AuthenticationStatus.None;
             switch (route.AuthorizationStatus)
             {
                 case AuthorizationStatus.UnauthenticatedClients:
                     var userWantsToAccessStudioMainPage = context.Request.Path == "/studio/index.html";
                     if (userWantsToAccessStudioMainPage)
                     {
-                        switch (authenticationStatus)
+                        switch (feature.Status)
                         {
                             case RavenServer.AuthenticationStatus.NoCertificateProvided:
                             case RavenServer.AuthenticationStatus.Expired:
@@ -177,8 +209,10 @@ namespace Raven.Server.Routing
                 case AuthorizationStatus.ValidUser:
                 case AuthorizationStatus.DatabaseAdmin:
                 case AuthorizationStatus.RestrictedAccess:
-                    switch (authenticationStatus)
+                    switch (feature.Status)
                     {
+                        case RavenServer.AuthenticationStatus.TwoFactorAuthFromInvalidLimit:
+                        case RavenServer.AuthenticationStatus.TwoFactorAuthNotProvided:
                         case RavenServer.AuthenticationStatus.NoCertificateProvided:
                         case RavenServer.AuthenticationStatus.Expired:
                         case RavenServer.AuthenticationStatus.NotYetValid:
@@ -190,7 +224,7 @@ namespace Raven.Server.Routing
                             // we allow an access to the restricted endpoints with an unfamiliar certificate, since we will authorize it at the endpoint level
                             if (route.AuthorizationStatus == AuthorizationStatus.RestrictedAccess)
                                 return true;
-                            ;
+                            
                             goto case RavenServer.AuthenticationStatus.None;
 
                         case RavenServer.AuthenticationStatus.Allowed:
@@ -241,6 +275,7 @@ namespace Raven.Server.Routing
 
             reqCtx.RavenServer = _ravenServer;
             reqCtx.RouteMatch = tryMatch.Match;
+            reqCtx.CheckForChanges = tryMatch.Value.CheckForChanges;
 
             var tuple = tryMatch.Value.TryGetHandler(reqCtx);
             var handler = tuple.Item1 ?? await tuple.Item2;
@@ -288,7 +323,13 @@ namespace Raven.Server.Routing
                     skipAuthorization = context.Request.Method == "OPTIONS";
                 }
 
-                var status = RavenServer.AuthenticationStatus.ClusterAdmin;
+                if (RequestHandler.CheckCSRF(context, reqCtx.RavenServer.ServerStore) == false)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+                    return;
+                } 
+                
+                var status = AuthenticationStatus.ClusterAdmin;
                 try
                 {
                     if (_ravenServer.Configuration.Security.AuthenticationEnabled && skipAuthorization == false)
@@ -331,6 +372,8 @@ namespace Raven.Server.Routing
                                 case RavenServer.AuthenticationStatus.ClusterAdmin:
                                 case RavenServer.AuthenticationStatus.Expired:
                                 case RavenServer.AuthenticationStatus.NotYetValid:
+                                case RavenServer.AuthenticationStatus.TwoFactorAuthNotProvided:
+                                case RavenServer.AuthenticationStatus.TwoFactorAuthFromInvalidLimit:
                                     break;
 
                                 default:
@@ -340,6 +383,8 @@ namespace Raven.Server.Routing
                         }
                     }
                 }
+
+                context.Response.Headers[Constants.Headers.ServerVersion] = RavenServerStartup.ServerVersionHeaderValue;
 
                 if (reqCtx.Database != null)
                 {
@@ -410,6 +455,7 @@ namespace Raven.Server.Routing
             AuthorizationStatus authorizationStatus)
         {
             string message;
+            int statusCode = (int)HttpStatusCode.Forbidden;
             if (feature == null ||
                 feature.Status == RavenServer.AuthenticationStatus.None ||
                 feature.Status == RavenServer.AuthenticationStatus.NoCertificateProvided)
@@ -434,9 +480,7 @@ namespace Raven.Server.Routing
                 }
                 else if (feature.Status == RavenServer.AuthenticationStatus.UnfamiliarIssuer)
                 {
-                    message = $"The supplied client certificate '{name}' is unknown to the server but has a known Public Key Pinning Hash. Will not use it to authenticate because the issuer is unknown. " +
-                              Environment.NewLine +
-                              $"To fix this, the admin can register the pinning hash of the *issuer* certificate: '{feature.IssuerHash}' in the '{RavenConfiguration.GetKey(x => x.Security.WellKnownIssuerHashes)}' configuration entry.";
+                    message = $"The supplied client certificate '{name}' is unknown to the server but has a known Public Key Pinning Hash. Will not use it to authenticate because the issuer is unknown. ";
                 }
                 else if (feature.Status == RavenServer.AuthenticationStatus.Allowed)
                 {
@@ -452,7 +496,12 @@ namespace Raven.Server.Routing
                 }
                 else if (feature.Status == RavenServer.AuthenticationStatus.NotYetValid)
                 {
-                    message = $"The supplied client certificate '{name}'cannot be used before {feature.Certificate.NotBefore:D}";
+                    message = $"The supplied client certificate '{name}' cannot be used before {feature.Certificate.NotBefore:D}";
+                }
+                else if (feature.Status == RavenServer.AuthenticationStatus.TwoFactorAuthNotProvided)
+                {
+                    statusCode = (int)HttpStatusCode.PreconditionRequired;
+                    message = $"The supplied client certificate '{name}' requires two factor authorization to be valid. Please POST the relevant TOTP value to /authentication/2fa";
                 }
                 else
                 {
@@ -475,7 +524,7 @@ namespace Raven.Server.Routing
                     break;
             }
 
-            context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+            context.Response.StatusCode = statusCode;
             using (var ctx = JsonOperationContext.ShortTermSingleUse())
             await using (var writer = new AsyncBlittableJsonTextWriter(ctx, context.Response.Body))
             {
@@ -496,6 +545,11 @@ namespace Raven.Server.Routing
                     });
             }
         }
+
+        private bool ShouldRetryToAuthenticateConnection(AuthenticateConnection authenticateConnection) =>
+            authenticateConnection.Status == AuthenticationStatus.UnfamiliarCertificate &&
+            _ravenServer.ServerStore.LastCertificateUpdateTime.HasValue &&
+            _ravenServer.ServerStore.LastCertificateUpdateTime.Value > authenticateConnection.CreatedAt;
 
         private static void ThrowUnknownAuthStatus(RouteInformation route)
         {

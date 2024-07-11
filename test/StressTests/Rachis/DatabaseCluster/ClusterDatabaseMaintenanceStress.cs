@@ -45,7 +45,7 @@ namespace StressTests.Rachis.DatabaseCluster
                 ReplicationFactor = clusterSize
             }))
             {
-                var tcs = new TaskCompletionSource<DocumentDatabase>();
+                var tcs = new TaskCompletionSource<DocumentDatabase>(TaskCreationOptions.RunContinuationsAsynchronously);
 
                 var databaseName = store.Database;
                 using (var session = store.OpenSession())
@@ -63,11 +63,11 @@ namespace StressTests.Rachis.DatabaseCluster
                 using (new DisposableAction(() =>
                 {
                     if (preferred.ServerStore.DatabasesLandlord.DatabasesCache.TryRemove(databaseName, tcs.Task))
-                        tcs.SetCanceled();
+                        tcs.TrySetCanceled();
                 }))
                 {
-                    var t = preferred.ServerStore.DatabasesLandlord.DatabasesCache.ForTestingPurposesOnly().Replace(databaseName, tcs.Task);
-                    t.Result.Dispose();
+                    var t = await preferred.ServerStore.DatabasesLandlord.DatabasesCache.ForTestingPurposesOnly().Replace(databaseName, tcs.Task);
+                    t.Dispose();
 
                     Assert.True(await WaitForValueAsync(async () =>
                     {
@@ -83,7 +83,7 @@ namespace StressTests.Rachis.DatabaseCluster
 
                 val = await WaitForValueAsync(async () => await GetRehabCount(store, databaseName), 0);
                 Assert.Equal(0, val);
-                val = await WaitForValueAsync(async () => await GetMembersCount(store, databaseName), 2);
+                val = await WaitForValueAsync(async () => await GetMembersCount(store, databaseName), clusterSize);
                 Assert.Equal(clusterSize, val);
             }
         }
@@ -96,7 +96,7 @@ namespace StressTests.Rachis.DatabaseCluster
             {
                 [RavenConfiguration.GetKey(x => x.Cluster.ElectionTimeout)] = 300.ToString(),
                 [RavenConfiguration.GetKey(x => x.Cluster.StabilizationTime)] = "1",
-                [RavenConfiguration.GetKey(x => x.Cluster.MoveToRehabGraceTime)] = "10",
+                [RavenConfiguration.GetKey(x => x.Cluster.MoveToRehabGraceTime)] = "5",
                 [RavenConfiguration.GetKey(x => x.Cluster.RotatePreferredNodeGraceTime)] = "1",
                 [RavenConfiguration.GetKey(x => x.Replication.ReplicationMinimalHeartbeat)] = "15",
             };
@@ -108,7 +108,7 @@ namespace StressTests.Rachis.DatabaseCluster
                 ReplicationFactor = clusterSize
             }))
             {
-                var tcs = new TaskCompletionSource<DocumentDatabase>();
+                var tcs = new TaskCompletionSource<DocumentDatabase>(TaskCreationOptions.RunContinuationsAsynchronously);
 
                 var databaseName = store.Database;
                 using (var session = store.OpenSession())
@@ -129,11 +129,11 @@ namespace StressTests.Rachis.DatabaseCluster
                 using (new DisposableAction(() =>
                 {
                     if (preferred.ServerStore.DatabasesLandlord.DatabasesCache.TryRemove(databaseName, tcs.Task))
-                        tcs.SetCanceled();
+                        tcs.TrySetCanceled();
                 }))
                 {
-                    var t = preferred.ServerStore.DatabasesLandlord.DatabasesCache.ForTestingPurposesOnly().Replace(databaseName, tcs.Task);
-                    t.Result.Dispose();
+                    var t = await preferred.ServerStore.DatabasesLandlord.DatabasesCache.ForTestingPurposesOnly().Replace(databaseName, tcs.Task);
+                    t.Dispose();
 
                     Assert.True(await WaitForValueAsync(async () =>
                     {
@@ -157,5 +157,6 @@ namespace StressTests.Rachis.DatabaseCluster
                 Assert.Equal(fixedOrder, record.Topology.Members);
             }
         }
+
     }
 }

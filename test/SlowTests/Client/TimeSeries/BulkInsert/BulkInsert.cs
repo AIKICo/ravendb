@@ -11,6 +11,7 @@ using Raven.Client.Documents.BulkInsert;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Operations.TimeSeries;
+using Raven.Client.Exceptions.Documents.BulkInsert;
 using Raven.Server.Utils;
 using Raven.Tests.Core.Utils.Entities;
 using SlowTests.Client.Attachments;
@@ -18,6 +19,7 @@ using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Threading;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -1183,16 +1185,16 @@ namespace SlowTests.Client.TimeSeries.BulkInsert
                     {
                         timeSeriesBulkInsert.Append(baseline.AddMinutes(1), 59d, "watches/fitbit");
 
-                        var error = Assert.Throws<InvalidOperationException>(() => bulkInsert.Store(new { Name = "Oren" }, documentId));
+                        var error = Assert.Throws<BulkInsertInvalidOperationException>(() => bulkInsert.Store(new { Name = "Oren" }, documentId));
                         AssertError();
 
-                        error = Assert.Throws<InvalidOperationException>(() => bulkInsert.CountersFor("test").Increment("1", 1));
+                        error = Assert.Throws<BulkInsertInvalidOperationException>(() => bulkInsert.CountersFor("test").Increment("1", 1));
                         AssertError();
 
-                        error = Assert.Throws<InvalidOperationException>(() => bulkInsert.TimeSeriesFor(documentId, "Pulse"));
+                        error = Assert.Throws<BulkInsertInvalidOperationException>(() => bulkInsert.TimeSeriesFor(documentId, "Pulse"));
                         AssertError();
 
-                        error = Assert.Throws<InvalidOperationException>(() => bulkInsert.TimeSeriesFor(documentId, "Heartrate"));
+                        error = Assert.Throws<BulkInsertInvalidOperationException>(() => bulkInsert.TimeSeriesFor(documentId, "Heartrate"));
                         AssertError();
 
                         void AssertError()

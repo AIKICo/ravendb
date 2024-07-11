@@ -8,11 +8,13 @@ using FastTests.Server.Replication;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations.OngoingTasks;
 using Raven.Client.Documents.Operations.Replication;
+using Raven.Client.Exceptions;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Utils;
 using Raven.Tests.Core.Utils.Entities;
 using Sparrow.Json;
+using Sparrow.Server;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -117,6 +119,42 @@ namespace SlowTests.Server.Replication
             }
         }
 
+        [Fact]
+        public async Task EnsureCantUseFilteredReplicationOnUnsecuredHub()
+        {
+            var name = $"pull-replication {GetDatabaseName()}";
+            using (var hub = GetDocumentStore())
+            {
+                var error = await Assert.ThrowsAnyAsync<RavenException>(async () =>
+                {
+                    await hub.Maintenance.ForDatabase(hub.Database).SendAsync(new PutPullReplicationAsHubOperation(new PullReplicationDefinition(name)
+                    {
+                        WithFiltering = true
+                    }));
+                });
+
+                Assert.Contains("Server must be secured in order to use filtering in pull replication", error.Message);
+            }
+        }
+
+        [Fact]
+        public async Task EnsureCantUseSinkToHubReplicationOnUnsecuredHub()
+        {
+            var name = $"pull-replication {GetDatabaseName()}";
+            using (var hub = GetDocumentStore())
+            {
+                var error = await Assert.ThrowsAnyAsync<RavenException>(async () =>
+                {
+                    await hub.Maintenance.ForDatabase(hub.Database).SendAsync(new PutPullReplicationAsHubOperation(new PullReplicationDefinition(name)
+                    {
+                        Mode = PullReplicationMode.SinkToHub | PullReplicationMode.HubToSink
+                    }));
+                });
+
+                Assert.Contains($"Server must be secured in order to use Mode {nameof(PullReplicationMode.SinkToHub)} in pull replication {name}", error.Message);
+            }
+        }
+        
         [Fact]
         public async Task DeletePullReplicationFromSink()
         {
@@ -244,7 +282,7 @@ namespace SlowTests.Server.Replication
         public async Task DisablePullReplicationOnSink()
         {
             var definitionName = $"pull-replication {GetDatabaseName()}";
-            var timeout = 3000;
+            var timeout = 10_000;
 
             using (var sink = GetDocumentStore())
             using (var hub = GetDocumentStore())
@@ -309,14 +347,14 @@ namespace SlowTests.Server.Replication
                 Assert.True(WaitForDocument(sink, "users/1", timeout), sink.Identifier);
 
                 var db = await Databases.GetDocumentDatabaseInstanceFor(sink);
-                var removedOnSink = new ManualResetEventSlim();
+                var removedOnSink = new AsyncManualResetEvent();
                 db.ReplicationLoader.IncomingReplicationRemoved += _ => removedOnSink.Set();
 
                 pullDefinition.Disabled = true;
                 pullDefinition.TaskId = saveResult.TaskId;
                 await hub.Maintenance.ForDatabase(hub.Database).SendAsync(new PutPullReplicationAsHubOperation(pullDefinition));
 
-                Assert.True(removedOnSink.Wait(timeout));
+                Assert.True(await removedOnSink.WaitAsync(TimeSpan.FromMilliseconds(timeout)));
 
                 using (var main = hub.OpenSession())
                 {
@@ -654,12 +692,12 @@ namespace SlowTests.Server.Replication
 
         //TODO write test for deletion! - make sure replication is stopped after we delete hub!
 
-        public Task<List<ModifyOngoingTaskResult>> SetupPullReplicationAsync(string remoteName, DocumentStore sink, params DocumentStore[] hub)
+        public static Task<List<ModifyOngoingTaskResult>> SetupPullReplicationAsync(string remoteName, DocumentStore sink, params DocumentStore[] hub)
         {
             return SetupPullReplicationAsync(remoteName, sink, null, hub);
         }
 
-        public async Task<List<ModifyOngoingTaskResult>> SetupPullReplicationAsync(string remoteName, DocumentStore sink, X509Certificate2 certificate, params DocumentStore[] hub)
+        public static async Task<List<ModifyOngoingTaskResult>> SetupPullReplicationAsync(string remoteName, DocumentStore sink, X509Certificate2 certificate, params DocumentStore[] hub)
         {
             var tasks = new List<Task<ModifyOngoingTaskResult>>();
             var resList = new List<ModifyOngoingTaskResult>();
@@ -670,7 +708,6 @@ namespace SlowTests.Server.Replication
                 {
                     pull.CertificateWithPrivateKey = Convert.ToBase64String(certificate.Export(X509ContentType.Pfx));
                 }
-                ModifyReplicationDestination(pull);
                 tasks.Add(AddWatcherToReplicationTopology(sink, pull, store.Urls));
             }
             await Task.WhenAll(tasks);

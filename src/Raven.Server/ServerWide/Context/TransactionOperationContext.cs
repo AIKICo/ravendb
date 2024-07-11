@@ -70,12 +70,18 @@ namespace Raven.Server.ServerWide.Context
             if (Transaction == null || Transaction.Disposed || Transaction.InnerTransaction.IsWriteTransaction)
                 ThrowReadTransactionMustBeOpen();
 
+            Allocator.DefragmentSegments();
+
             Transaction = CloneReadTransaction(Transaction);
 
             return Transaction;
         }
 
         protected abstract TTransaction CloneReadTransaction(TTransaction previous);
+
+        public override long AllocatedMemory => _arenaAllocator.Allocated + Allocator._totalAllocated;
+
+        public override long UsedMemory => _arenaAllocator.TotalUsed + Allocator._currentlyAllocated;
 
         public bool HasTransaction => Transaction != null && Transaction.Disposed == false;
 

@@ -325,7 +325,7 @@ namespace Raven.Server.Documents.ETL.Providers.Raven
                             }
                             else
                             {
-                                var (doc, attachmentName) = AttachmentsStorage.ExtractDocIdAndAttachmentNameFromTombstone(Context, item.AttachmentTombstoneId);
+                                var (doc, attachmentName) = AttachmentsStorage.GetDocIdAndAttachmentName(Context, item.AttachmentTombstoneId);
                                 _currentRun.DeleteAttachment(doc, attachmentName);
                             }
                         }
@@ -472,7 +472,14 @@ namespace Raven.Server.Documents.ETL.Providers.Raven
                 }
                 else
                 {
-                    _currentRun.PutFullDocument(docId, doc.Data);
+                    var collection = Database.DocumentsStorage.ExtractCollectionName(Context, doc.Data).Name;
+                    
+                    var etlExtractedItem = new RavenEtlItem(doc, collection);
+                    var attachments = GetAttachmentsFor(etlExtractedItem);
+                    var counterOperations = GetCounterOperationsFor(etlExtractedItem);
+                    // We don't need to put time series operations yet, it's handled outside this scope
+                    
+                    _currentRun.PutFullDocument(docId, doc.Data, attachments, counterOperations);
                 }
             }
 
@@ -506,7 +513,8 @@ namespace Raven.Server.Documents.ETL.Providers.Raven
             TimeSeriesSegmentEntry segmentEntry, 
             string loadBehaviorFunction)
         {
-            if (ShouldFilterByScriptAndGetParams(docId, segmentEntry.Name, loadBehaviorFunction, out (DateTime begin, DateTime end)? toLoad)) 
+            var tsNameOriginalCasing = Database.DocumentsStorage.TimeSeriesStorage.Stats.GetTimeSeriesNameOriginalCasing(Context, segmentEntry.DocId, segmentEntry.Name);
+            if (ShouldFilterByScriptAndGetParams(docId, tsNameOriginalCasing, loadBehaviorFunction, out (DateTime begin, DateTime end)? toLoad)) 
                 return true;
 
             if (toLoad == null)
@@ -757,7 +765,7 @@ namespace Raven.Server.Documents.ETL.Providers.Raven
 
         private List<Attachment> GetAttachmentsFor(RavenEtlItem item)
         {
-            if ((Current.Document.Flags & DocumentFlags.HasAttachments) != DocumentFlags.HasAttachments)
+            if ((item.Document.Flags & DocumentFlags.HasAttachments) != DocumentFlags.HasAttachments) 
                 return null;
 
             if (item.Document.TryGetMetadata(out var metadata) == false ||

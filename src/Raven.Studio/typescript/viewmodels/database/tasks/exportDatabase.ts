@@ -38,6 +38,7 @@ class exportDatabase extends viewModelBase {
     filteredCollections: KnockoutComputed<Array<string>>;
 
     commandTypes: Array<commandLineType> = ["PowerShell", "Cmd", "Bash"];
+    compressionAlgorithms: Array<Raven.Client.Documents.Smuggler.ExportCompressionAlgorithm> = ["Gzip", "Zstd"];
     effectiveCommandType = ko.observable<commandLineType>("PowerShell");
     effectiveCommand: KnockoutComputed<string>;
 
@@ -149,6 +150,14 @@ class exportDatabase extends viewModelBase {
                         "<span class=\"token keyword\">this</span>.Freight = <span class=\"token number\">15.3</span>;<br />" +
                         "</pre>"
             });
+        
+        popoverUtils.longWithHover($("#skipCorruptedDataPopover"), {
+            content: 
+            "<div>" +
+                "<strong>Checked</strong>: continues export despite corrupted data and logs errors in the report. <br />" +
+                "<strong>Unchecked</strong>: halts export upon encountering corrupted data." +
+                "</div>"
+        })
 
         popoverUtils.longWithHover($("#js-ongoing-tasks-disabled"), {
             content: "Imported ongoing tasks will be disabled by default."
@@ -230,6 +239,14 @@ class exportDatabase extends viewModelBase {
 
     getCommandTypeLabel(cmdType: commandLineType) {
         return `Export Command - ${cmdType}`;
+    }
+
+    getCompressionAlgorithmLabel(algorithm: Raven.Client.Documents.Smuggler.ExportCompressionAlgorithm | null) {
+        if (!algorithm) {
+            return "Default";
+        }
+        
+        return algorithm;
     }
 
     copyCommandToClipboard() {

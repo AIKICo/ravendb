@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.BulkInsert;
 using Raven.Client.Documents.Changes;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Identity;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Session;
@@ -30,7 +31,7 @@ namespace Raven.Client.Documents
     {
         private readonly ConcurrentDictionary<DatabaseChangesOptions, IDatabaseChanges> _databaseChanges = new ConcurrentDictionary<DatabaseChangesOptions, IDatabaseChanges>();
 
-        private readonly ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>> _aggressiveCacheChanges = new ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>>();
+        internal readonly ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>> _aggressiveCacheChanges = new ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>>();
 
         private readonly ConcurrentDictionary<string, Lazy<RequestExecutor>> _requestExecutors = new ConcurrentDictionary<string, Lazy<RequestExecutor>>(StringComparer.OrdinalIgnoreCase);
 
@@ -44,7 +45,7 @@ namespace Raven.Client.Documents
 
         private string _identifier;
 
-        public override IHiLoIdGenerator HiLoIdGenerator => _asyncMultiDbHiLo;
+        public override IHiLoIdGenerator HiLoIdGenerator => _asyncMultiDbHiLo ?? throw new InvalidOperationException($"Overwriting {nameof(DocumentConventions.AsyncDocumentIdGenerator)} convention does not allow usage of default HiLo generator, you should use your own one.");
 
         /// <summary>
         /// Gets or sets the identifier for this store.

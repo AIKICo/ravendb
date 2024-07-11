@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
-    <RuntimeFrameworkVersion>7.0.1</RuntimeFrameworkVersion>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeFrameworkVersion>8.0.7</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>SlowTests</AssemblyName>
     <PackageId>SlowTests</PackageId>
@@ -85,9 +85,12 @@
     <EmbeddedResource Include="Data\RavenDB_15159\12119.smaps.gz" />
     <EmbeddedResource Include="Data\RavenDB_15294\northwind-4.2.103.zip" />
     <None Remove="Data\RavenDB_18864\53AutoIndexCoraxImportTest.ravendbdump" />
+    <EmbeddedResource Include="Data\RavenDB_17312\map-reduce_54_001_index_ver.ravendb-snapshot" />
     <EmbeddedResource Include="Data\RavenDB_18864\53AutoIndexCoraxImportTest.ravendbdump" />
     <None Remove="Data\RavenDB_19449\RavenDB_19449.zip" />
     <EmbeddedResource Include="Data\RavenDB_19449\RavenDB_19449.zip" />
+    <None Remove="Data\RavenDB_21957\js_index_with_dates_54112.ravendb-snapshot" />
+    <EmbeddedResource Include="Data\RavenDB_21957\js_index_with_dates_54112.ravendb-snapshot" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Data\non-leaf-page-seq-id-large-values-2.txt" />
@@ -148,8 +151,8 @@
   </ItemGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.4.1" />
-    <PackageReference Include="System.DirectoryServices.Protocols" Version="7.0.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.10.0" />
+    <PackageReference Include="System.DirectoryServices.Protocols" Version="8.0.0" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.4.5">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>

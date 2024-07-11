@@ -4,8 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using FastTests;
-using Raven.Client.Documents;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Smuggler;
@@ -72,7 +70,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AmazonS3Theory]
+        [AmazonS3RetryTheory]
         [InlineData(7, 3, false)]
         [InlineData(10, 3, true)]
         public async Task can_delete_backups_by_date_s3(int backupAgeInSeconds, int numberOfBackupsToCreate, bool checkIncremental)
@@ -91,7 +89,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     },
                     async databaseName =>
                     {
-                        using (var client = new RavenAwsS3Client(settings, DefaultConfiguration))
+                        using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                        using (var client = new RavenAwsS3Client(settings, DefaultConfiguration, cancellationToken: cts.Token))
                         {
                             var folders = await client.ListObjectsAsync($"{client.RemoteFolderName}/", "/", listFolders: true);
                             return folders.FileInfoDetails.Count;
@@ -105,13 +104,13 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             }
         }
 
-        [AzureTheory, Trait("Category", "Smuggler")]
+        [AzureRetryTheory, Trait("Category", "Smuggler")]
         [InlineData(7, 3, false)]
         [InlineData(10, 3, true)]
         public async Task can_delete_backups_by_date_azure(int backupAgeInSeconds, int numberOfBackupsToCreate, bool checkIncremental)
         {
             await Locker.WaitAsync();
-            using (var holder = new Azure.AzureClientHolder(AzureFactAttribute.AzureSettings))
+            using (var holder = new Azure.AzureClientHolder(AzureRetryFactAttribute.AzureSettings))
             {
                 try
                 {
@@ -245,8 +244,16 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 var status = await Backup.RunBackupAndReturnStatusAsync(Server, backupTaskId, store, isFullBackup: true, expectedEtag: etag, timeout: timeout);
                 sp3.Stop();
                 
-                var directoriesCount = await getDirectoriesCount(store.Database);
                 var expectedNumberOfDirectories = checkIncremental ? 2 : 1;
+                var gracePeriod = config.LocalSettings == null
+                    ? (int)TimeSpan.FromSeconds(30).TotalMilliseconds
+                    : 0;
+
+                var directoriesCount = await WaitForValueAsync(async () => await getDirectoriesCount(store.Database),
+                    expectedVal: expectedNumberOfDirectories,
+                    timeout: gracePeriod,
+                    interval: (int)TimeSpan.FromSeconds(1).TotalMilliseconds);
+
                 Assert.True(expectedNumberOfDirectories == directoriesCount, 
                     $"ExpectedNumberOfDirectories: {expectedNumberOfDirectories}, ActualNumberOfDirectories: {directoriesCount}, SaveChanges() duration: {sp1.Elapsed}, GetStatisticsOperation duration: {sp2.Elapsed}, RunBackupAndReturnStatusAsync duration: {sp3.Elapsed}," +
                     $" Backup duration: {status.DurationInMs}, LocalRetentionDurationInMs: {status.LocalRetentionDurationInMs}");

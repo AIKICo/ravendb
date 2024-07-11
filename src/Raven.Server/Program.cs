@@ -3,30 +3,31 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Threading;
 using System.Threading.Tasks;
 using McMaster.Extensions.CommandLineUtils;
 using Microsoft.AspNetCore.Connections;
-using Raven.Client.Properties;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
 using Raven.Server.Config.Settings;
 using Raven.Server.Documents.Indexes.Static.NuGet;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.BackgroundTasks;
-using Raven.Server.ServerWide.Context;
 using Raven.Server.TrafficWatch;
 using Raven.Server.Utils;
 using Raven.Server.Utils.Cli;
 using Sparrow;
 using Sparrow.Logging;
+using Sparrow.LowMemory;
 using Sparrow.Platform;
 using Sparrow.Server.Platform;
 using Sparrow.Utils;
 using Voron;
 using Voron.Exceptions;
 using Voron.Impl;
+using NativeMemory = Sparrow.Utils.NativeMemory;
 
 namespace Raven.Server
 {
@@ -45,6 +46,8 @@ namespace Raven.Server
             UseOnlyInvariantCultureInRavenDB();
 
             SetCurrentDirectoryToServerPath();
+
+            LowMemoryNotification.Instance.SupportsCompactionOfLargeObjectHeap = true;
 
             string[] configurationArgs;
             try
@@ -67,6 +70,20 @@ namespace Raven.Server
             if (CommandLineSwitches.PrintVersionAndExit)
             {
                 Console.WriteLine(ServerVersion.FullVersion);
+                return 0;
+            }
+
+            if (CommandLineSwitches.PrintInfoAndExit)
+            {
+                Console.WriteLine($"{nameof(ServerVersion.Version)}: {ServerVersion.Version}");
+                Console.WriteLine($"{nameof(ServerVersion.FullVersion)}: {ServerVersion.FullVersion}");
+                Console.WriteLine($"{nameof(ServerVersion.AssemblyVersion)}: {ServerVersion.AssemblyVersion}");
+                Console.WriteLine($"{nameof(ServerVersion.Build)}: {ServerVersion.Build}");
+                Console.WriteLine($"{nameof(ServerVersion.CommitHash)}: {ServerVersion.CommitHash}");
+                Console.WriteLine($"{nameof(ServerVersion.ReleaseDate)}: {ServerVersion.ReleaseDate}");
+                Console.WriteLine($"Framework: {RuntimeInformation.FrameworkDescription}");
+                Console.WriteLine($"Runtime: {RuntimeInformation.RuntimeIdentifier}");
+                Console.WriteLine($"Architecture: {RuntimeInformation.ProcessArchitecture}");
                 return 0;
             }
 
@@ -112,7 +129,7 @@ namespace Raven.Server
 
             InitializeThreadPoolThreads(configuration);
 
-            MultiSourceNuGetFetcher.Instance.Initialize(configuration.Indexing.NuGetPackagesPath, configuration.Indexing.NuGetPackageSourceUrl);
+            MultiSourceNuGetFetcher.Instance.Initialize(configuration.Indexing.NuGetPackagesPath, configuration.Indexing.NuGetPackageSourceUrl, configuration.Indexing.NuGetAllowPreleasePackages);
 
             LatestVersionCheck.Instance.Initialize(configuration.Updates);
 
@@ -181,7 +198,6 @@ namespace Raven.Server
                                 Console.WriteLine("Warning: Admin Channel is not available:" + e);
                             }
 
-                            server.BeforeSchemaUpgrade = x => BeforeSchemaUpgrade(x, server.ServerStore);
                             server.Initialize();
 
                             if (CommandLineSwitches.PrintServerId)
@@ -259,10 +275,22 @@ namespace Raven.Server
                             }
                             else if (e is SocketException && PlatformDetails.RunningOnPosix)
                             {
+                                string urls;
+                                try
+                                {
+                                    var web = server.Configuration.Core?.ServerUrls ?? Array.Empty<string>();
+                                    var tcp = server.Configuration.Core.TcpServerUrls ?? Array.Empty<string>();
+                                    urls = string.Join(", ", web.Concat(tcp));
+                                }
+                                catch (Exception eUrl)
+                                {
+                                    urls = "Unable to figure our which URL is used because: " + eUrl; // should never happen
+                                }
                                 message =
                                     $"{Environment.NewLine}In Linux low-level port (below 1024) will need a special permission, " +
                                     $"if this is your case please run{Environment.NewLine}" +
-                                    $"sudo setcap CAP_NET_BIND_SERVICE=+eip {Path.Combine(AppContext.BaseDirectory, "Raven.Server")}";
+                                    $"sudo setcap CAP_NET_BIND_SERVICE=+eip {Path.Combine(AppContext.BaseDirectory, "Raven.Server")}{Environment.NewLine}" + 
+                                    $"Urls: [{urls}]";
                             }
                             else if (e.InnerException is LicenseExpiredException)
                             {
@@ -304,84 +332,6 @@ namespace Raven.Server
             return 0;
         }
 
-        private static void BeforeSchemaUpgrade(StorageEnvironment storageEnvironment, ServerStore serverStore)
-        {
-            // doing this before the schema upgrade to allow to downgrade in case we cannot start the server
-
-            using (var contextPool = new TransactionContextPool(storageEnvironment, serverStore.Configuration.Memory.MaxContextSizeToKeep))
-            {
-                var license = serverStore.LoadLicense(contextPool);
-                if (license == null)
-                    return;
-
-                var licenseStatus = LicenseManager.GetLicenseStatus(license);
-                if (licenseStatus.Expiration >= RavenVersionAttribute.Instance.ReleaseDate)
-                    return;
-
-                string licenseJson = null;
-                var fromPath = false;
-                if (string.IsNullOrEmpty(serverStore.Configuration.Licensing.License) == false)
-                {
-                    licenseJson = serverStore.Configuration.Licensing.License;
-                }
-                else if (File.Exists(serverStore.Configuration.Licensing.LicensePath.FullPath))
-                {
-                    try
-                    {
-                        licenseJson = File.ReadAllText(serverStore.Configuration.Licensing.LicensePath.FullPath);
-                        fromPath = true;
-                    }
-                    catch
-                    {
-                        // expected
-                    }
-                }
-
-                var errorMessage = $"Cannot start the RavenDB server because the expiration date of current license ({FormattedDateTime(licenseStatus.Expiration ?? DateTime.MinValue)}) " +
-                                   $"is before the release date of this version ({FormattedDateTime(RavenVersionAttribute.Instance.ReleaseDate)})";
-
-                string expiredLicenseMessage = "";
-                if (string.IsNullOrEmpty(licenseJson) == false)
-                {
-                    if (LicenseHelper.TryDeserializeLicense(licenseJson, out License localLicense))
-                    {
-                        var localLicenseStatus = LicenseManager.GetLicenseStatus(localLicense);
-                        if (localLicenseStatus.Expiration >= RavenVersionAttribute.Instance.ReleaseDate)
-                        {
-                            serverStore.LicenseManager.OnBeforeInitialize += () => serverStore.LicenseManager.TryActivateLicenseAsync(throwOnActivationFailure: serverStore.Server.ThrowOnLicenseActivationFailure).Wait(serverStore.ServerShutdown);
-                            return;
-                        }
-
-                        var configurationKey =
-                            fromPath ? RavenConfiguration.GetKey(x => x.Licensing.LicensePath) : RavenConfiguration.GetKey(x => x.Licensing.License);
-                        expiredLicenseMessage = localLicense.Id == license.Id
-                            ? ". You can update current license using the setting.json file"
-                            : $". The license '{localLicense.Id}' obtained from '{configurationKey}' with expiration date of '{FormattedDateTime(localLicenseStatus.Expiration ?? DateTime.MinValue)}' is also expired.";
-                    }
-                    else
-                    {
-                        errorMessage += ". Could not parse the license from setting.json file.";
-                        throw new LicenseExpiredException(errorMessage);
-                    }
-                }
-
-                var licenseStorage = new LicenseStorage();
-                licenseStorage.Initialize(storageEnvironment, contextPool);
-
-                var buildInfo = licenseStorage.GetBuildInfo();
-                if (buildInfo != null)
-                    errorMessage += $" You can downgrade to the latest build that was working ({buildInfo.FullVersion})";
-                if (string.IsNullOrEmpty(expiredLicenseMessage) == false)
-                    errorMessage += expiredLicenseMessage;
-                throw new LicenseExpiredException(errorMessage);
-
-                static string FormattedDateTime(DateTime dateTime)
-                {
-                    return dateTime.ToString("dd MMMM yyyy");
-                }
-            }
-        }
-
         private static void UseOnlyInvariantCultureInRavenDB()
         {
             Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
@@ -406,22 +356,20 @@ namespace Raven.Server
 
         private static void InitializeThreadPoolThreads(RavenConfiguration configuration)
         {
-            if (configuration.Server.ThreadPoolMinWorkerThreads != null || configuration.Server.ThreadPoolMinCompletionPortThreads != null)
-            {
-                ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
+            ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
 
-                int effectiveMinWorkerThreads = configuration.Server.ThreadPoolMinWorkerThreads ?? workerThreads;
-                int effectiveMinCompletionPortThreads = configuration.Server.ThreadPoolMinCompletionPortThreads ?? completionPortThreads;
+            int effectiveMinWorkerThreads = configuration.Server.ThreadPoolMinWorkerThreads ?? 2 * workerThreads;
+            int effectiveMinCompletionPortThreads = configuration.Server.ThreadPoolMinCompletionPortThreads ?? 2 * completionPortThreads;
 
-                ThreadPool.SetMinThreads(effectiveMinWorkerThreads, effectiveMinCompletionPortThreads);
+            ThreadPool.SetMinThreads(effectiveMinWorkerThreads, effectiveMinCompletionPortThreads);
 
-                if (Logger.IsInfoEnabled)
-                    Logger.Info($"Thread Pool configuration was modified by calling {nameof(ThreadPool.SetMinThreads)}. Current values: workerThreads - {effectiveMinWorkerThreads}, completionPortThreads - {effectiveMinCompletionPortThreads}.");
-            }
+            if ((configuration.Server.ThreadPoolMinWorkerThreads != null || configuration.Server.ThreadPoolMinCompletionPortThreads != null) && Logger.IsInfoEnabled)
+                Logger.Info($"Thread Pool configuration was modified by calling {nameof(ThreadPool.SetMinThreads)}. Current values: workerThreads - {effectiveMinWorkerThreads}, completionPortThreads - {effectiveMinCompletionPortThreads}.");
+
 
             if (configuration.Server.ThreadPoolMaxWorkerThreads != null || configuration.Server.ThreadPoolMaxCompletionPortThreads != null)
             {
-                ThreadPool.GetMaxThreads(out var workerThreads, out var completionPortThreads);
+                ThreadPool.GetMaxThreads(out workerThreads, out completionPortThreads);
 
                 int effectiveMaxWorkerThreads = configuration.Server.ThreadPoolMaxWorkerThreads ?? workerThreads;
                 int effectiveMaxCompletionPortThreads = configuration.Server.ThreadPoolMaxCompletionPortThreads ?? completionPortThreads;

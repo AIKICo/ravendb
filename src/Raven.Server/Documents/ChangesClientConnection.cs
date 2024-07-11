@@ -8,23 +8,29 @@ using System.Threading.Tasks;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Util;
+using Sparrow;
 using Sparrow.Collections;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Json.Sync;
+using Sparrow.LowMemory;
 using Sparrow.Server.Collections;
 using Sparrow.Threading;
+using Sparrow.Utils;
 
 namespace Raven.Server.Documents
 {
-    public class ChangesClientConnection : IDisposable
+    public class ChangesClientConnection : ILowMemoryHandler, IDisposable
     {
         private static long _counter;
 
         private readonly WebSocket _webSocket;
         private readonly DocumentDatabase _documentDatabase;
         private readonly AsyncQueue<ChangeValue> _sendQueue = new AsyncQueue<ChangeValue>();
+        private readonly MultipleUseFlag _lowMemoryFlag = new();
 
-        private readonly CancellationTokenSource _cts;
+        public CancellationTokenSource CancellationToken { get; }
+
         private readonly CancellationToken _disposeToken;
 
         private readonly DateTime _startedAt;
@@ -60,6 +66,7 @@ namespace Raven.Server.Documents
         private int _watchAllIndexes;
         private int _watchAllCounters;
         private int _watchAllTimeSeries;
+        private bool _aggressiveChanges;
 
         public class ChangeValue
         {
@@ -73,8 +80,10 @@ namespace Raven.Server.Documents
             _webSocket = webSocket;
             _documentDatabase = documentDatabase;
             _startedAt = SystemTime.UtcNow;
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(documentDatabase.DatabaseShutdown);
-            _disposeToken = _cts.Token;
+            CancellationToken = CancellationTokenSource.CreateLinkedTokenSource(documentDatabase.DatabaseShutdown);
+            _disposeToken = CancellationToken.Token;
+
+            LowMemoryNotification.Instance.RegisterLowMemoryHandler(this);
         }
 
         public long Id = Interlocked.Increment(ref _counter);
@@ -342,6 +351,15 @@ namespace Raven.Server.Documents
             if (IsDisposed)
                 return;
 
+            if (_aggressiveChanges)
+            {
+                Debug.Assert(_watchAllDocuments == 0 && (_matchingDocuments == null || _matchingDocuments.Count == 0));
+
+                if (AggressiveCacheChange.ShouldUpdateAggressiveCache(change))
+                    PulseAggressiveCaching();
+                return;
+            }
+
             if (_watchAllDocuments > 0)
             {
                 Send(change);
@@ -376,6 +394,15 @@ namespace Raven.Server.Documents
 
         public void SendIndexChanges(IndexChange change)
         {
+            if (_aggressiveChanges)
+            {
+                Debug.Assert(_watchAllIndexes == 0 && (_matchingIndexes == null || _matchingIndexes.Count == 0));
+
+                if (AggressiveCacheChange.ShouldUpdateAggressiveCache(change))
+                    PulseAggressiveCaching();
+                return;
+            }
+
             if (_watchAllIndexes > 0)
             {
                 Send(change);
@@ -386,6 +413,20 @@ namespace Raven.Server.Documents
             {
                 Send(change);
             }
+        }
+
+        private static readonly ChangeValue AggressiveCachingPulseValue = new()
+        {
+            AllowSkip = true,
+            ValueToSend = new DynamicJsonValue
+            {
+                ["Type"] = nameof(AggressiveCacheChange),
+            }
+        };
+
+        private void PulseAggressiveCaching()
+        {
+            _sendQueue.AddIfEmpty(AggressiveCachingPulseValue);
         }
 
         public void SendTopologyChanges(TopologyChange change)
@@ -533,6 +574,8 @@ namespace Raven.Server.Documents
                 await using (var ms = new MemoryStream())
                 {
                     var sp = Stopwatch.StartNew();
+                    var sendTaskSp = Stopwatch.StartNew();
+
                     while (true)
                     {
                         if (_disposeToken.IsCancellationRequested)
@@ -542,7 +585,8 @@ namespace Raven.Server.Documents
                         context.Reset();
                         context.Renew();
 
-                        await using (var writer = new AsyncBlittableJsonTextWriter(context, ms))
+                        var messagesCount = 0;
+                        using (var writer = new BlittableJsonTextWriter(context, ms))
                         {
                             sp.Restart();
 
@@ -555,17 +599,20 @@ namespace Raven.Server.Documents
                                 if (value == null || _disposeToken.IsCancellationRequested)
                                     break;
 
+                                _documentDatabase.ForTestingPurposes?.OnNextMessageChangesApi?.Invoke(value, _webSocket);
+
                                 if (first == false)
                                     writer.WriteComma();
 
                                 first = false;
                                 context.Write(writer, value);
+                                messagesCount++;
 
-                                await writer.FlushAsync();
+                                writer.Flush();
 
                                 if (ms.Length > 16 * 1024)
                                     break;
-                            } while (_sendQueue.Count > 0 && sp.Elapsed < TimeSpan.FromSeconds(5));
+                            } while (_sendQueue.IsEmpty == false && sp.Elapsed < TimeSpan.FromSeconds(5));
 
                             writer.WriteEndArray();
                         }
@@ -574,9 +621,78 @@ namespace Raven.Server.Documents
                             break;
 
                         ms.TryGetBuffer(out ArraySegment<byte> bytes);
-                        await _webSocket.SendAsync(bytes, WebSocketMessageType.Text, true, _disposeToken);
+
+                        var sendTask = _webSocket.SendAsync(bytes, WebSocketMessageType.Text, true, _disposeToken);
+                        if (sendTask.IsCompleted)
+                        {
+                            await sendTask;
+                            continue;
+                        }
+
+                        await WaitForSendTaskAsync(sendTask, sendTaskSp, messagesCount, ms);
                     }
                 }
+            }
+        }
+
+        private async Task WaitForSendTaskAsync(Task sendTask, Stopwatch sp, int messagesCount, MemoryStream ms)
+        {
+            sp.Restart();
+
+            while (true)
+            {
+                var waitTask = TimeoutManager.WaitFor(TimeSpan.FromSeconds(5), _disposeToken);
+
+                var result = await Task.WhenAny(sendTask, waitTask);
+                if (result == sendTask)
+                {
+                    await sendTask;
+                    return;
+                }
+
+                var isLowMemory = _lowMemoryFlag.IsRaised();
+                switch (isLowMemory)
+                {
+                    case true:
+                        if (_sendQueue.Count < 16 * 1024)
+                        {
+                            // we are in low memory state and the number of messages in the queue is reasonable.
+                            // continue waiting for the send task to complete.
+                            continue;
+                        }
+
+                        break;
+
+                    case false:
+                        if (_sendQueue.Count < 128 * 1024)
+                        {
+                            // we aren't in low memory state and the number of pending messages is less than 128K.
+                            // continue waiting for the send task to complete.
+                            continue;
+                        }
+
+                        break;
+                }
+
+                // - we waited for some time for the send task to complete,
+                // - we are in low memory state and the number of messages waiting in the queue exceeds 16K
+                // - OR we have 128K messages waiting in the queue.
+                // - we'll close the WebSocket connection and let the client reconnect again.
+
+                try
+                {
+                    CancellationToken.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // the connection was already disposed
+                }
+
+                throw new TimeoutException($"Waited for {sp.Elapsed} to send {messagesCount:#,#;;0} messages to the client but was unsuccessful " +
+                                           $"(total size: {new Sparrow.Size(ms.Length, SizeUnit.Bytes)}), " +
+                                           $"low memory state: {isLowMemory} and there are {_sendQueue.Count:#,#;;0} messages waiting in the queue. " +
+                                           $"Changes connection from studio: {IsChangesConnectionOriginatedFromStudio}. " +
+                                           $"Closing the changes WebSocket and letting the client reconnect again.");
             }
         }
 
@@ -618,13 +734,13 @@ namespace Raven.Server.Documents
         public void Dispose()
         {
             _isDisposed.Raise();
-            _cts.Cancel();
+            CancellationToken.Cancel();
             _sendQueue.Enqueue(new ChangeValue
             {
                 AllowSkip = false,
                 ValueToSend = null
             });
-            _cts.Dispose();
+            CancellationToken.Dispose();
         }
 
         public void Confirm(int commandId)
@@ -646,7 +762,8 @@ namespace Raven.Server.Documents
             {
                 ValueToSend = new DynamicJsonValue
                 {
-                    ["TopologyChange"] = true
+                    [nameof(ChangesSupportedFeatures.TopologyChange)] = true,
+                    [nameof(ChangesSupportedFeatures.AggressiveCachingChange)] = true,
                 },
                 AllowSkip = false
             });
@@ -796,6 +913,14 @@ namespace Raven.Server.Documents
             {
                 WatchTopology();
             }
+            else if (Match(command, "watch-aggressive-caching"))
+            {
+                _aggressiveChanges = true;
+            }
+            else if (Match(command, "unwatch-aggressive-caching"))
+            {
+                _aggressiveChanges = false;
+            }
             else
             {
                 throw new ArgumentOutOfRangeException(nameof(command), "Command argument is not valid");
@@ -812,6 +937,7 @@ namespace Raven.Server.Documents
             return new DynamicJsonValue
             {
                 ["Id"] = Id,
+                ["PendingMessagesCount"] = _sendQueue.Count,
                 ["State"] = _webSocket.State.ToString(),
                 ["CloseStatus"] = _webSocket.CloseStatus,
                 ["CloseStatusDescription"] = _webSocket.CloseStatusDescription,
@@ -889,6 +1015,16 @@ namespace Raven.Server.Documents
                     [nameof(Name)] = Name
                 };
             }
+        }
+
+        public void LowMemory(LowMemorySeverity lowMemorySeverity)
+        {
+            _lowMemoryFlag.Raise();
+        }
+
+        public void LowMemoryOver()
+        {
+            _lowMemoryFlag.Lower();
         }
     }
 }

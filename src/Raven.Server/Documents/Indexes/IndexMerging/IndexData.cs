@@ -29,10 +29,11 @@ namespace Raven.Server.Documents.Indexes.IndexMerging
 
         public string IndexName { get; set; }
         public bool IsAlreadyMerged { get; set; }
-        public bool IsSuitedForMerge { get; set; }
         public string Comment { get; set; }
 
-        public string Collection { get; set; }
+        public bool IsFanout { get; set; }
+
+        public string[] Collections { get; set; }
         public InvocationExpressionSyntax InvocationExpression { get; set; }
         public IndexDefinition Index => _index;
         public bool IsMapReduceOrMultiMap { get; set; }

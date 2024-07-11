@@ -9,6 +9,7 @@ using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Queries.Timings;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Client.Extensions;
@@ -25,6 +26,7 @@ using Raven.Server.ServerWide.Context;
 using Raven.Server.TrafficWatch;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Logging;
 using PatchRequest = Raven.Server.Documents.Patch.PatchRequest;
 
 namespace Raven.Server.Documents.Handlers
@@ -49,7 +51,7 @@ namespace Raven.Server.Documents.Handlers
             {
                 try
                 {
-                    using (var token = CreateTimeLimitedQueryToken())
+                    using (var token = CreateHttpRequestBoundTimeLimitedOperationTokenForQuery())
                     using (var queryContext = QueryOperationContext.Allocate(Database))
                     {
                         var debug = GetStringQueryString("debug", required: false);
@@ -111,6 +113,8 @@ namespace Raven.Server.Documents.Handlers
             
             if (ShouldAddPagingPerformanceHint(numberOfResults))
                 AddPagingPerformanceHint(PagingOperationType.Queries, $"{nameof(FacetedQuery)} ({result.IndexName})", $"{indexQuery.Metadata.QueryText}\n{indexQuery.QueryParameters}", numberOfResults, indexQuery.PageSize, result.DurationInMs, -1);
+
+            AddQueryTimingsToTrafficWatch(indexQuery);
         }
 
         private async Task Query(QueryOperationContext queryContext, OperationCancelToken token, RequestTimeTracker tracker, HttpMethod method)
@@ -174,6 +178,14 @@ namespace Raven.Server.Documents.Handlers
             
             if (ShouldAddPagingPerformanceHint(numberOfResults))
                 AddPagingPerformanceHint(PagingOperationType.Queries, $"{nameof(Query)} ({result.IndexName})", $"{indexQuery.Metadata.QueryText}\n{indexQuery.QueryParameters}", numberOfResults, indexQuery.PageSize, result.DurationInMs, totalDocumentsSizeInBytes);
+
+            AddQueryTimingsToTrafficWatch(indexQuery);
+        }
+
+        private void AddQueryTimingsToTrafficWatch(IndexQueryServerSide indexQuery)
+        {
+            if (TrafficWatchManager.HasRegisteredClients && indexQuery.Timings != null)
+                HttpContext.Items[nameof(QueryTimings)] = indexQuery.Timings.ToTimings();
         }
 
         private Action<AbstractBlittableJsonTextWriter> WriteAdditionalData(IndexQueryServerSide indexQuery, bool shouldReturnServerSideQuery)
@@ -240,7 +252,7 @@ namespace Raven.Server.Documents.Handlers
             var queryRunner = Database.QueryRunner.GetRunner(indexQuery);
             if (!(queryRunner is GraphQueryRunner gqr))
                 throw new InvalidOperationException("The specified query is not a graph query.");
-            using (var token = CreateTimeLimitedQueryToken())
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationTokenForQuery())
             await using (var writer = new AsyncBlittableJsonTextWriter(queryContext.Documents, ResponseBodyStream()))
             {
                 await gqr.WriteDetailedQueryResult(indexQuery, queryContext, writer, token);
@@ -254,7 +266,7 @@ namespace Raven.Server.Documents.Handlers
             if (!(queryRunner is GraphQueryRunner gqr))
                 throw new InvalidOperationException("The specified query is not a graph query.");
 
-            using (var token = CreateTimeLimitedQueryToken())
+            using (var token = CreateHttpRequestBoundTimeLimitedOperationTokenForQuery())
             {
                 var results = await gqr.GetAnalyzedQueryResults(indexQuery, queryContext, null, token);
 
@@ -361,6 +373,9 @@ namespace Raven.Server.Documents.Handlers
 
                     if (TrafficWatchManager.HasRegisteredClients)
                         TrafficWatchQuery(query);
+                    
+                    if (LoggingSource.AuditLog.IsInfoEnabled)
+                        LogAuditFor(Database.Name, "DELETE", $"Documents matching the query: {query}");
 
                     await ExecuteQueryOperation(query,
                         (runner, options, onProgress, token) => runner.ExecuteDeleteQuery(query, options, queryContext, onProgress, token),
@@ -531,7 +546,7 @@ namespace Raven.Server.Documents.Handlers
                 Operations.Operations.OperationType operationType)
         {
             var options = GetQueryOperationOptions();
-            var token = CreateTimeLimitedQueryOperationToken();
+            var token = CreateTimeLimitedBackgroundOperationTokenForQueryOperation();
 
             var operationId = Database.Operations.GetNextOperationId();
 
@@ -626,7 +641,8 @@ namespace Raven.Server.Documents.Handlers
                 AllowStale = GetBoolValueQueryString("allowStale", required: false) ?? false,
                 MaxOpsPerSecond = GetIntValueQueryString("maxOpsPerSec", required: false),
                 StaleTimeout = GetTimeSpanQueryString("staleTimeout", required: false),
-                RetrieveDetails = GetBoolValueQueryString("details", required: false) ?? false
+                RetrieveDetails = GetBoolValueQueryString("details", required: false) ?? false,
+                IgnoreMaxStepsForScript = GetBoolValueQueryString("ignoreMaxStepsForScript", required: false) ?? false
             };
         }
     }

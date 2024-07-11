@@ -15,7 +15,7 @@ using Sparrow.Platform;
 
 namespace Raven.Server.Documents.Handlers
 {
-    public class SecretKeyHandler : RequestHandler
+    public class SecretKeyHandler : ServerRequestHandler
     {
         [RavenAction("/admin/secrets", "GET", AuthorizationStatus.Operator)]
         public async Task GetKeys()
@@ -128,7 +128,7 @@ namespace Raven.Server.Documents.Handlers
                             if (url == null)
                                 throw new InvalidOperationException($"Node {node} is not a part of the cluster, cannot send secret key.");
 
-                            if (url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false)
+                            if (url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false && Server.AllowEncryptedDatabasesOverHttp == false)
                                 throw new InvalidOperationException($"Cannot put secret key for {name} on node {node} with url {url} because it is not using HTTPS");
 
                             await SendKeyToNodeAsync(name, base64, ctx, ServerStore, node, url).ConfigureAwait(false);
@@ -142,7 +142,7 @@ namespace Raven.Server.Documents.Handlers
 
         private static async Task SendKeyToNodeAsync(string name, string base64, JsonOperationContext ctx, ServerStore server, string node, string url)
         {
-            using (var shortLived = RequestExecutor.CreateForSingleNodeWithoutConfigurationUpdates(url, name, server.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var shortLived = RequestExecutor.CreateForShortTermUse(new string[] { url }, name, server.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 var command = new PutSecretKeyCommand(name, base64);
                 try

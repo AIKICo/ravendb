@@ -23,6 +23,7 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Handlers.Admin;
+using Raven.Server.NotificationCenter;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
@@ -266,6 +267,13 @@ namespace SlowTests.Server.Documents.Revisions
             using (var store1 = GetDocumentStore())
             using (var store2 = GetDocumentStore())
             {
+                var config2 = new RevisionsCollectionConfiguration
+                {
+                    Disabled = false,
+                    MinimumRevisionsToKeep = 0
+                };
+                await RevisionsHelper.SetupConflictedRevisionsAsync(store1, Server.ServerStore, configuration: config2);
+
                 await PutDocument(store1);
                 await PutDocument(store2);
 
@@ -278,10 +286,19 @@ namespace SlowTests.Server.Documents.Revisions
                 await SetupReplicationAsync(store2, store1);
                 WaitForMarker(store2, store1);
 
-                var db = await Databases.GetDocumentDatabaseInstanceFor(store1);
+                using (var session1 = store1.OpenAsyncSession())
+                using (var session2 = store2.OpenAsyncSession())
+                {
+                    var revisionsCount1 = await session1.Advanced.Revisions.GetCountForAsync("foo/bar");
+                    Assert.Equal(5, revisionsCount1);
 
+                    var revisionsCount2 = await session2.Advanced.Revisions.GetCountForAsync("foo/bar");
+                    Assert.Equal(5, revisionsCount2);
+                }
+
+                var db = await Databases.GetDocumentDatabaseInstanceFor(store1);
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 WaitForMarker(store1, store2);
 
@@ -539,7 +556,7 @@ namespace SlowTests.Server.Documents.Revisions
                 });
                 await SetupReplicationAsync(store1, store2);
 
-                var deletedRevisions = await store1.Commands().GetRevisionsBinEntriesAsync(long.MaxValue);
+                var deletedRevisions = await store1.Commands().GetRevisionsBinEntriesAsync(0);
                 Assert.Equal(0, deletedRevisions.Count());
 
                 var id = "users/1";
@@ -575,10 +592,10 @@ namespace SlowTests.Server.Documents.Revisions
                 Assert.Equal(4, statistics.CountOfRevisionDocuments);
 
                 //sanity
-                deletedRevisions = await store1.Commands().GetRevisionsBinEntriesAsync(long.MaxValue);
+                deletedRevisions = await store1.Commands().GetRevisionsBinEntriesAsync(0);
                 Assert.Equal(1, deletedRevisions.Count());
 
-                deletedRevisions = await store2.Commands().GetRevisionsBinEntriesAsync(long.MaxValue);
+                deletedRevisions = await store2.Commands().GetRevisionsBinEntriesAsync(0);
                 Assert.Equal(1, deletedRevisions.Count());
 
                 using (var session = store2.OpenAsyncSession())
@@ -935,7 +952,7 @@ namespace SlowTests.Server.Documents.Revisions
                 EnforceConfigurationResult result;
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
                 {
-                    result = (EnforceConfigurationResult)await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(onProgress: null, token: token);
+                    result = (EnforceConfigurationResult)await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(onProgress: null, token: token);
                 }
 
                 Assert.Equal(11, result.ScannedRevisions);
@@ -977,6 +994,11 @@ namespace SlowTests.Server.Documents.Revisions
                 ["Products"] = 0,
                 ["Users"] = 0
             };
+        }
+
+        public Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> GetDisabledSubscribersCollections(HashSet<string> tombstoneCollections)
+        {
+            throw new NotImplementedException();
         }
     }
 }

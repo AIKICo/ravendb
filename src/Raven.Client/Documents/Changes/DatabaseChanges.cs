@@ -1,8 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +11,7 @@ using Raven.Client.Exceptions.Changes;
 using Raven.Client.Exceptions.Database;
 using Raven.Client.Extensions;
 using Raven.Client.Http;
+using Raven.Client.Json.Serialization;
 using Raven.Client.Util;
 using Sparrow;
 using Sparrow.Json;
@@ -31,6 +31,7 @@ namespace Raven.Client.Documents.Changes
         private readonly string _database;
 
         private readonly Action _onDispose;
+        private readonly string _nodeTag;
         private ClientWebSocket _client;
 
         private readonly Task _task;
@@ -41,6 +42,9 @@ namespace Raven.Client.Documents.Changes
 
         private readonly ConcurrentDictionary<DatabaseChangesOptions, DatabaseConnectionState> _counters = new ConcurrentDictionary<DatabaseChangesOptions, DatabaseConnectionState>();
         private int _immediateConnection;
+
+        private readonly TaskCompletionSource<ChangesSupportedFeatures> _supportedFeaturesTcs = new();
+        internal Task<ChangesSupportedFeatures> GetSupportedFeaturesAsync() => _supportedFeaturesTcs.Task;
 
         private ServerNode _serverNode;
         private int _nodeIndex;
@@ -56,10 +60,24 @@ namespace Raven.Client.Documents.Changes
             _cts = new CancellationTokenSource();
             _client = CreateClientWebSocket(_requestExecutor);
 
+            GetSupportedFeaturesAsync().ContinueWith(async t =>
+            {
+                if (t.Result.TopologyChange == false)
+                    return;
+
+                GetOrAddConnectionState("Topology", "watch-topology-change", "", "");
+                await _requestExecutor
+                    .UpdateTopologyAsync(
+                        new RequestExecutor.UpdateTopologyParameters(_serverNode) { TimeoutInMs = 0, ForceUpdate = true, DebugTag = "watch-topology-change" })
+                    .ConfigureAwait(false);
+            });
+
             _onDispose = onDispose;
+            _nodeTag = nodeTag;
             ConnectionStatusChanged += OnConnectionStatusChanged;
 
             _task = DoWork(nodeTag);
+            _ = _task.ContinueWith(_ => Dispose());
         }
 
         public static ClientWebSocket CreateClientWebSocket(RequestExecutor requestExecutor)
@@ -166,8 +184,21 @@ namespace Raven.Client.Documents.Changes
             return taskedObservable;
         }
 
+        internal IChangesObservable<AggressiveCacheChange> ForAggressiveCaching()
+        {
+            var counter = GetOrAddConnectionState("aggressive-caching", "watch-aggressive-caching", "unwatch-aggressive-caching", null);
+
+            var taskedObservable = new ChangesObservable<AggressiveCacheChange, DatabaseConnectionState>(
+                counter,
+                notification => true);
+
+            return taskedObservable;
+        }
+
         public IChangesObservable<OperationStatusChange> ForOperationId(long operationId)
         {
+            Debug.Assert(string.IsNullOrEmpty(_nodeTag) == false, "Changes API must be provided a node tag in order to track node-specific operations.");
+
             var counter = GetOrAddConnectionState("operations/" + operationId, "watch-operation", "unwatch-operation", operationId.ToString());
 
             var taskedObservable = new ChangesObservable<OperationStatusChange, DatabaseConnectionState>(
@@ -179,6 +210,8 @@ namespace Raven.Client.Documents.Changes
 
         public IChangesObservable<OperationStatusChange> ForAllOperations()
         {
+            Debug.Assert(string.IsNullOrEmpty(_nodeTag) == false, "Changes API must be provided a node tag in order to track node-specific operations.");
+
             var counter = GetOrAddConnectionState("all-operations", "watch-operations", "unwatch-operations", null);
 
             var taskedObservable = new ChangesObservable<OperationStatusChange, DatabaseConnectionState>(
@@ -378,7 +411,7 @@ namespace Raven.Client.Documents.Changes
             }
             catch
             {
-               // we are disposing
+                // we are disposing
             }
 
             ConnectionStatusChanged -= OnConnectionStatusChanged;
@@ -484,6 +517,11 @@ namespace Raven.Client.Documents.Changes
             }
         }
 
+        public class OnReconnect : EventArgs
+        {
+            public static OnReconnect Instance = new OnReconnect();
+        }
+
         private async Task DoWork(string nodeTag)
         {
             try
@@ -508,6 +546,7 @@ namespace Raven.Client.Documents.Changes
                 return;
             }
 
+            var timerInSec = 1;
             var wasConnected = false;
             while (_cts.IsCancellationRequested == false)
             {
@@ -519,7 +558,13 @@ namespace Raven.Client.Documents.Changes
                             .ToLower()
                             .ToWebSocketPath(), UriKind.Absolute);
 
-                        await _client.ConnectAsync(_url, _cts.Token).ConfigureAwait(false);
+                        using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token))
+                        {
+                            timeoutCts.CancelAfter(TimeSpan.FromSeconds(15));
+                            await _client.ConnectAsync(_url, timeoutCts.Token).ConfigureAwait(false);
+                        }
+
+                        timerInSec = 1;
                         wasConnected = true;
                         Interlocked.Exchange(ref _immediateConnection, 1);
 
@@ -528,9 +573,8 @@ namespace Raven.Client.Documents.Changes
                             counter.Value.Set(counter.Value.OnConnect());
                         }
 
-                        ConnectionStatusChanged?.Invoke(this, EventArgs.Empty);
+                        ConnectionStatusChanged?.Invoke(this, OnReconnect.Instance);
                     }
-
                     await ProcessChanges().ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (_cts.Token.IsCancellationRequested)
@@ -544,17 +588,24 @@ namespace Raven.Client.Documents.Changes
                 }
                 catch (Exception e)
                 {
-                    //We don't report this error since we can automatically recover from it and we can't
-                    // recover from the OnError accessing the faulty WebSocket.
+                    // we don't report this error since we can automatically recover from it,
+                    // and we can't recover from the OnError accessing the faulty WebSocket.
                     try
                     {
+                        NotifyAboutReconnection(e);
+
                         if (wasConnected)
                             ConnectionStatusChanged?.Invoke(this, EventArgs.Empty);
 
                         wasConnected = false;
                         try
                         {
-                            _serverNode = await _requestExecutor.HandleServerNotResponsive(_url.AbsoluteUri, _serverNode, _nodeIndex, e).ConfigureAwait(false);
+                            // If node tag is provided we should not failover to a different node
+                            // Failing over will create a mismatch if the operation is created and monitored on the provided node tag
+                            if (string.IsNullOrEmpty(nodeTag))
+                                _serverNode = await _requestExecutor.HandleServerNotResponsive(_url.AbsoluteUri, _serverNode, _nodeIndex, e).ConfigureAwait(false);
+                            else
+                                await _requestExecutor.UpdateTopologyAsync(new RequestExecutor.UpdateTopologyParameters(_serverNode) { TimeoutInMs = 0, ForceUpdate = true, DebugTag = "changes-api-connection-failure" }).ConfigureAwait(false);
                         }
                         catch (DatabaseDoesNotExistException databaseDoesNotExistException)
                         {
@@ -563,7 +614,7 @@ namespace Raven.Client.Documents.Changes
                         }
                         catch (Exception)
                         {
-                            //We don't want to stop observe for changes if server down. we will wait for one to be up
+                            // we don't want to stop observing for changes if the server is down. we will wait for it to be up.
                         }
 
                         if (ReconnectClient() == false)
@@ -588,7 +639,8 @@ namespace Raven.Client.Documents.Changes
 
                 try
                 {
-                    await TimeoutManager.WaitFor(TimeSpan.FromSeconds(1), _cts.Token).ConfigureAwait(false);
+                    timerInSec = Math.Min(timerInSec * 2, 60);
+                    await TimeoutManager.WaitFor(TimeSpan.FromSeconds(timerInSec), _cts.Token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -651,10 +703,10 @@ namespace Raven.Client.Documents.Changes
                             {
                                 try
                                 {
-                                    if (json.TryGet(nameof(TopologyChange), out bool supports) && supports)
+                                    if (json.TryGet(nameof(TopologyChange), out bool _))
                                     {
-                                        GetOrAddConnectionState("Topology", "watch-topology-change", "", "");
-                                        await _requestExecutor.UpdateTopologyAsync(new RequestExecutor.UpdateTopologyParameters(_serverNode) { TimeoutInMs = 0, ForceUpdate = true, DebugTag = "watch-topology-change" }).ConfigureAwait(false);
+                                        var supportedFeatures = JsonDeserializationClient.ChangesSupportedFeatures(json);
+                                        _supportedFeaturesTcs.TrySetResult(supportedFeatures);
                                         continue;
                                     }
 
@@ -679,7 +731,7 @@ namespace Raven.Client.Documents.Changes
 
                                         default:
                                             json.TryGet("Value", out BlittableJsonReaderObject value);
-                                            NotifySubscribers(type, value, _counters.ForceEnumerateInThreadSafeManner().Select(x => x.Value).ToList());
+                                            NotifySubscribers(type, value);
                                             break;
                                     }
                                 }
@@ -695,47 +747,53 @@ namespace Raven.Client.Documents.Changes
             }
         }
 
-        private void NotifySubscribers(string type, BlittableJsonReaderObject value, List<DatabaseConnectionState> states)
+        private void NotifySubscribers(string type, BlittableJsonReaderObject value)
         {
             switch (type)
             {
+                case nameof(AggressiveCacheChange):
+                    foreach (var state in _counters)
+                    {
+                        state.Value.Send(AggressiveCacheChange.Instance);
+                    }
+                    break;
                 case nameof(DocumentChange):
                     var documentChange = DocumentChange.FromJson(value);
-                    foreach (var state in states)
+                    foreach (var state in _counters)
                     {
-                        state.Send(documentChange);
+                        state.Value.Send(documentChange);
                     }
                     break;
 
                 case nameof(CounterChange):
                     var counterChange = CounterChange.FromJson(value);
-                    foreach (var state in states)
+                    foreach (var state in _counters)
                     {
-                        state.Send(counterChange);
+                        state.Value.Send(counterChange);
                     }
                     break;
 
                 case nameof(TimeSeriesChange):
                     var timeSeriesChange = TimeSeriesChange.FromJson(value);
-                    foreach (var state in states)
+                    foreach (var state in _counters)
                     {
-                        state.Send(timeSeriesChange);
+                        state.Value.Send(timeSeriesChange);
                     }
                     break;
 
                 case nameof(IndexChange):
                     var indexChange = IndexChange.FromJson(value);
-                    foreach (var state in states)
+                    foreach (var state in _counters)
                     {
-                        state.Send(indexChange);
+                        state.Value.Send(indexChange);
                     }
                     break;
 
                 case nameof(OperationStatusChange):
                     var operationStatusChange = OperationStatusChange.FromJson(value);
-                    foreach (var state in states)
+                    foreach (var state in _counters)
                     {
-                        state.Send(operationStatusChange);
+                        state.Value.Send(operationStatusChange);
                     }
                     break;
 
@@ -765,7 +823,11 @@ namespace Raven.Client.Documents.Changes
             }
         }
 
-        private void NotifyAboutError(Exception e)
+        internal virtual void NotifyAboutReconnection(Exception e)
+        {
+        }
+
+        internal void NotifyAboutError(Exception e)
         {
             if (_cts.Token.IsCancellationRequested)
                 return;

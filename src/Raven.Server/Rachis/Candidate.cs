@@ -10,6 +10,7 @@ using Raven.Server.Rachis.Remote;
 using Raven.Server.ServerWide;
 using Sparrow.Threading;
 using Raven.Server.Utils;
+using Sparrow.Server.Utils;
 
 namespace Raven.Server.Rachis
 {
@@ -62,7 +63,7 @@ namespace Raven.Server.Rachis
                     if (clusterTopology.Members.Count == 1)
                     {
                         CastVoteForSelf(ElectionTerm + 1, "Single member cluster, natural leader");
-                        _engine.SwitchToLeaderState(ElectionTerm, ClusterCommandsVersionManager.CurrentClusterMinimalVersion,
+                        _engine.SwitchToLeaderState(ElectionTerm, ClusterCommandsVersionManager.MyCommandsVersion,
                             "I'm the only one in the cluster, so no need for elections, I rule.");
                         return;
                     }
@@ -294,7 +295,7 @@ namespace Raven.Server.Rachis
 
         public void Start()
         {
-            _longRunningWork = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x=>Run(), null, "Candidate for - " + _engine.Tag);
+            _longRunningWork = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, ThreadNames.ForCandidate("Candidate for - " + _engine.Tag, _engine.Tag));
         }
 
         public void Dispose()

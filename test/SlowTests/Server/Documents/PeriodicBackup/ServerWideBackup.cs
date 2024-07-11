@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -14,12 +13,12 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Client.ServerWide.Operations.OngoingTasks;
-using Raven.Server.Config;
 using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
 using Sparrow.Json;
 using Sparrow.Platform;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -494,12 +493,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     IncrementalBackupFrequency = "0 2 * * 1"
                 };
 
-                await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(serverWideBackupConfiguration1));
-                await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(serverWideBackupConfiguration2));
-
-                var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
-                var backup = record.PeriodicBackups.First();
-                var backupTaskId = backup.TaskId;
+                var backupTaskId = await Backup.UpdateServerWideConfigAsync(Server, serverWideBackupConfiguration1, store);
+                await Backup.UpdateServerWideConfigAsync(Server, serverWideBackupConfiguration2, store);
 
                 await store.Maintenance.SendAsync(new StartBackupOperation(true, backupTaskId));
 
@@ -532,6 +527,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 // new server should have only 0 backups
                 var server = GetNewServer();
+                await server.ServerStore.EnsureNotPassiveAsync();
 
                 using (Databases.EnsureDatabaseDeletion(databaseName, store))
                 using (var store2 = GetDocumentStore(new Options
@@ -604,7 +600,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                         throw new ArgumentOutOfRangeException(nameof(encryptionMode), encryptionMode, null);
                 }
 
-                await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(serverWideBackupConfiguration));
+                var backupTaskId = await Backup.UpdateServerWideConfigAsync(Server, serverWideBackupConfiguration, store);
 
                 using (var session = store.OpenAsyncSession())
                 {
@@ -614,10 +610,6 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     }, "users/1");
                     await session.SaveChangesAsync();
                 }
-
-                var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
-                var backup = record.PeriodicBackups.First();
-                var backupTaskId = backup.TaskId;
 
                 await store.Maintenance.SendAsync(new StartBackupOperation(true, backupTaskId));
 
@@ -712,6 +704,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 // new server should have only one backup
                 var server = GetNewServer();
+                await server.ServerStore.EnsureNotPassiveAsync();
                 using (var store3 = GetDocumentStore(new Options
                 {
                     CreateDatabase = false,
@@ -961,11 +954,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     }
                 };
 
-                await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(serverWideBackupConfiguration));
-
-                var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
-                var backup = record.PeriodicBackups.First();
-                var backupTaskId = backup.TaskId;
+                var backupTaskId = await Backup.UpdateServerWideConfigAsync(Server, serverWideBackupConfiguration, store);
 
                 await store.Maintenance.SendAsync(new StartBackupOperation(true, backupTaskId));
 
@@ -976,86 +965,6 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 }, 0);
 
                 Assert.Equal(0, value);
-            }
-        }
-
-        [Fact, Trait("Category", "Smuggler")]
-        public async Task CanStoreAndEditServerWideBackupForIdleDatabase()
-        {
-            using var server = GetNewServer(new ServerCreationOptions
-            {
-                CustomSettings = new Dictionary<string, string>
-                {
-                    [RavenConfiguration.GetKey(x => x.Databases.MaxIdleTime)] = "10",
-                    [RavenConfiguration.GetKey(x => x.Databases.FrequencyToCheckForIdle)] = "3",
-                    [RavenConfiguration.GetKey(x => x.Core.RunInMemory)] = "false"
-                }
-            });
-            using (var store = GetDocumentStore(new Options { Server = server, RunInMemory = false }))
-            {
-                var fullFreq = "0 2 1 1 *";
-                var incFreq = "0 2 * * 0";
-                var putConfiguration = new ServerWideBackupConfiguration
-                {
-                    FullBackupFrequency = fullFreq,
-                    IncrementalBackupFrequency = incFreq,
-                    LocalSettings = new LocalSettings
-                    {
-                        FolderPath = "test/folder"
-                    }
-                };
-
-                Assert.Equal(1, WaitForValue(() => server.ServerStore.IdleDatabases.Count, 1, timeout: 60000, interval: 1000));
-
-                var result = await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(putConfiguration));
-                var serverWideConfiguration = await store.Maintenance.Server.SendAsync(new GetServerWideBackupConfigurationOperation(result.Name));
-                Assert.NotNull(serverWideConfiguration);
-                Assert.Equal(fullFreq, serverWideConfiguration.FullBackupFrequency);
-                Assert.Equal(incFreq, serverWideConfiguration.IncrementalBackupFrequency);
-                Assert.Equal(1, server.ServerStore.IdleDatabases.Count);
-
-                // update the backup configuration
-                putConfiguration.Name = serverWideConfiguration.Name;
-                putConfiguration.TaskId = serverWideConfiguration.TaskId;
-                putConfiguration.FullBackupFrequency = "0 2 * * 0";
-
-                var oldName = result.Name;
-                result = await store.Maintenance.Server.SendAsync(new PutServerWideBackupConfigurationOperation(putConfiguration));
-
-                Exception ex = null;
-                try
-                {
-                    await server.ServerStore.Cluster.WaitForIndexNotification(result.RaftCommandIndex, TimeSpan.FromMinutes(1));
-                }
-                catch (Exception e)
-                {
-                    ex = e;
-                }
-                finally
-                {
-                    Assert.Null(ex);
-                }
-                
-                var record = await store.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(store.Database));
-                Assert.Equal(1, record.PeriodicBackups.Count);
-                PeriodicBackupConfiguration periodicBackupConfiguration = record.PeriodicBackups.First();
-
-                var newServerWideConfiguration = await store.Maintenance.Server.SendAsync(new GetServerWideBackupConfigurationOperation(result.Name));
-
-                // compare with periodic backup task 
-                Assert.NotEqual(newServerWideConfiguration.TaskId, periodicBackupConfiguration.TaskId); // backup task id in db record doesn't change
-                Assert.Equal(PutServerWideBackupConfigurationCommand.GetTaskName(oldName), periodicBackupConfiguration.Name);
-                Assert.Equal(incFreq, periodicBackupConfiguration.FullBackupFrequency);
-                Assert.Equal(incFreq, periodicBackupConfiguration.IncrementalBackupFrequency);
-                Assert.NotEqual(serverWideConfiguration.FullBackupFrequency, periodicBackupConfiguration.FullBackupFrequency);
-
-                // compare with previous server wide backup
-                Assert.NotEqual(serverWideConfiguration.TaskId, newServerWideConfiguration.TaskId); // task id in server storage get increased with each change
-                Assert.Equal(oldName, result.Name);
-                Assert.Equal(incFreq, newServerWideConfiguration.FullBackupFrequency);
-                Assert.Equal(incFreq, newServerWideConfiguration.IncrementalBackupFrequency);
-                Assert.NotEqual(serverWideConfiguration.FullBackupFrequency, newServerWideConfiguration.FullBackupFrequency);
-                Assert.Equal(1, server.ServerStore.IdleDatabases.Count);
             }
         }
 

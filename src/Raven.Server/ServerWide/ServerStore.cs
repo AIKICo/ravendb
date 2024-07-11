@@ -13,7 +13,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Lucene.Net.Search;
-using Microsoft.Extensions.Caching.Memory;
 using NCrontab.Advanced;
 using NCrontab.Advanced.Extensions;
 using Raven.Client;
@@ -50,8 +49,10 @@ using Raven.Server.Documents.Indexes.Sorting;
 using Raven.Server.Documents.Operations;
 using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Documents.TcpHandlers;
+using Raven.Server.Exceptions;
 using Raven.Server.Integrations.PostgreSQL.Commands;
 using Raven.Server.Json;
+using Raven.Server.Monitoring;
 using Raven.Server.NotificationCenter;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
@@ -82,6 +83,7 @@ using Sparrow.Server;
 using Sparrow.Server.LowMemory;
 using Sparrow.Server.Platform;
 using Sparrow.Server.Utils;
+using Sparrow.Server.Utils.DiskStatsGetter;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron;
@@ -90,6 +92,7 @@ using Constants = Raven.Client.Constants;
 using MemoryCache = Raven.Server.Utils.Imports.Memory.MemoryCache;
 using MemoryCacheOptions = Raven.Server.Utils.Imports.Memory.MemoryCacheOptions;
 using NodeInfo = Raven.Client.ServerWide.Commands.NodeInfo;
+using Size = Sparrow.Size;
 
 namespace Raven.Server.ServerWide
 {
@@ -107,6 +110,7 @@ namespace Raven.Server.ServerWide
         public const string LicenseLimitsStorageKey = "License/Limits/Key";
 
         private readonly CancellationTokenSource _shutdownNotification = new CancellationTokenSource();
+        private FileLocker _fileLocker;
 
         public CancellationToken ServerShutdown => _shutdownNotification.Token;
 
@@ -131,6 +135,7 @@ namespace Raven.Server.ServerWide
         public readonly LicenseManager LicenseManager;
         public readonly FeedbackSender FeedbackSender;
         public readonly StorageSpaceMonitor StorageSpaceMonitor;
+        public readonly ServerLimitsMonitor ServerLimitsMonitor;
         public readonly SecretProtection Secrets;
         public readonly AsyncManualResetEvent InitializationCompleted;
         public readonly GlobalIndexingScratchSpaceMonitor GlobalIndexingScratchSpaceMonitor;
@@ -145,6 +150,8 @@ namespace Raven.Server.ServerWide
         public Operations Operations { get; }
 
         public CatastrophicFailureNotification CatastrophicFailureNotification { get; }
+
+        public DateTime? LastCertificateUpdateTime { get; private set; }
 
         public ServerStore(RavenConfiguration configuration, RavenServer server)
         {
@@ -187,6 +194,8 @@ namespace Raven.Server.ServerWide
             FeedbackSender = new FeedbackSender();
 
             StorageSpaceMonitor = new StorageSpaceMonitor(NotificationCenter);
+
+            ServerLimitsMonitor = new ServerLimitsMonitor(this, NotificationCenter, _notificationsStorage);
 
             DatabaseInfoCache = new DatabaseInfoCache();
 
@@ -328,7 +337,14 @@ namespace Raven.Server.ServerWide
                             {
                                 var topology = GetClusterTopology();
                                 var leader = _engine.LeaderTag;
-                                if (leader == null || leader == _engine.Tag)
+
+                                if (leader == null)
+                                {
+                                    delay = ReconnectionBackoff(delay);
+                                    break;
+                                }
+
+                                if (leader == _engine.Tag)
                                     break;
 
                                 var leaderUrl = topology.GetUrlFromTag(leader);
@@ -577,6 +593,7 @@ namespace Raven.Server.ServerWide
                 Configuration.Memory.UseTotalDirtyMemInsteadOfMemUsage,
                 Configuration.Memory.EnableHighTemporaryDirtyMemoryUse,
                 Configuration.Memory.TemporaryDirtyMemoryAllowedPercentage,
+                Configuration.Memory.LargeObjectHeapCompactionThresholdPercentage,
                 new LowMemoryMonitor(), ServerShutdown);
 
             MemoryInformation.SetFreeCommittedMemory(
@@ -602,7 +619,15 @@ namespace Raven.Server.ServerWide
             }
             else
             {
-                options = StorageEnvironmentOptions.ForPath(path.FullPath, null, null, IoChanges, CatastrophicFailureNotification);
+                _fileLocker = new FileLocker(Path.Combine(path.FullPath, "system.lock"));
+                _fileLocker.TryAcquireWriteLock(Logger);
+
+                string tempPath = null;
+
+                if (Configuration.Storage.TempPath != null)
+                    tempPath = Configuration.Storage.TempPath.Combine("System").FullPath;
+
+                options = StorageEnvironmentOptions.ForPath(path.FullPath, tempPath, null, IoChanges, CatastrophicFailureNotification);
                 var secretKey = Path.Combine(path.FullPath, "secret.key.encrypted");
                 if (File.Exists(secretKey))
                 {
@@ -803,7 +828,6 @@ namespace Raven.Server.ServerWide
             CheckSwapOrPageFileAndRaiseNotification();
 
             _engine = new RachisConsensus<ClusterStateMachine>(this);
-            _engine.BeforeAppendToRaftLog = BeforeAppendToRaftLog;
 
             var myUrl = GetNodeHttpServerUrl();
             _engine.Initialize(_env, Configuration, clusterChanges, myUrl, out _lastClusterTopologyIndex);
@@ -832,11 +856,19 @@ namespace Raven.Server.ServerWide
                 var errorThreshold = new Sparrow.Size(128, SizeUnit.Megabytes);
                 var swapSize = MemoryInformation.GetMemoryInfo().TotalSwapSize;
                 if (swapSize < Configuration.PerformanceHints.MinSwapSize - errorThreshold)
+                {
+                    bool noSwapFile = swapSize == Size.Zero;
+                    string title = noSwapFile ? "No swap file" : "Low swap size";
+                    string message = noSwapFile ? $"There is no swap file, it is advised to set up a '{Configuration.PerformanceHints.MinSwapSize}' swap file" : 
+                        $"The current swap size is '{swapSize}' and it is lower then the threshold defined '{Configuration.PerformanceHints.MinSwapSize}'";
+
                     NotificationCenter.Add(AlertRaised.Create(null,
-                        "Low swap size",
-                        $"The current swap size is '{swapSize}' and it is lower then the threshold defined '{Configuration.PerformanceHints.MinSwapSize}'",
+                        title,
+                        message,
                         AlertType.LowSwapSize,
                         NotificationSeverity.Warning));
+                }
+
                 return;
             }
 
@@ -849,20 +881,6 @@ namespace Raven.Server.ServerWide
                         "Your system has no PageFile. It is recommended to have a PageFile in order for Server to work properly",
                         AlertType.LowSwapSize,
                         NotificationSeverity.Warning));
-            }
-        }
-
-        private void BeforeAppendToRaftLog(ClusterOperationContext ctx, CommandBase cmd)
-        {
-            switch (cmd)
-            {
-                case AddDatabaseCommand addDatabase:
-                    if (addDatabase.Record.Topology.Count == 0)
-                    {
-                        AssignNodesToDatabase(GetClusterTopology(ctx), addDatabase.Record);
-                    }
-                    Debug.Assert(addDatabase.Record.Topology.Count != 0, "Empty topology after AssignNodesToDatabase");
-                    break;
             }
         }
 
@@ -918,6 +936,7 @@ namespace Raven.Server.ServerWide
             }
         }
 
+
         public void TriggerDatabases()
         {
             _engine.StateMachine.Changes.DatabaseChanged += DatabasesLandlord.ClusterOnDatabaseChanged;
@@ -936,7 +955,7 @@ namespace Raven.Server.ServerWide
                         {
                             try
                             {
-                                await DatabasesLandlord.ClusterOnDatabaseChanged(db, 0, "Init", DatabasesLandlord.ClusterDatabaseChangeType.RecordChanged, null);
+                                await DatabasesLandlord.ClusterOnDatabaseChanged(db, 0, DatabasesLandlord.Init, DatabasesLandlord.ClusterDatabaseChangeType.RecordChanged, null);
                             }
                             catch (Exception e)
                             {
@@ -957,14 +976,14 @@ namespace Raven.Server.ServerWide
             }
 
             _clusterMaintenanceSetupTask = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
-                ClusterMaintenanceSetupTask(), null, "Cluster Maintenance Setup Task");
+                ClusterMaintenanceSetupTask(), null, ThreadNames.ForClusterMaintenanceSetupTask("Cluster Maintenance Setup Task"));
 
             const string threadName = "Update Topology Change Notification Task";
             _updateTopologyChangeNotification = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
             {
                 ThreadHelper.TrySetThreadPriority(ThreadPriority.BelowNormal, threadName, Logger);
                 UpdateTopologyChangeNotification();
-            }, null, threadName);
+            }, null, ThreadNames.ForUpdateTopologyChangeNotificationTask(threadName));
         }
 
         private void OnStateChanged(object sender, RachisConsensus.StateTransition state)
@@ -1004,7 +1023,15 @@ namespace Raven.Server.ServerWide
                 try
                 {
                     var database = await completedTask;
-                    database.RefreshFeatures();
+                    await database.RefreshFeaturesAsync();
+                }
+                catch (OperationCanceledException)
+                {
+                    // database shutdown
+                }
+                catch (ObjectDisposedException)
+                {
+                    // database shutdown
                 }
                 catch (Exception e)
                 {
@@ -1098,7 +1125,7 @@ namespace Raven.Server.ServerWide
                     {
                         if (Logger.IsInfoEnabled)
                         {
-                            await Logger.InfoWithWait("Unable to notify about cluster topology change", e);
+                            Logger.Info("Unable to notify about cluster topology change", e);
                         }
                     }
                 }
@@ -1134,7 +1161,7 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        private Task OnDatabaseChanged(string databaseName, long index, string type, DatabasesLandlord.ClusterDatabaseChangeType _, object __)
+        private Task OnDatabaseChanged(string databaseName, long index, string type, DatabasesLandlord.ClusterDatabaseChangeType _, object state)
         {
             switch (type)
             {
@@ -1154,6 +1181,9 @@ namespace Raven.Server.ServerWide
 
                 case nameof(RemoveNodeFromDatabaseCommand):
                     NotificationCenter.Add(DatabaseChanged.Create(databaseName, DatabaseChangeType.RemoveNode));
+                    break;
+                case nameof(PutServerWideBackupConfigurationCommand):
+                    RescheduleTimerIfDatabaseIdle(databaseName, state);
                     break;
             }
 
@@ -1199,68 +1229,76 @@ namespace Raven.Server.ServerWide
                     LicenseManager.ReloadLicenseLimits();
                     ConcurrentBackupsCounter.ModifyMaxConcurrentBackups();
                     NotifyAboutClusterTopologyAndConnectivityChanges();
-
                     break;
-
-                case nameof(PutServerWideBackupConfigurationCommand):
-                    RescheduleTimerForIdleDatabases(index);
+                case nameof(PutCertificateCommand):
+                    LastCertificateUpdateTime = SystemTime.UtcNow;
                     break;
             }
         }
 
-        private void RescheduleTimerForIdleDatabases(long taskId)
+        private void RescheduleTimerIfDatabaseIdle(string db, object state)
         {
-            if (IdleDatabases.IsEmpty)
+            if (IdleDatabases.ContainsKey(db) == false)
                 return;
 
-            foreach (var db in IdleDatabases.Keys)
+            if (state is long taskId == false)
             {
-                PeriodicBackupConfiguration backupConfig;
-                DatabaseTopology topology;
-                using (ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
-                using (ctx.OpenReadTransaction())
-                using (var rawRecord = Cluster.ReadRawDatabaseRecord(ctx, db))
-                {
-                    topology = rawRecord.Topology;
-                    backupConfig = rawRecord.GetPeriodicBackupConfiguration(taskId);
-
-                    if (backupConfig == null)
-                        throw new InvalidOperationException($"Could not reschedule the wakeup timer for idle database '{db}', because there is no backup task with id '{taskId}'.");
-                }
-
-                var tag = topology.WhoseTaskIsIt(Engine.CurrentState, backupConfig, null);
-                if (Engine.Tag != tag)
-                {
-                    if (Logger.IsOperationsEnabled)
-                        Logger.Operations($"Could not reschedule the wakeup timer for idle database '{db}', because backup task '{backupConfig.Name}' with id '{taskId}' belongs to node '{tag}' current node is '{Engine.Tag}'.");
-                    continue;
-                }
-
-                if (backupConfig.Disabled || backupConfig.FullBackupFrequency == null && backupConfig.IncrementalBackupFrequency == null)
-                    continue;
-
-                var now = SystemTime.UtcNow;
-                DateTime wakeup;
-                if (backupConfig.FullBackupFrequency == null)
-                {
-                    wakeup = CrontabSchedule.Parse(backupConfig.IncrementalBackupFrequency).GetNextOccurrence(now);
-                }
-                else
-                {
-                    wakeup = CrontabSchedule.Parse(backupConfig.FullBackupFrequency).GetNextOccurrence(now);
-                    if (backupConfig.IncrementalBackupFrequency != null)
-                    {
-                        var incremental = CrontabSchedule.Parse(backupConfig.IncrementalBackupFrequency).GetNextOccurrence(now);
-                        wakeup = new DateTime(Math.Min(wakeup.Ticks, incremental.Ticks));
-                    }
-                }
-
-                var dueTime = (int)(wakeup - now).TotalMilliseconds;
-                DatabasesLandlord.RescheduleDatabaseWakeup(db, dueTime, wakeup);
-
-                if (Logger.IsOperationsEnabled)
-                    Logger.Operations($"Rescheduling the wakeup timer for idle database '{db}', because backup task '{backupConfig.Name}' with id '{taskId}' which belongs to node '{Engine.Tag}', new timer is set to: '{wakeup}', with dueTime: {dueTime} ms.");
+                Debug.Assert(state == null, 
+                    $"This is probably a bug. This method should be called only for {nameof(PutServerWideBackupConfigurationCommand)} and the state should be the database periodic backup task id.");
+                //The database is excluded from the server-wide backup.
+                return;
             }
+            
+            PeriodicBackupConfiguration backupConfig;
+            using (ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
+            using (ctx.OpenReadTransaction())
+            using (var rawRecord = Cluster.ReadRawDatabaseRecord(ctx, db))
+            {
+                backupConfig = rawRecord.GetPeriodicBackupConfiguration(taskId);
+
+                if (backupConfig == null)
+                {
+                    //`indexPerDatabase` was collected from the previous transaction. The database can be excluded in the meantime. 
+                    if(Logger.IsInfoEnabled)
+                        Logger.Info($"Could not reschedule the wakeup timer for idle database '{db}', because there is no backup task with id '{taskId}'.");
+                    return;
+                }
+            }
+
+            var tag = BackupUtils.GetResponsibleNodeTag(Server.ServerStore, db, backupConfig.TaskId);
+            if (Engine.Tag != tag)
+            {
+                if (Logger.IsOperationsEnabled && tag != null)
+                    Logger.Operations($"Could not reschedule the wakeup timer for idle database '{db}', because backup task '{backupConfig.Name}' with id '{taskId}' belongs to node '{tag}' current node is '{Engine.Tag}'.");
+                return;
+            }
+
+            if (backupConfig.Disabled || backupConfig.FullBackupFrequency == null && backupConfig.IncrementalBackupFrequency == null)
+                return;
+
+            var now = SystemTime.UtcNow;
+            DateTime wakeup;
+            if (backupConfig.FullBackupFrequency == null)
+            {
+                wakeup = CrontabSchedule.Parse(backupConfig.IncrementalBackupFrequency).GetNextOccurrence(now);
+            }
+            else
+            {
+                wakeup = CrontabSchedule.Parse(backupConfig.FullBackupFrequency).GetNextOccurrence(now);
+                if (backupConfig.IncrementalBackupFrequency != null)
+                {
+                    var incremental = CrontabSchedule.Parse(backupConfig.IncrementalBackupFrequency).GetNextOccurrence(now);
+                    wakeup = new DateTime(Math.Min(wakeup.Ticks, incremental.Ticks));
+                }
+            }
+
+            wakeup = DateTime.SpecifyKind(wakeup, DateTimeKind.Utc);
+            var nextIdleDatabaseActivity = new IdleDatabaseActivity(IdleDatabaseActivityType.WakeUpDatabase, wakeup);
+            DatabasesLandlord.RescheduleNextIdleDatabaseActivity(db, nextIdleDatabaseActivity);
+
+            if (Logger.IsOperationsEnabled)
+                    Logger.Operations($"Rescheduling the wakeup timer for idle database '{db}', because backup task '{backupConfig.Name}' with id '{taskId}' which belongs to node '{Engine.Tag}', new timer is set to: '{nextIdleDatabaseActivity.DateTime}', with dueTime: {nextIdleDatabaseActivity.DueTime} ms.");
+
         }
 
         private void ConfirmCertificateReplacedValueChanged(long index, string type)
@@ -2196,7 +2234,17 @@ namespace Raven.Server.ServerWide
                     break;
 
                 case ConnectionStringType.Sql:
-                    command = new PutSqlConnectionStringCommand(JsonDeserializationCluster.SqlConnectionString(connectionString), databaseName, raftRequestId);
+                    // RavenDB-21784 - Replace obsolete MySql provider name
+                    var deserializedSqlConnectionString = JsonDeserializationCluster.SqlConnectionString(connectionString);
+                    if (deserializedSqlConnectionString.FactoryName == "MySql.Data.MySqlClient")
+                    {
+                        deserializedSqlConnectionString.FactoryName = "MySqlConnector.MySqlConnectorFactory";
+                        var alert = AlertRaised.Create(databaseName, "Deprecated MySql factory auto-updated", "MySql.Data.MySqlClient factory has been defaulted to MySqlConnector.MySqlConnectorFactory",
+                            AlertType.SqlConnectionString_DeprecatedFactoryReplaced, NotificationSeverity.Info);
+                        NotificationCenter.Add(alert);
+                    }
+                    
+                    command = new PutSqlConnectionStringCommand(deserializedSqlConnectionString, databaseName, raftRequestId);
                     break;
                 case ConnectionStringType.Olap:
                     command = new PutOlapConnectionStringCommand(JsonDeserializationCluster.OlapConnectionString(connectionString), databaseName, raftRequestId);
@@ -2406,6 +2454,7 @@ namespace Raven.Server.ServerWide
                     var toDispose = new List<IDisposable>
                     {
                         StorageSpaceMonitor,
+                        ServerLimitsMonitor,
                         NotificationCenter,
                         LicenseManager,
                         DatabasesLandlord,
@@ -2413,7 +2462,8 @@ namespace Raven.Server.ServerWide
                         _clusterRequestExecutor,
                         ContextPool,
                         ByteStringMemoryCache.Cleaner,
-                        InitializationCompleted
+                        InitializationCompleted,
+                        _fileLocker
                     };
 
                     foreach (var disposable in toDispose)
@@ -2472,11 +2522,9 @@ namespace Raven.Server.ServerWide
                 {
                     _server.Statistics.MaybePersist(ContextPool, Logger);
 
-                    var maxTimeDatabaseCanBeIdle = Configuration.Databases.MaxIdleTime.AsTimeSpan;
-
                     foreach (var databaseKvp in DatabasesLandlord.LastRecentlyUsed.ForceEnumerateInThreadSafeManner())
                     {
-                        if (CanUnloadDatabase(databaseKvp.Key, databaseKvp.Value, maxTimeDatabaseCanBeIdle, statistics: null, out DocumentDatabase database) == false)
+                        if (CanUnloadDatabase(databaseKvp.Key, databaseKvp.Value, statistics: null, out DocumentDatabase database) == false)
                             continue;
 
                         var dbIdEtagDictionary = new Dictionary<string, long>();
@@ -2487,7 +2535,7 @@ namespace Raven.Server.ServerWide
                                 dbIdEtagDictionary[kvp.Key] = kvp.Value;
                         }
 
-                        if (DatabasesLandlord.UnloadDirectly(databaseKvp.Key, database.PeriodicBackupRunner.GetWakeDatabaseTimeUtc(database.Name)))
+                        if (DatabasesLandlord.UnloadDirectly(databaseKvp.Key, database.PeriodicBackupRunner.GetNextIdleDatabaseActivity(database.Name)))
                             IdleDatabases[database.Name] = dbIdEtagDictionary;
                     }
                 }
@@ -2514,7 +2562,7 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        public bool CanUnloadDatabase(StringSegment databaseName, DateTime lastRecentlyUsed, TimeSpan maxTimeDatabaseCanBeIdle, DatabasesDebugHandler.IdleDatabaseStatistics statistics, out DocumentDatabase database)
+        public bool CanUnloadDatabase(StringSegment databaseName, DateTime lastRecentlyUsed, DatabasesDebugHandler.IdleDatabaseStatistics statistics, out DocumentDatabase database)
         {
             database = null;
             var now = SystemTime.UtcNow;
@@ -2523,16 +2571,6 @@ namespace Raven.Server.ServerWide
                 statistics.LastRecentlyUsed = lastRecentlyUsed;
 
             var diff = now - lastRecentlyUsed;
-
-            if (diff <= maxTimeDatabaseCanBeIdle)
-            {
-                if (statistics == null)
-                    return false;
-                else
-                {
-                    statistics.Explanations.Add($"Cannot unload database because the difference ({diff}) between now ({now}) and last recently used ({lastRecentlyUsed}) is lower or equal to max idle time ({maxTimeDatabaseCanBeIdle}).");
-                }
-            }
 
             if (DatabasesLandlord.DatabasesCache.TryGetValue(databaseName, out Task<DocumentDatabase> resourceTask) == false
                 || resourceTask == null
@@ -2548,6 +2586,21 @@ namespace Raven.Server.ServerWide
             }
 
             database = resourceTask.Result;
+
+            var maxTimeDatabaseCanBeIdle = database.Configuration.Databases.MaxIdleTime.AsTimeSpan;
+
+            if (statistics != null)
+                statistics.MaxIdleTime = maxTimeDatabaseCanBeIdle;
+
+            if (diff <= maxTimeDatabaseCanBeIdle)
+            {
+                if (statistics == null)
+                    return false;
+                else
+                {
+                    statistics.Explanations.Add($"Cannot unload database because the difference ({diff}) between now ({now}) and last recently used ({lastRecentlyUsed}) is lower or equal to max idle time ({maxTimeDatabaseCanBeIdle}).");
+                }
+            }
 
             if (statistics != null)
                 statistics.IsLoaded = true;
@@ -2688,7 +2741,7 @@ namespace Raven.Server.ServerWide
                 .Concat(clusterTopology.Watchers.Keys)
                 .ToList();
 
-            if (record.Encrypted)
+            if (record.Encrypted && Server.AllowEncryptedDatabasesOverHttp == false)
             {
                 clusterNodes.RemoveAll(n => AdminDatabasesHandler.NotUsingHttps(clusterTopology.GetUrlFromTag(n)));
                 if (clusterNodes.Count < topology.ReplicationFactor)
@@ -2749,6 +2802,12 @@ namespace Raven.Server.ServerWide
 
             if (string.IsNullOrEmpty(record.Topology.ClusterTransactionIdBase64))
                 record.Topology.ClusterTransactionIdBase64 = Guid.NewGuid().ToBase64Unpadded();
+
+            foreach (var node in record.Topology.AllNodes)
+            {
+                if (string.IsNullOrEmpty(node))
+                    throw new InvalidOperationException($"Attempting to save the database record of '{databaseName}' but one of its specified topology nodes is null.");
+            }
 
             record.Topology.Stamp ??= new LeaderStamp();
             record.Topology.Stamp.Term = _engine.CurrentTerm;
@@ -2815,27 +2874,6 @@ namespace Raven.Server.ServerWide
             return _engine.CurrentState == RachisState.Passive;
         }
 
-        public async Task<(long Index, object Result)> SendToLeaderAsync(CommandBase cmd)
-        {
-            var response = await SendToLeaderAsyncInternal(cmd);
-
-#if DEBUG
-            if (response.Result.ContainsBlittableObject())
-            {
-                throw new InvalidOperationException($"{nameof(ServerStore)}::{nameof(SendToLeaderAsync)}({response.Result}) should not return command results with blittable json objects. This is not supposed to happen and should be reported.");
-            }
-#endif
-
-            return response;
-        }
-
-        //this is needed for cases where Result or any of its fields are blittable json.
-        //(for example, this is needed for use with AddOrUpdateCompareExchangeCommand, since it returns BlittableJsonReaderObject as result)
-        public Task<(long Index, object Result)> SendToLeaderAsync(JsonOperationContext context, CommandBase cmd)
-        {
-            return SendToLeaderAsyncInternal(cmd);
-        }
-
         public DynamicJsonArray GetClusterErrors()
         {
             return _engine.GetClusterErrorsFromLeader();
@@ -2900,10 +2938,11 @@ namespace Raven.Server.ServerWide
         public NodeInfo GetNodeInfo()
         {
             var memoryInformation = Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo);
+            var clusterTopology = GetClusterTopology();
             return new NodeInfo
             {
                 NodeTag = NodeTag,
-                TopologyId = GetClusterTopology().TopologyId,
+                TopologyId = clusterTopology.TopologyId,
                 Certificate = Server.Certificate.CertificateForClients,
                 NumberOfCores = ProcessorInfo.ProcessorCount,
                 InstalledMemoryInGb = memoryInformation.InstalledMemory.GetDoubleValue(SizeUnit.Gigabytes),
@@ -2912,6 +2951,7 @@ namespace Raven.Server.ServerWide
                 OsInfo = LicenseManager.OsInfo,
                 ServerId = GetServerId(),
                 CurrentState = CurrentRachisState,
+                ServerRole = clusterTopology.GetServerRoleForTag(NodeTag),
                 HasFixedPort = HasFixedPort,
                 ServerSchemaVersion = SchemaUpgrader.CurrentVersion.ServerVersion
             };
@@ -2989,20 +3029,29 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        private async Task<(long Index, object Result)> SendToLeaderAsyncInternal(CommandBase cmd)
+        public async Task<(long Index, object Result)> SendToLeaderAsync(CommandBase cmd, CancellationToken? token = null)
         {
-            using (ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-                return await SendToLeaderAsyncInternal(context, cmd);
+            token ??= CancellationToken.None;
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(token.Value, _shutdownNotification.Token))
+            {
+                if (cmd.Timeout != null)
+                {
+                    cts.CancelAfter(cmd.Timeout.Value);
+                } 
+
+                using (ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                    return await SendToLeaderAsyncInternal(context, cmd, cts.Token);
+            }
         }
 
-        private async Task<(long Index, object Result)> SendToLeaderAsyncInternal(TransactionOperationContext context, CommandBase cmd)
+        private async Task<(long Index, object Result)> SendToLeaderAsyncInternal(TransactionOperationContext context, CommandBase cmd, CancellationToken token)
         {
             //I think it is reasonable to expect timeout twice of error retry
-            var timeoutTask = TimeoutManager.WaitFor(Engine.OperationTimeout, _shutdownNotification.Token);
+            var timeoutTask = TimeoutManager.WaitFor(Engine.OperationTimeout, token);
             Exception requestException = null;
             while (true)
             {
-                ServerShutdown.ThrowIfCancellationRequested();
+                token.ThrowIfCancellationRequested();
 
                 if (_engine.CurrentState == RachisState.Leader && _engine.CurrentLeader?.Running == true)
                 {
@@ -3030,13 +3079,15 @@ namespace Raven.Server.ServerWide
                     if (cachedLeaderTag == null)
                     {
                         await Task.WhenAny(logChange, timeoutTask);
-                        if (logChange.IsCompleted == false)
+                        token.ThrowIfCancellationRequested();
+
+                        if (timeoutTask.IsCompleted)
                             ThrowTimeoutException(cmd, requestException);
 
                         continue;
                     }
 
-                    var response = await SendToNodeAsync(context, cachedLeaderTag, cmd, reachedLeader);
+                    var response = await SendToNodeAsync(context, cachedLeaderTag, cmd, reachedLeader, token);
                     return (response.Index, cmd.FromRemote(response.Result));
                 }
                 catch (Exception ex)
@@ -3051,7 +3102,9 @@ namespace Raven.Server.ServerWide
                 }
 
                 await Task.WhenAny(logChange, timeoutTask);
-                if (logChange.IsCompleted == false)
+                token.ThrowIfCancellationRequested();
+
+                if (timeoutTask.IsCompleted)
                 {
                     ThrowTimeoutException(cmd, requestException);
                 }
@@ -3071,7 +3124,8 @@ namespace Raven.Server.ServerWide
                                        $"and we timed out waiting for one after {Engine.OperationTimeout}", requestException);
         }
 
-        private async Task<(long Index, object Result)> SendToNodeAsync(TransactionOperationContext context, string engineLeaderTag, CommandBase cmd, Reference<bool> reachedLeader)
+        private async Task<(long Index, object Result)> SendToNodeAsync(TransactionOperationContext context, string engineLeaderTag, CommandBase cmd,
+            Reference<bool> reachedLeader, CancellationToken token)
         {
             var djv = cmd.ToJson(context);
             var cmdJson = context.ReadObject(djv, "raft/command");
@@ -3084,7 +3138,10 @@ namespace Raven.Server.ServerWide
                 throw new InvalidOperationException("Leader " + engineLeaderTag + " was not found in the topology members");
 
             cmdJson.TryGet("Type", out string commandType);
-            var command = new PutRaftCommand(cmdJson, _engine.Url, commandType);
+            var command = new PutRaftCommand(cmdJson, _engine.Url, commandType)
+            {
+                Timeout = cmd.Timeout
+            };
 
             var serverCertificateChanged = Interlocked.Exchange(ref _serverCertificateChanged, 0) == 1;
 
@@ -3092,13 +3149,13 @@ namespace Raven.Server.ServerWide
                 || serverCertificateChanged
                 || _clusterRequestExecutor.Url.Equals(leaderUrl, StringComparison.OrdinalIgnoreCase) == false)
             {
-                _clusterRequestExecutor?.Dispose();
-                _clusterRequestExecutor = CreateNewClusterRequestExecutor(leaderUrl);
+                var newExecutor = CreateNewClusterRequestExecutor(leaderUrl);
+                Interlocked.Exchange(ref _clusterRequestExecutor, newExecutor);
             }
 
             try
             {
-                await _clusterRequestExecutor.ExecuteAsync(command, context, token: ServerShutdown);
+                await _clusterRequestExecutor.ExecuteAsync(command, context, token: token);
             }
             catch
             {
@@ -3107,6 +3164,82 @@ namespace Raven.Server.ServerWide
             }
 
             return (command.Result.RaftCommandIndex, command.Result.Data);
+        }
+
+        protected internal async Task WaitForExecutionOnSpecificNode(TransactionOperationContext context, string node, long index)
+        {
+            await Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
+
+            using (var requester = ClusterRequestExecutor.CreateForShortTermUse(GetClusterTopology().GetUrlFromTag(node), Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var oct = new OperationCancelToken(cancelAfter: Configuration.Cluster.OperationTimeout.AsTimeSpan, token: ServerShutdown))
+                await requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context, token: oct.Token);
+        }
+
+        public async Task WaitForExecutionOnRelevantNodesAsync(JsonOperationContext context, List<string> members, long index)
+        {
+            await Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
+
+            if (members == null || members.Count == 0)
+                throw new InvalidOperationException("Cannot wait for execution when there are no nodes to execute on.");
+
+            using (var requestExecutor = ClusterRequestExecutor.Create(GetClusterTopology().Members.Values.ToArray(), Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var oct = new OperationCancelToken(cancelAfter: Configuration.Cluster.OperationTimeout.AsTimeSpan, token: ServerShutdown))
+            {
+                List<Exception> exceptions = null;
+
+                var waitingTasks =
+                    members.Select(member => WaitForRaftIndexOnNodeAndReturnIfExceptionAsync(requestExecutor, member, index, context, oct.Token));
+
+                foreach (var exception in await Task.WhenAll(waitingTasks))
+                {
+                    if (exception == null)
+                        continue;
+
+                    exceptions ??= new List<Exception>();
+                    exceptions.Add(exception.ExtractSingleInnerException());
+                }
+
+                HandleExceptions(exceptions);
+            }
+
+            return;
+
+            void HandleExceptions(IReadOnlyCollection<Exception> exceptions)
+            {
+                if (exceptions == null || exceptions.Count == 0)
+                    return;
+
+                var allExceptionsAreTimeouts  = exceptions.All(exception => exception is OperationCanceledException);
+                var aggregateException = new RaftIndexWaitAggregateException(index, exceptions);
+
+                if (allExceptionsAreTimeouts)
+                    throw new TimeoutException($"The raft command (number '{index}') took too long to run on the intended nodes.", aggregateException);
+
+                throw aggregateException;
+            }
+        }
+
+        private async Task<Exception> WaitForRaftIndexOnNodeAndReturnIfExceptionAsync(RequestExecutor executor, string nodeTag, long index, JsonOperationContext context, CancellationToken token)
+        {
+            try
+            {
+                var cmd = new WaitForRaftIndexCommand(index, nodeTag);
+                await executor.ExecuteAsync(cmd, context, token: token);
+                return null;
+            }
+            catch (RavenException re) when (re.InnerException is HttpRequestException)
+            {
+                // we want to throw for self-checks
+                if (nodeTag == NodeTag)
+                    return re;
+
+                // ignore - we are ok when connection with a node cannot be established (test: AddDatabaseOnDisconnectedNode)
+                return null;
+            }
+            catch (Exception e)
+            {
+                return e;
+            }
         }
 
         private ClusterRequestExecutor CreateNewClusterRequestExecutor(string leaderUrl)
@@ -3180,7 +3313,7 @@ namespace Raven.Server.ServerWide
             return _engine.WaitForTopology(state, token: token);
         }
 
-        public Task WaitForState(RachisState rachisState, CancellationToken token)
+        public Task<bool> WaitForState(RachisState rachisState, CancellationToken token)
         {
             return _engine.WaitForState(rachisState, token);
         }
@@ -3230,9 +3363,14 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        public async Task WaitForCommitIndexChange(RachisConsensus.CommitIndexModification modification, long value, CancellationToken token = default)
+        public Task WaitForCommitIndexChange(RachisConsensus.CommitIndexModification modification, long value, TimeSpan timeout, CancellationToken token = default)
         {
-            await _engine.WaitForCommitIndexChange(modification, value, token);
+            return _engine.WaitForCommitIndexChange(modification, value, timeout, token);
+        }
+
+        public Task WaitForCommitIndexChange(RachisConsensus.CommitIndexModification modification, long value, CancellationToken token = default)
+        {
+            return _engine.WaitForCommitIndexChange(modification, value, timeout: null, token);
         }
 
         public string LastStateChangeReason()
@@ -3310,7 +3448,7 @@ namespace Raven.Server.ServerWide
 
                 using (var cts = new CancellationTokenSource(Server.Configuration.Cluster.OperationTimeout.AsTimeSpan))
                 {
-                    connectionInfo = ReplicationUtils.GetTcpInfoAsync(url, database, "Test-Connection", Server.Certificate.Certificate,
+                    connectionInfo = ReplicationUtils.GetDatabaseTcpInfoAsync(GetNodeHttpServerUrl(), url, database, "Test-Connection", Server.Certificate.Certificate,
                         cts.Token);
                 }
                 Task timeoutTask = await Task.WhenAny(timeout, connectionInfo);
@@ -3521,6 +3659,9 @@ namespace Raven.Server.ServerWide
             internal Action BeforePutLicenseCommandHandledInOnValueChanged;
             internal bool StopIndex;
             internal Action<CompareExchangeCommandBase> ModifyCompareExchangeTimeout;
+            internal Action RestoreDatabaseAfterSavingDatabaseRecord;
+            internal Action AfterCommitInClusterTransaction;
+            internal Action<string, List<ClusterTransactionCommand.SingleClusterDatabaseCommand>> BeforeExecuteClusterTransactionBatch;
         }
         
         public readonly MemoryCache QueryClauseCache;

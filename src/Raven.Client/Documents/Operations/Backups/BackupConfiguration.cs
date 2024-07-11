@@ -8,6 +8,7 @@ namespace Raven.Client.Documents.Operations.Backups
     public class BackupConfiguration : IDynamicJson
     {
         public BackupType BackupType { get; set; }
+        public BackupUploadMode BackupUploadMode { get; set; }
         public SnapshotSettings SnapshotSettings { get; set; }
         public BackupEncryptionSettings BackupEncryptionSettings { get; set; }
         public LocalSettings LocalSettings { get; set; }
@@ -101,6 +102,7 @@ namespace Raven.Client.Documents.Operations.Backups
             return new DynamicJsonValue
             {
                 [nameof(BackupType)] = BackupType,
+                [nameof(BackupUploadMode)] = BackupUploadMode,
                 [nameof(SnapshotSettings)] = SnapshotSettings?.ToJson(),
                 [nameof(BackupEncryptionSettings)] = BackupEncryptionSettings?.ToJson(),
                 [nameof(LocalSettings)] = LocalSettings?.ToJson(),
@@ -109,6 +111,22 @@ namespace Raven.Client.Documents.Operations.Backups
                 [nameof(AzureSettings)] = AzureSettings?.ToJson(),
                 [nameof(GoogleCloudSettings)] = GoogleCloudSettings?.ToJson(),
                 [nameof(FtpSettings)] = FtpSettings?.ToJson()
+            };
+        }
+        public virtual DynamicJsonValue ToAuditJson()
+        {
+            return new DynamicJsonValue
+            {
+                [nameof(BackupType)] = BackupType,
+                [nameof(SnapshotSettings)] = SnapshotSettings?.ToAuditJson(),
+                [nameof(BackupEncryptionSettings)] = BackupEncryptionSettings?.ToAuditJson(),
+                [nameof(LocalSettings)] = LocalSettings?.ToAuditJson(),
+                [nameof(S3Settings)] = S3Settings?.ToAuditJson(),
+                [nameof(GlacierSettings)] = GlacierSettings?.ToAuditJson(),
+                [nameof(AzureSettings)] = AzureSettings?.ToAuditJson(),
+                [nameof(GoogleCloudSettings)] = GoogleCloudSettings?.ToAuditJson(),
+                [nameof(FtpSettings)] = FtpSettings?.ToAuditJson()
+
             };
         }
 

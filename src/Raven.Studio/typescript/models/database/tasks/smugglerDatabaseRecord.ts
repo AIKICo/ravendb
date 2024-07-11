@@ -15,6 +15,7 @@ class smugglerDatabaseRecord {
     includeTimeSeries = ko.observable<boolean>(true);
     includeSettings = ko.observable<boolean>(true);
     includeRevisions = ko.observable<boolean>(true);
+    includeRefresh = ko.observable<boolean>(true);
     includeExpiration = ko.observable<boolean>(true);
     includePeriodicBackups = ko.observable<boolean>(true);
     includeExternalReplications = ko.observable<boolean>(true);
@@ -34,6 +35,7 @@ class smugglerDatabaseRecord {
     includeHubReplications = ko.observable<boolean>(true);
     includeSinkReplications = ko.observable<boolean>(true);
     includePostgreSqlIntegration = ko.observable<boolean>(true);
+    includeIndexHistory = ko.observable<boolean>(false);
 
     hasIncludes: KnockoutComputed<boolean>;
 
@@ -88,7 +90,7 @@ class smugglerDatabaseRecord {
         const result: Raven.Client.Documents.Smuggler.DatabaseRecordItemType[] = [];
         
         if (!this.customizeDatabaseRecordTypes()) {
-            return ["None"];
+            return this.includeIndexHistory() ? ["IndexesHistory"] : ["None"];
         }
         
         if (this.includeConflictSolverConfig()) {
@@ -99,6 +101,9 @@ class smugglerDatabaseRecord {
         }
         if (this.includeRevisions()) {
             result.push("Revisions");
+        }
+        if (this.includeRefresh()) {
+            result.push("Refresh");
         }
         if (this.includeExpiration()) {
             result.push("Expiration");
@@ -162,6 +167,9 @@ class smugglerDatabaseRecord {
         }
         if (this.includePostgreSqlIntegration()) {
             result.push("PostgreSQLIntegration")
+        }
+        if (this.includeIndexHistory()) {
+            result.push("IndexesHistory")
         }
         
         return result;

@@ -13,6 +13,7 @@ using Raven.Client.Documents.Operations.ETL.OLAP;
 using Raven.Client.Documents.Operations.ETL.Queue;
 using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Documents.Operations.OngoingTasks;
+using Raven.Client.Util;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.ETL;
@@ -66,27 +67,40 @@ namespace SlowTests.Server.Documents.ETL
 
         protected AddEtlOperationResult AddEtl(DocumentStore src, DocumentStore dst, IEnumerable<string> collections, string script, bool applyToAllDocuments = false, bool disabled = false, string mentor = null, bool pinToMentorNode = false)
         {
+            return AddEtl(src, dst, collections, script, applyToAllDocuments, disabled, mentor, pinToMentorNode, out _);
+        }
+
+        protected AddEtlOperationResult AddEtl(DocumentStore src, DocumentStore dst, IEnumerable<string> collections, string script, out RavenEtlConfiguration configuration)
+        {
+            return AddEtl(src, dst, collections, script, false, false, null, false, out configuration);
+        }
+
+        protected AddEtlOperationResult AddEtl(DocumentStore src, DocumentStore dst, IEnumerable<string> collections, string script, bool applyToAllDocuments, bool disabled, string mentor, bool pinToMentorNode, out RavenEtlConfiguration configuration)
+        {
             var connectionStringName = $"{src.Database}@{src.Urls.First()} to {dst.Database}@{dst.Urls.First()}";
 
-            return AddEtl(src, new RavenEtlConfiguration()
+            var transformation = new Transformation
+            {
+                Name = $"ETL : {connectionStringName}",
+                Collections = new List<string>(collections),
+                Script = script,
+                ApplyToAllDocuments = applyToAllDocuments,
+                Disabled = disabled
+            };
+
+            configuration = new RavenEtlConfiguration
             {
                 Name = connectionStringName,
                 ConnectionStringName = connectionStringName,
                 Transforms =
-                    {
-                        new Transformation
-                        {
-                            Name = $"ETL : {connectionStringName}",
-                            Collections = new List<string>(collections),
-                            Script = script,
-                            ApplyToAllDocuments = applyToAllDocuments,
-                            Disabled = disabled
-                        }
-                    },
+                {
+                    transformation
+                },
                 MentorNode = mentor,
                 PinToMentorNode = pinToMentorNode
-                
-            },
+            };
+
+            return AddEtl(src, configuration,
                 new RavenConnectionString
                 {
                     Name = connectionStringName,
@@ -112,7 +126,7 @@ namespace SlowTests.Server.Documents.ETL
 
         protected ManualResetEventSlim WaitForEtl(DocumentStore store, Func<string, EtlProcessStatistics, bool> predicate)
         {
-            var database = GetDatabase(store.Database).Result;
+            var database = AsyncHelpers.RunSync(() => GetDatabase(store.Database));
 
             var mre = new ManualResetEventSlim();
 
@@ -128,9 +142,9 @@ namespace SlowTests.Server.Documents.ETL
 
         protected async Task<(string, string, EtlProcessStatistics)> WaitForEtlAsync(DocumentStore store, Func<string, EtlProcessStatistics, bool> predicate, TimeSpan timeout)
         {
-            var database = GetDatabase(store.Database).Result;
+            var database = await GetDatabase(store.Database);
 
-            var taskCompletionSource = new TaskCompletionSource<(string, string, EtlProcessStatistics)>();
+            var taskCompletionSource = new TaskCompletionSource<(string, string, EtlProcessStatistics)>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             void EtlLoaderOnBatchCompleted((string ConfigurationName, string TransformationName, EtlProcessStatistics Statistics) x)
             {
@@ -138,11 +152,11 @@ namespace SlowTests.Server.Documents.ETL
                 {
                     if (predicate($"{x.ConfigurationName}/{x.TransformationName}", x.Statistics) == false)
                         return;
-                    taskCompletionSource.SetResult(x);
+                    taskCompletionSource.TrySetResult(x);
                 }
                 catch (Exception e)
                 {
-                    taskCompletionSource.SetException(e);
+                    taskCompletionSource.TrySetException(e);
                 }
             }
 
@@ -239,7 +253,7 @@ namespace SlowTests.Server.Documents.ETL
                 tag = QueueEtl<QueueItem>.QueueEtlTag;
             else
                 throw new NotSupportedException($"Unknown ETL type: {typeof(T)}");
-
+            
             var loadAlert = database.NotificationCenter.EtlNotifications.GetAlert<EtlErrorsDetails>(tag, $"{config.Name}/{config.Transforms.First().Name}", AlertType.Etl_TransformationError);
 
             if (loadAlert.Errors.Count != 0)

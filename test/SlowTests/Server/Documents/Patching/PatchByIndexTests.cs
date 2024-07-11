@@ -1,25 +1,15 @@
 ﻿using System;
-using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests;
-using MySqlX.XDevAPI;
-using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Queries;
 using Raven.Server.Documents.Indexes;
-using Raven.Server.Documents.Indexes.Auto;
-using Raven.Server.Documents.Indexes.MapReduce.Auto;
-using Raven.Server.Documents.Indexes.Static;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.Queries;
-using Raven.Server.Documents.Queries.Dynamic;
 using Raven.Server.ServerWide;
-using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
-using Sparrow.Json;
-using Sparrow.Json.Parsing;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -66,7 +56,7 @@ namespace SlowTests.Server.Documents.Patching
                     var query = new IndexQueryServerSide($"FROM index '{index.Name}'");
                     var patch = new PatchRequest("var u = this; u.is = true;", PatchRequestType.Patch, query.Metadata.DeclaredFunctions);
 
-                    var before = context.Documents.AllocatedMemory;
+                    var before = context.Documents.UsedMemory;
                     await database.QueryRunner.ExecutePatchQuery(
                         query,
                         new QueryOperationOptions { RetrieveDetails = true },
@@ -75,7 +65,7 @@ namespace SlowTests.Server.Documents.Patching
                         context,
                         p => { },
                         new OperationCancelToken(CancelAfter, CancellationToken.None, CancellationToken.None));
-                    var after = context.Documents.AllocatedMemory;
+                    var after = context.Documents.UsedMemory;
 
                     //In a case of fragmentation, we don't immediately freeing memory so the memory can be a little bit higher
                     const long threshold = 256;

@@ -235,14 +235,9 @@ class importDatabaseFromSql extends viewModelBase {
             return false;
         }
         
-        const connectionString = this.model.getConnectionString(); 
-        
         this.spinners.schema(true);
         
-        const schemaRequestDto = {
-            Provider: this.model.databaseType(),
-            ConnectionString: connectionString
-        } as Raven.Server.SqlMigration.Model.SourceSqlDatabase;
+        const schemaRequestDto = this.model.toSourceDto();
         
         new fetchSqlDatabaseSchemaCommand(this.activeDatabase(), schemaRequestDto)
             .execute()
@@ -291,7 +286,10 @@ class importDatabaseFromSql extends viewModelBase {
         const searchText = this.searchText();
         if (searchText) {
             const queryLower = searchText.toLocaleLowerCase();
-            this.filteredTables(this.model.tables().filter(x => x.tableName.toLocaleLowerCase().includes(queryLower) && x.collectionName().toLocaleLowerCase().includes(queryLower)));
+            this.filteredTables(
+                this.model.tables().filter(x => x.tableName.toLocaleLowerCase().includes(queryLower) 
+                    || x.tableSchema.toLocaleLowerCase().includes(queryLower)
+                    || x.collectionName().toLocaleLowerCase().includes(queryLower)));
         } else {
             this.filteredTables(this.model.tables());
         }
@@ -303,7 +301,7 @@ class importDatabaseFromSql extends viewModelBase {
     }
     
     migrate() {
-        const firstWithDuplicates = this.model.tables().find(x => x.hasDuplicateProperties());
+        const firstWithDuplicates = this.model.tables().filter(x => x.checked()).find(x => x.hasDuplicateProperties());
         if (firstWithDuplicates) {
             this.goToTable(firstWithDuplicates);
             return;
@@ -413,7 +411,8 @@ class importDatabaseFromSql extends viewModelBase {
         switch (this.model.databaseType()) {
             case "MsSQL":
                 return "ace/mode/sqlserver";
-            case "MySQL":
+            case "MySQL_MySql_Data":
+            case "MySQL_MySqlConnector":
                 return "ace/mode/mysql";
             case "NpgSQL":
                 return "ace/mode/sql";

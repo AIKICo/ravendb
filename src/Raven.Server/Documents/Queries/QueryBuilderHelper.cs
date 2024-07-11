@@ -22,6 +22,7 @@ using Sparrow;
 using Sparrow.Json;
 using Sparrow.Server;
 using Spatial4n.Shapes;
+using Voron;
 using Constants = Raven.Client.Constants;
 using Index = Raven.Server.Documents.Indexes.Index;
 
@@ -516,38 +517,47 @@ public static class QueryBuilderHelper
         if (fieldName is "score()")
             return FieldMetadata.Build(allocator, fieldName, -1, FieldIndexingMode.Normal, null);
 
-        
-        
-        return GetFieldMetadata(allocator, fieldName, index, indexMapping, queryMapping, hasDynamics, dynamicFields, isForQuery, isSorting: true);
+
+
+        return GetFieldMetadata(allocator, fieldName, index, indexMapping, queryMapping, hasDynamics, dynamicFields, isForQuery: isForQuery, isSorting: true);
     }
 
-    internal static FieldMetadata GetFieldMetadata(ByteStringContext allocator, string fieldName, Index index, IndexFieldsMapping indexMapping, FieldsToFetch queryMapping, bool hasDynamics, Lazy<List<string>> dynamicFields, bool isForQuery = true,
-        bool exact = false, bool isSorting = false)
+    internal static FieldMetadata GetFieldMetadata(ByteStringContext allocator, string fieldName, Index index, IndexFieldsMapping indexMapping,
+        FieldsToFetch queryMapping, bool hasDynamics, Lazy<List<string>> dynamicFields, bool isForQuery = true,
+        bool exact = false, bool isSorting = false, bool hasBoost = false, bool handleSearch = false)
     {
         RuntimeHelpers.EnsureSufficientExecutionStack();
-
-        if (fieldName.Equals(Constants.Documents.Indexing.Fields.DocumentIdMethodName, StringComparison.OrdinalIgnoreCase) 
-            || fieldName is Constants.Documents.Indexing.Fields.DocumentIdFieldName)
+        FieldMetadata metadata;
+        
+        //Sometimes index can contians Id property and its different than real document ID. We've to 
+        if ((fieldName.Equals(Constants.Documents.Indexing.Fields.DocumentIdMethodName, StringComparison.OrdinalIgnoreCase) && indexMapping.ContainsField(fieldName)) == false && 
+            fieldName is Constants.Documents.Indexing.Fields.DocumentIdFieldName)
         {
-            var metadata = indexMapping.GetByFieldId(0).Metadata;
+            metadata = indexMapping.GetByFieldId(0).Metadata;
             return exact 
-                ? FieldMetadata.Build(metadata.FieldName, 0, FieldIndexingMode.Exact, null) 
-                : metadata;
+                ? metadata.ChangeAnalyzer(FieldIndexingMode.Exact, null).ChangeScoringMode(hasBoost)
+                : metadata.ChangeScoringMode(hasBoost);
         }
         
         if (isForQuery == false)
         {
             if (fieldName is "score" or "score()")
-                return FieldMetadata.Build(default, default, default, default);
+                return default;
         }
 
         var shouldTurnOffAnalyzersForTime = index.IndexFieldsPersistence.HasTimeValues(fieldName) && isSorting == false;
-
         if (indexMapping.TryGetByFieldName(allocator, fieldName, out var indexFinding))
         {
-            return exact || shouldTurnOffAnalyzersForTime
-                ? indexFinding.Metadata.ChangeAnalyzer(FieldIndexingMode.Exact) 
-                : indexFinding.Metadata;
+            if (exact || shouldTurnOffAnalyzersForTime) //When field has exact let's change the analyzer to do nothing
+                metadata = indexFinding.Metadata.ChangeAnalyzer(FieldIndexingMode.Exact);
+            else if (indexFinding.FieldIndexingMode is FieldIndexingMode.Search) // in case of search
+                metadata = handleSearch  
+                    ? indexFinding.Metadata //when we want mapping for search lets use 'search` analyzer 
+                    : indexFinding.Metadata.ChangeAnalyzer(FieldIndexingMode.Normal, indexMapping.DefaultAnalyzer); //but when we do a TermMatch we want to have just default analyzer, even on full-text search field
+            else
+                metadata = indexFinding.Metadata;
+
+            metadata = metadata.ChangeScoringMode(hasBoost);
         }
         else
         {
@@ -557,9 +567,10 @@ public static class QueryBuilderHelper
             var mode = shouldTurnOffAnalyzersForTime || exact 
                 ? FieldIndexingMode.Exact 
                 : FieldIndexingMode.Normal;
-            return FieldMetadata.Build(allocator, fieldName, Corax.Constants.IndexWriter.DynamicField, mode, indexMapping.DefaultAnalyzer);
+            metadata = FieldMetadata.Build(allocator, fieldName, Corax.Constants.IndexWriter.DynamicField, mode, indexMapping.DefaultAnalyzer, hasBoost: hasBoost);
         }
 
+        return metadata;
         void ThrowNotFoundInIndex() => throw new InvalidQueryException($"Field {fieldName} not found in Index '{index.Name}'.");
     }
 

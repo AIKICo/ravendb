@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Raven.Client;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
 using Raven.Server.Config.Categories;
@@ -140,7 +141,7 @@ namespace Raven.Server.Documents.Queries
                     else if (q.Select != null)
                     {
                         //TODO : investigate fields to fetch
-                        var fieldsToFetch = new FieldsToFetch(query, null);
+                        var fieldsToFetch = new FieldsToFetch(query, null, IndexType.None);
                         idc = new IncludeDocumentsCommand(Database.DocumentsStorage, queryContext.Documents, query.Metadata.Includes, fieldsToFetch.IsProjection);
                         icevc = IncludeCompareExchangeValuesCommand.ExternalScope(queryContext, query.Metadata.CompareExchangeValueIncludes);
                         irc = new IncludeRevisionsCommand(database: Database, context: queryContext.Documents, query.Metadata.RevisionIncludes);
@@ -324,7 +325,7 @@ namespace Raven.Server.Documents.Queries
         {
             using (var context = QueryOperationContext.Allocate(Database, needsServerContext: false))
             {
-                var result = new StreamDocumentQueryResult(response, writer, token)
+                var result = new StreamDocumentQueryResult(response, writer, queryContext.Documents, token)
                 {
                     IndexName = Constants.Documents.Indexing.DummyGraphIndexName
                 };

@@ -1,21 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Http;
-using System.Runtime.CompilerServices;
-using System.Threading;
 using System.Threading.Tasks;
-using FastTests;
 using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using Orders;
 using Raven.Client.Documents.Operations.Backups;
-using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server;
 using Raven.Server.Config;
-using Raven.Server.Documents;
-using Raven.Server.Rachis;
 using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
@@ -56,31 +48,38 @@ namespace SlowTests.Issues
             // Backup Config
             var config = Backup.CreateBackupConfiguration(backupPath, mentorNode: firstServer.ServerStore.NodeTag);
             var result = await store.Maintenance.SendAsync(new UpdatePeriodicBackupOperation(config));
+            Backup.WaitForResponsibleNodeUpdateInCluster(store, nodes, result.TaskId);
 
             // Turn Database offline in second server.
-            Assert.Equal(1, WaitForValue(() => secondServer.ServerStore.IdleDatabases.Count, 1, timeout: 60000, interval: 1000)); //wait for db to be idle
-            var online = secondServer.ServerStore.DatabasesLandlord.DatabasesCache.TryGetValue(store.Database, out Task<DocumentDatabase> dbTask) &&
-                         dbTask != null &&
-                         dbTask.IsCompleted;
-            Assert.False(online);
+            var unloaded = secondServer.ServerStore.DatabasesLandlord.UnloadDirectly(store.Database);
+            Assert.True(unloaded);
 
             // Backup run in first server
             await Backup.RunBackupAsync(firstServer, result.TaskId, store);
 
             // Test - check if the second server backup info is up to date
-            var firstInfo = await GetBackupInfo(firstServer);
-            var secondInfo = await GetBackupInfo(secondServer);
+            BackupInfo firstInfo = default;
+            BackupInfo secondInfo = default;
 
-            Assert.NotNull(firstInfo);
-            Assert.NotNull(secondInfo);
-            Assert.Equal(firstInfo.LastBackup, secondInfo.LastBackup);
+            await WaitForValueAsync(async () =>
+            {
+                firstInfo = await GetBackupInfo(firstServer);
+                if (firstInfo == null)
+                    return false;
+
+                secondInfo = await GetBackupInfo(secondServer);
+                if (secondInfo == null)
+                    return false;
+
+                return (Math.Abs(firstInfo.IntervalUntilNextBackupInSec - secondInfo.IntervalUntilNextBackupInSec) <= 1) && 
+                       firstInfo.LastBackup == secondInfo.LastBackup;
+            }, true, timeout: 60_000, interval: 1000);
+            
             Assert.Equal(firstInfo.BackupTaskType, secondInfo.BackupTaskType);
-            Assert.Equal(((int)(firstInfo.IntervalUntilNextBackupInSec)) / 60, ((int)(secondInfo.IntervalUntilNextBackupInSec)) / 60);
-            Assert.NotNull(firstInfo.Destinations);
-            Assert.NotNull(secondInfo.Destinations);
-            Assert.Equal(firstInfo.Destinations.Count, 1);
-            Assert.Equal(secondInfo.Destinations.Count, 1);
-            Assert.Equal(firstInfo.Destinations[0], secondInfo.Destinations[0]);
+            Assert.Equal(firstInfo.IntervalUntilNextBackupInSec, secondInfo.IntervalUntilNextBackupInSec, tolerance: 1);
+            Assert.Equal(firstInfo.Destinations?.Count, 1);
+            Assert.Equal(secondInfo.Destinations?.Count, 1);
+            Assert.Equal(firstInfo.Destinations?[0], secondInfo.Destinations?[0]);
         }
 
         private async Task<BackupInfo> GetBackupInfo(RavenServer server)
@@ -89,12 +88,9 @@ namespace SlowTests.Issues
             var res = await client.GetAsync($"{server.WebUrl}/databases");
             string resBodyJson = await res.Content.ReadAsStringAsync();
             var resBody = JsonConvert.DeserializeObject<ResBody>(resBodyJson);
-            Assert.NotNull(resBody);
-            Assert.NotNull(resBody.Databases);
-            Assert.Equal(resBody.Databases.Length, 1);
-            return resBody.Databases[0].BackupInfo;
+            Assert.Equal(resBody?.Databases?.Length, 1);
+            return resBody?.Databases?[0].BackupInfo;
         }
-
 
         private class ResBody
         {
@@ -130,6 +126,5 @@ namespace SlowTests.Issues
 
             return nodes;
         }
-
     }
 }

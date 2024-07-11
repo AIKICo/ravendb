@@ -798,6 +798,9 @@ namespace Raven.Client.Util
 
             public static bool IsCollection(Type type)
             {
+                if (type.IsArray)
+                    return true;
+                
                 if (type.GetGenericArguments().Length == 0)
                     return type == typeof(Enumerable);
 
@@ -1643,7 +1646,7 @@ namespace Raven.Client.Util
                         break;
 
                     case "MaxValue":
-                        writer.Write("new Date(253402297199999)");
+                        writer.Write("new Date(253402300799999)");
                         break;
 
                     case "Now":

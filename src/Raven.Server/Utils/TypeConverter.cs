@@ -138,7 +138,7 @@ namespace Raven.Server.Utils
 
             var isSupported = true;
             var hasProperties = false;
-            foreach (var property in accessor.GetPropertiesInOrder(value))
+            foreach (var property in accessor.GetProperties(value))
             {
                 hasProperties = true;
 
@@ -182,14 +182,14 @@ namespace Raven.Server.Utils
             return UnlikelyIsSupportedType(value);
         }
 
-        public static object ToBlittableSupportedType(object value, bool flattenArrays = false, bool forIndexing = false, Engine engine = null, JsonOperationContext context = null)
+        public static object ToBlittableSupportedType(object value, bool flattenArrays = false, bool forIndexing = false, bool canTryJsStringToDateConversion = true, Engine engine = null, JsonOperationContext context = null)
         {
-            return ToBlittableSupportedType(value, value, flattenArrays, forIndexing, 0, engine, context, out _);
+            return ToBlittableSupportedType(value, value, flattenArrays, forIndexing, 0, canTryJsStringToDateConversion, engine, context, out _);
         }
 
-        public static object ToBlittableSupportedType(object value, out BlittableSupportedReturnType returnType, bool flattenArrays = false, bool forIndexing = false, Engine engine = null, JsonOperationContext context = null)
+        public static object ToBlittableSupportedType(object value, out BlittableSupportedReturnType returnType, bool flattenArrays = false, bool forIndexing = false, bool canTryJsStringToDateConversion = true, Engine engine = null, JsonOperationContext context = null)
         {
-            return ToBlittableSupportedType(value, value, flattenArrays, forIndexing, 0, engine, context, out returnType);
+            return ToBlittableSupportedType(value, value, flattenArrays, forIndexing, 0, canTryJsStringToDateConversion, engine, context, out returnType);
         }
 
         public enum BlittableSupportedReturnType : int
@@ -241,7 +241,7 @@ namespace Raven.Server.Utils
             return BlittableSupportedReturnType.Runtime;
         }
 
-        private static object ToBlittableSupportedType(object root, object value, bool flattenArrays, bool forIndexing, int recursiveLevel, Engine engine, JsonOperationContext context, out BlittableSupportedReturnType blittableSupportedReturnType)
+        private static object ToBlittableSupportedType(object root, object value, bool flattenArrays, bool forIndexing, int recursiveLevel, bool canTryJsStringToDateConversion, Engine engine, JsonOperationContext context, out BlittableSupportedReturnType blittableSupportedReturnType)
         {
             RuntimeHelpers.EnsureSufficientExecutionStack();
             if (recursiveLevel > MaxAllowedRecursiveLevelForType)
@@ -285,7 +285,15 @@ namespace Raven.Server.Utils
                     if (js.IsUndefined())
                         return DynamicNullObject.Null;
                     if (js.IsString())
-                        return js.AsString();
+                    {
+                        var jsString = js.AsString();
+
+                        if (canTryJsStringToDateConversion && TryConvertStringValue(jsString, out var jsDate))
+                            return jsDate;
+                        
+                        return jsString;
+                    }
+
                     if (js.IsBoolean())
                         return js.AsBoolean();
                     if (js.IsNumber())
@@ -312,7 +320,7 @@ namespace Raven.Server.Utils
                     else if (js.IsArray())
                     {
                         var arr = js.AsArray();
-                        var convertedArray = EnumerateArray(root, arr, flattenArrays, forIndexing, recursiveLevel + 1, engine, context);
+                        var convertedArray = EnumerateArray(root, arr, flattenArrays, forIndexing, recursiveLevel + 1, canTryJsStringToDateConversion, engine, context);
                         return new DynamicJsonArray(flattenArrays ? Flatten(convertedArray) : convertedArray);
                     }
                     else if (js.IsObject())
@@ -335,7 +343,7 @@ namespace Raven.Server.Utils
 
                     var enumerable = (IEnumerable)value;
                     if (ShouldTreatAsEnumerable(enumerable))
-                        return EnumerableToJsonArray(flattenArrays ? Flatten(enumerable) : enumerable, root, flattenArrays, forIndexing, recursiveLevel, engine, context);
+                        return EnumerableToJsonArray(flattenArrays ? Flatten(enumerable) : enumerable, root, flattenArrays, forIndexing, recursiveLevel, canTryJsStringToDateConversion, engine, context);
 
                     break;
                 }
@@ -346,8 +354,8 @@ namespace Raven.Server.Utils
                     var dictionary = (IDictionary)value;
                     foreach (var key in dictionary.Keys)
                     {
-                        var keyAsString = KeyAsString(key: ToBlittableSupportedType(root, key, flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, engine: engine, context: context, out _));
-                        @object[keyAsString] = ToBlittableSupportedType(root, dictionary[key], flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, engine: engine, context: context, out _);
+                        var keyAsString = KeyAsString(key: ToBlittableSupportedType(root, key, flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, canTryJsStringToDateConversion, engine: engine, context: context, out _));
+                        @object[keyAsString] = ToBlittableSupportedType(root, dictionary[key], flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, canTryJsStringToDateConversion, engine: engine, context: context, out _);
                     }
 
                     return @object;
@@ -359,8 +367,8 @@ namespace Raven.Server.Utils
                     var dDictionary = (IDictionary<object, object>)value;
                     foreach (var key in dDictionary.Keys)
                     {
-                        var keyAsString = KeyAsString(key: ToBlittableSupportedType(root, key, flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, engine: engine, context: context, out _));
-                        @object[keyAsString] = ToBlittableSupportedType(root, dDictionary[key], flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, engine: engine, context: context, out _);
+                        var keyAsString = KeyAsString(key: ToBlittableSupportedType(root, key, flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, canTryJsStringToDateConversion, engine: engine, context: context, out _));
+                        @object[keyAsString] = ToBlittableSupportedType(root, dDictionary[key], flattenArrays, forIndexing, recursiveLevel: recursiveLevel + 1, canTryJsStringToDateConversion, engine: engine, context: context, out _);
                     }
 
                     return @object;
@@ -376,16 +384,16 @@ namespace Raven.Server.Utils
             var inner = new DynamicJsonValue();
             var accessor = GetPropertyAccessor(value);
 
-            foreach (var property in accessor.GetPropertiesInOrder(value))
+            foreach (var property in accessor.GetProperties(value))
             {
                 var propertyValue = property.Value;
                 if (propertyValue is IEnumerable<object> propertyValueAsEnumerable && ShouldTreatAsEnumerable(propertyValue))
                 {
-                    inner[property.Key] = EnumerableToJsonArray(propertyValueAsEnumerable, root, flattenArrays, forIndexing, recursiveLevel, engine, context);
+                    inner[property.Key] = EnumerableToJsonArray(propertyValueAsEnumerable, root, flattenArrays, forIndexing, recursiveLevel, canTryJsStringToDateConversion, engine, context);
                     continue;
                 }
 
-                inner[property.Key] = ToBlittableSupportedType(root, propertyValue, flattenArrays, forIndexing, recursiveLevel + 1, engine, context, out _);
+                inner[property.Key] = ToBlittableSupportedType(root, propertyValue, flattenArrays, forIndexing, recursiveLevel + 1, canTryJsStringToDateConversion, engine, context, out _);
             }
 
             return inner;
@@ -427,15 +435,15 @@ namespace Raven.Server.Utils
             throw new InvalidOperationException("Invalid type " + jsValue);
         }
 
-        private static IEnumerable<object> EnumerateArray(object root, ArrayInstance arr, bool flattenArrays, bool forIndexing, int recursiveLevel, Engine engine, JsonOperationContext context)
+        private static IEnumerable<object> EnumerateArray(object root, ArrayInstance arr, bool flattenArrays, bool forIndexing, int recursiveLevel, bool canTryJsStringToDateConversion, Engine engine, JsonOperationContext context)
         {
             foreach (var (key, val) in arr.GetOwnPropertiesWithoutLength())
             {
-                yield return ToBlittableSupportedType(root, val.Value, flattenArrays, forIndexing, recursiveLevel, engine, context, out _);
+                yield return ToBlittableSupportedType(root, val.Value, flattenArrays, forIndexing, recursiveLevel, canTryJsStringToDateConversion, engine, context, out _);
             }
         }
 
-        private static DynamicJsonArray EnumerableToJsonArray(IEnumerable propertyEnumerable, object root, bool flattenArrays, bool forIndexing, int recursiveLevel, Engine engine, JsonOperationContext context)
+        private static DynamicJsonArray EnumerableToJsonArray(IEnumerable propertyEnumerable, object root, bool flattenArrays, bool forIndexing, int recursiveLevel, bool canTryJsStringToDateConversion, Engine engine, JsonOperationContext context)
         {
             RuntimeHelpers.EnsureSufficientExecutionStack();
             
@@ -443,7 +451,7 @@ namespace Raven.Server.Utils
 
             foreach (var x in propertyEnumerable)
             {
-                dja.Add(ToBlittableSupportedType(root, x, flattenArrays, forIndexing, recursiveLevel + 1, engine, context, out _));
+                dja.Add(ToBlittableSupportedType(root, x, flattenArrays, forIndexing, recursiveLevel + 1, canTryJsStringToDateConversion, engine, context, out _));
             }
 
             return dja;
@@ -710,17 +718,17 @@ namespace Raven.Server.Utils
             return PropertyAccessorCache.GetOrAdd(type, x => PropertyAccessor.Create(type, value));
         }
 
-        public static IPropertyAccessor GetPropertyAccessorForMapReduceOutput(object value, List<IndexFieldBase> orderedMapFields, Dictionary<string, CompiledIndexField> groupByFields)
+        public static IPropertyAccessor GetPropertyAccessorForMapReduceOutput(object value, Dictionary<string, CompiledIndexField> groupByFields)
         {
             var type = value.GetType();
 
             if (type == typeof(ObjectInstance)) // We don't cache JS types
-                return PropertyAccessor.CreateMapReduceOutputAccessor(type, value, orderedMapFields, groupByFields, true);
+                return PropertyAccessor.CreateMapReduceOutputAccessor(type, value, groupByFields, true);
 
             if (value is Dictionary<string, object>) // don't use cache when using dictionaries
-                return PropertyAccessor.CreateMapReduceOutputAccessor(type, value, orderedMapFields, groupByFields);
+                return PropertyAccessor.CreateMapReduceOutputAccessor(type, value, groupByFields);
 
-            return PropertyAccessorForMapReduceOutputCache.GetOrAdd(type, x => PropertyAccessor.CreateMapReduceOutputAccessor(type, value, orderedMapFields, groupByFields));
+            return PropertyAccessorForMapReduceOutputCache.GetOrAdd(type, x => PropertyAccessor.CreateMapReduceOutputAccessor(type, value, groupByFields));
         }
 
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client;
 using Raven.Client.Documents.Changes;
@@ -20,6 +21,7 @@ using Raven.Server.Documents.ETL.Providers.Queue.Kafka;
 using Raven.Server.Documents.ETL.Providers.Queue.RabbitMq;
 using Raven.Server.Documents.ETL.Providers.Raven;
 using Raven.Server.Documents.ETL.Providers.SQL;
+using Raven.Server.NotificationCenter;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
@@ -80,7 +82,7 @@ namespace Raven.Server.Documents.ETL
             var items = QueueDestinations.Where(x => x.BrokerType == brokerType);
             return items.Count();
         }
-        
+
         public void Initialize(DatabaseRecord record)
         {
             LoadProcesses(record, record.RavenEtls, record.SqlEtls, record.OlapEtls, record.ElasticSearchEtls, record.QueueEtls, toRemove: null);
@@ -293,7 +295,7 @@ namespace Raven.Server.Documents.ETL
                     continue;
 
                 var processState = GetProcessState(config.Transforms, _database, config.Name);
-                var whoseTaskIsIt = _database.WhoseTaskIsIt(_databaseRecord.Topology, config, processState);
+                var whoseTaskIsIt = OngoingTasksUtils.WhoseTaskIsIt(_serverStore, _databaseRecord.Topology, config, processState, _database.NotificationCenter);
                 if (whoseTaskIsIt != _serverStore.NodeTag)
                     continue;
 
@@ -309,7 +311,7 @@ namespace Raven.Server.Documents.ETL
                         process = new OlapEtl(transform, olapConfig, _database, _serverStore);
                     if (elasticSearchConfig != null)
                         process = new ElasticSearchEtl(transform, elasticSearchConfig, _database, _serverStore);
-                    if(queueConfig != null)
+                    if (queueConfig != null)
                         process = QueueEtl<QueueItem>.CreateInstance(transform, queueConfig, _database, _serverStore);
 
                     yield return process;
@@ -349,26 +351,25 @@ namespace Raven.Server.Documents.ETL
 
             if (_databaseRecord.Encrypted && config.UsingEncryptedCommunicationChannel() == false && config.AllowEtlOnNonEncryptedChannel == false)
             {
-                LogConfigurationError(config,
-                    new List<string>
-                    {
-                        $"{_database.Name} is encrypted, but connection to ETL destination {config.GetDestination()} does not use encryption, so ETL is not allowed. " +
-                        $"You can change this behavior by setting {nameof(config.AllowEtlOnNonEncryptedChannel)} when creating the ETL configuration"
-                    });
-                return false;
-            }
+                if (config.AllowEtlOnNonEncryptedChannel == false)
+                {
+                    LogConfigurationError(config,
+                        new List<string>
+                        {
+                            $"{_database.Name} is encrypted, but connection to ETL destination {config.GetDestination()} does not use encryption, so ETL is not allowed. " +
+                            $"You can change this behavior by setting {nameof(config.AllowEtlOnNonEncryptedChannel)} when creating the ETL configuration"
+                        });
+                    return false;
+                }
 
-            if (_databaseRecord.Encrypted && config.UsingEncryptedCommunicationChannel() == false && config.AllowEtlOnNonEncryptedChannel)
-            {
                 LogConfigurationWarning(config,
                     new List<string>
                     {
                         $"{_database.Name} is encrypted and connection to ETL destination {config.GetDestination()} does not use encryption, " +
                         $"but {nameof(config.AllowEtlOnNonEncryptedChannel)} is set to true, so ETL is allowed"
                     });
-                return true;
             }
-            
+
             if (_databaseRecord.Encrypted && config is ElasticSearchEtlConfiguration esConfig && esConfig.Connection.Authentication == null)
             {
                 LogConfigurationWarning(config,
@@ -376,8 +377,7 @@ namespace Raven.Server.Documents.ETL
                     {
                         $"{_database.Name} is encrypted and connection to ETL destination {config.GetDestination()} does not use authentication, but ETL is allowed."
                     });
-                return true;
-            }            
+            }
 
             if (uniqueNames.Add(config.Name) == false)
             {
@@ -461,7 +461,7 @@ namespace Raven.Server.Documents.ETL
             where T : EtlConfiguration<TConnectionString>
         {
             var processState = GetProcessState(etlTask.Transforms, _database, etlTask.Name);
-            var whoseTaskIsIt = _database.WhoseTaskIsIt(record.Topology, etlTask, processState);
+            var whoseTaskIsIt = OngoingTasksUtils.WhoseTaskIsIt(_serverStore, record.Topology, etlTask, processState, _database.NotificationCenter);
 
             responsibleNodes[etlTask.Name] = whoseTaskIsIt;
 
@@ -478,7 +478,6 @@ namespace Raven.Server.Documents.ETL
             var myOlapEtl = new List<OlapEtlConfiguration>();
             var myElasticSearchEtl = new List<ElasticSearchEtlConfiguration>();
             var myQueueEtl = new List<QueueEtlConfiguration>();
-
 
             var responsibleNodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -600,51 +599,51 @@ namespace Raven.Server.Documents.ETL
                             break;
                         }
                     case KafkaEtl kafkaEtl:
-                    {
-                        QueueEtlConfiguration existing = null;
-
-                        foreach (var config in myQueueEtl)
                         {
-                            var diff = kafkaEtl.Configuration.Compare(config);
+                            QueueEtlConfiguration existing = null;
 
-                            if (diff == EtlConfigurationCompareDifferences.None && kafkaEtl.Configuration.Equals(config))
+                            foreach (var config in myQueueEtl)
                             {
-                                existing = config;
-                                break;
+                                var diff = kafkaEtl.Configuration.Compare(config);
+
+                                if (diff == EtlConfigurationCompareDifferences.None)
+                                {
+                                    existing = config;
+                                    break;
+                                }
                             }
-                        }
 
-                        if (existing != null)
-                        {
-                            toRemove.Remove(processesPerConfig.Key);
-                            myQueueEtl.Remove(existing);
-                        }
+                            if (existing != null)
+                            {
+                                toRemove.Remove(processesPerConfig.Key);
+                                myQueueEtl.Remove(existing);
+                            }
 
-                        break;
-                    }
+                            break;
+                        }
                     case RabbitMqEtl rabbitMqEtl:
-                    {
-                        QueueEtlConfiguration existing = null;
-
-                        foreach (var config in myQueueEtl)
                         {
-                            var diff = rabbitMqEtl.Configuration.Compare(config);
+                            QueueEtlConfiguration existing = null;
 
-                            if (diff == EtlConfigurationCompareDifferences.None && rabbitMqEtl.Configuration.Equals(config))
+                            foreach (var config in myQueueEtl)
                             {
-                                existing = config;
-                                break;
+                                var diff = rabbitMqEtl.Configuration.Compare(config);
+
+                                if (diff == EtlConfigurationCompareDifferences.None)
+                                {
+                                    existing = config;
+                                    break;
+                                }
                             }
-                        }
 
-                        if (existing != null)
-                        {
-                            toRemove.Remove(processesPerConfig.Key);
-                            myQueueEtl.Remove(existing);
-                        }
+                            if (existing != null)
+                            {
+                                toRemove.Remove(processesPerConfig.Key);
+                                myQueueEtl.Remove(existing);
+                            }
 
-                        break;
-                    }
+                            break;
+                        }
                     case ElasticSearchEtl elasticSearchEtl:
                         {
                             ElasticSearchEtlConfiguration existing = null;
@@ -671,49 +670,80 @@ namespace Raven.Server.Documents.ETL
                 }
             }
 
-            Parallel.ForEach(toRemove, x =>
-            {
-                foreach (var process in x.Value)
-                {
-                    _database.DatabaseShutdown.ThrowIfCancellationRequested();
-
-                    try
-                    {
-                        string reason = GetStopReason(process, myRavenEtl, mySqlEtl, myElasticSearchEtl, myQueueEtl, responsibleNodes);
-
-                        process.Stop(reason);
-                    }
-                    catch (Exception e)
-                    {
-                        if (Logger.IsInfoEnabled)
-                            Logger.Info($"Failed to stop ETL process {process.Name} on the database record change", e);
-                    }
-                }
-            });
-
             LoadProcesses(record, myRavenEtl, mySqlEtl, myOlapEtl, myElasticSearchEtl, myQueueEtl, toRemove.SelectMany(x => x.Value).ToList());
 
-            Parallel.ForEach(toRemove, x =>
-            {
-                foreach (var process in x.Value)
-                {
-                    _database.DatabaseShutdown.ThrowIfCancellationRequested();
+            if (toRemove.Count == 0)
+                return;
 
-                    try
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Parallel.ForEach(toRemove, x =>
+                {
+                    foreach (var process in x.Value)
                     {
-                        process.Dispose();
+                        var sp = Stopwatch.StartNew();
+
+                        try
+                        {
+                            if (_database.DatabaseShutdown.IsCancellationRequested)
+                                return;
+
+                            using (process)
+                            {
+                                string reason = GetStopReason(process, myRavenEtl, mySqlEtl, myOlapEtl, myElasticSearchEtl, myQueueEtl, responsibleNodes);
+                                process.Stop(reason);
+                            }
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                        }
+                        catch (Exception e)
+                        {
+                            if (Logger.IsOperationsEnabled)
+                                Logger.Operations($"Failed to dispose ETL process {process.Name} on the database record change", e);
+                        }
+                        finally
+                        {
+                            LogLongRunningDisposeIfNeeded(sp, process.Name);
+                        }
                     }
-                    catch (Exception e)
-                    {
-                        if (Logger.IsInfoEnabled)
-                            Logger.Info($"Failed to dispose ETL process {process.Name} on the database record change", e);
-                    }
-                }
+                });
             });
         }
 
-        private static string GetStopReason(EtlProcess process, List<RavenEtlConfiguration> myRavenEtl, List<SqlEtlConfiguration> mySqlEtl,
-            List<ElasticSearchEtlConfiguration> myElasticSearchEtl, List<QueueEtlConfiguration> myQueueEtl, Dictionary<string, string> responsibleNodes)
+        private void LogLongRunningDisposeIfNeeded(Stopwatch sp, string processName)
+        {
+            try
+            {
+                if (sp == null || Logger.IsOperationsEnabled == false)
+                    return;
+
+                sp.Stop();
+
+                if (sp.Elapsed <= TimeSpan.FromSeconds(15))
+                    return;
+
+                var msg = $"Dispose of ETL process {processName} on the database record change was running for a very long time {sp.Elapsed}";
+                Logger.Operations(msg);
+
+#if !RELEASE
+                Console.WriteLine(msg);
+#endif
+            }
+            catch
+            {
+                // nothing that we can do
+            }
+        }
+
+        private static string GetStopReason(
+            EtlProcess process,
+            List<RavenEtlConfiguration> myRavenEtl,
+            List<SqlEtlConfiguration> mySqlEtl,
+            List<OlapEtlConfiguration> myOlapEtl,
+            List<ElasticSearchEtlConfiguration> myElasticSearchEtl,
+            List<QueueEtlConfiguration> myQueueEtl,
+            Dictionary<string, string> responsibleNodes)
         {
             EtlConfigurationCompareDifferences? differences = null;
             var transformationDiffs = new List<(string TransformationName, EtlConfigurationCompareDifferences Difference)>();
@@ -733,6 +763,13 @@ namespace Raven.Server.Documents.ETL
 
                 if (existing != null)
                     differences = sqlEtl.Configuration.Compare(existing, transformationDiffs);
+            }
+            else if (process is OlapEtl olapEtl)
+            {
+                var existing = myOlapEtl.FirstOrDefault(x => x.Name.Equals(olapEtl.ConfigurationName, StringComparison.OrdinalIgnoreCase));
+
+                if (existing != null)
+                    differences = olapEtl.Configuration.Compare(existing, transformationDiffs);
             }
             else if (process is ElasticSearchEtl elasticSearchEtl)
             {
@@ -784,14 +821,14 @@ namespace Raven.Server.Documents.ETL
             return reason;
         }
 
-        public void HandleDatabaseValueChanged(DatabaseRecord record)
+        public void HandleDatabaseValueChanged()
         {
             using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (context.OpenReadTransaction())
             {
                 foreach (var process in _processes)
                 {
-                    var state = _serverStore.Cluster.Read(context, EtlProcessState.GenerateItemName(record.DatabaseName, process.ConfigurationName, process.TransformationName));
+                    var state = _serverStore.Cluster.Read(context, EtlProcessState.GenerateItemName(_database.Name, process.ConfigurationName, process.TransformationName));
 
                     if (state == null)
                     {
@@ -833,6 +870,43 @@ namespace Raven.Server.Documents.ETL
                     MarkDocumentTombstonesForDeletion(config, lastProcessedTombstones);
             }
             return lastProcessedTombstones;
+        }
+
+        public Dictionary<TombstoneDeletionBlockageSource, HashSet<string>> GetDisabledSubscribersCollections(HashSet<string> tombstoneCollections)
+        {
+            var dict = new Dictionary<TombstoneDeletionBlockageSource, HashSet<string>>();
+
+            foreach (var config in ElasticSearchDestinations.Where(config => config.Disabled))
+            {
+                var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.ElasticSearchEtl, config.Name, config.TaskId);
+                dict[source] = tombstoneCollections;
+            }
+
+            foreach (var config in OlapDestinations.Where(config => config.Disabled))
+            {
+                var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.OlapEtl, config.Name, config.TaskId);
+                dict[source] = tombstoneCollections;
+            }
+
+            foreach (var config in QueueDestinations.Where(config => config.Disabled))
+            {
+                var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.QueueEtl, config.Name, config.TaskId);
+                dict[source] = tombstoneCollections;
+            }
+
+            foreach (var config in RavenDestinations.Where(config => config.Disabled))
+            {
+                var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.RavenEtl, config.Name, config.TaskId);
+                dict[source] = tombstoneCollections;
+            }
+
+            foreach (var config in SqlDestinations.Where(config => config.Disabled))
+            {
+                var source = new TombstoneDeletionBlockageSource(ITombstoneAware.TombstoneDeletionBlockerType.SqlEtl, config.Name, config.TaskId);
+                dict[source] = tombstoneCollections;
+            }
+
+            return dict;
         }
 
         private void MarkDocumentTombstonesForDeletion<T>(EtlConfiguration<T> config, Dictionary<string, long> lastProcessedTombstones) where T : ConnectionString

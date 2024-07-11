@@ -1,179 +1,123 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.IO;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Text;
+using System.Linq;
 using Corax.Mappings;
-using Corax.Pipeline;
 using Corax.Queries;
-using Sparrow.Server;
 using Voron;
 
 namespace Corax;
 
 public partial class IndexSearcher
 {
-    public IQueryMatch SearchQuery(FieldMetadata field, string searchTerm, Constants.Search.Operator @operator, bool isNegated)
+    public IQueryMatch SearchQuery(FieldMetadata field, IEnumerable<string> values, Constants.Search.Operator @operator)
     {
-        return SearchQuery<NullScoreFunction>(field, searchTerm, default, @operator, isNegated);
-    }
+        AssertFieldIsSearched();
+        var searchAnalyzer = field.IsDynamic
+            ? _fieldMapping.SearchAnalyzer(field.FieldName.ToString()) 
+            : field.Analyzer;
 
-    public IQueryMatch SearchQuery<TScoreFunction>(FieldMetadata field, string searchTerm, TScoreFunction scoreFunction, Constants.Search.Operator @operator, bool isNegated = false, bool manuallyCutWildcards = false)
-        where TScoreFunction : IQueryScoreFunction
-    {
-        bool isDynamic = field.FieldId == Constants.IndexWriter.DynamicField;
-        ReadOnlySpan<byte> term = Encoding.UTF8.GetBytes(searchTerm).AsSpan();
-        if (isNegated)
+        field = field.ChangeAnalyzer(field.Mode, searchAnalyzer);
+        
+        IQueryMatch searchQuery = null;
+
+        List<Slice> termMatches = null;
+        foreach (var value in values)
         {
-            @operator = @operator switch
+            var termType = GetTermType(value);
+            (int startIncrement, int lengthIncrement) = termType switch
             {
-                Constants.Search.Operator.Or => Constants.Search.Operator.And,
-                Constants.Search.Operator.And => Constants.Search.Operator.Or,
+                Constants.Search.SearchMatchOptions.StartsWith => (0, -1),
+                Constants.Search.SearchMatchOptions.EndsWith => (1, 0),
+                Constants.Search.SearchMatchOptions.Contains => (1, -1),
+                Constants.Search.SearchMatchOptions.TermMatch => (0, 0),
+                _ => throw new InvalidExpressionException("Unknown flag inside Search match.")
+            };
+
+            var termReadyToAnalyze = value.AsSpan(startIncrement, value.Length - startIncrement + lengthIncrement);
+            var analyzedTerm = EncodeAndApplyAnalyzer(field, termReadyToAnalyze, canReturnEmptySlice: true);
+
+            if (analyzedTerm.Size == 0)
+                continue; //skip empty results
+            
+            if (termType is Constants.Search.SearchMatchOptions.TermMatch)
+            {
+                termMatches ??= new();
+                termMatches.Add(analyzedTerm);
+                continue;
+            }
+            
+            var query = termType switch
+            {
+                Constants.Search.SearchMatchOptions.TermMatch => throw new InvalidDataException($"{nameof(TermMatch)} is handled in different part of evaluator. This is a bug."),
+                Constants.Search.SearchMatchOptions.StartsWith => StartWithQuery(field, analyzedTerm),
+                Constants.Search.SearchMatchOptions.EndsWith => EndsWithQuery(field, analyzedTerm),
+                Constants.Search.SearchMatchOptions.Contains => ContainsQuery(field, analyzedTerm),
+                _ => throw new ArgumentOutOfRangeException()
+            };
+
+            if (searchQuery is null)
+            {
+                searchQuery = query;
+                continue;
+            }
+            
+            searchQuery = @operator switch
+            {
+                Constants.Search.Operator.Or => Or(searchQuery, query),
+                Constants.Search.Operator.And => And(searchQuery, query),
                 _ => throw new ArgumentOutOfRangeException(nameof(@operator), @operator, null)
             };
         }
-
-        if (field.Analyzer == null && isDynamic == false)
-        {
-            throw new InvalidOperationException($"{nameof(SearchQuery)} requires analyzer.");
-        }
-
-        var searchAnalyzer = isDynamic 
-            ? _fieldMapping.SearchAnalyzer(field.FieldName.ToString()) 
-            : field.Analyzer;
         
-        var wildcardAnalyzer = Analyzer.Create<WhitespaceTokenizer, ExactTransformer>(this.Allocator);
-
-        searchAnalyzer.GetOutputBuffersSize(term.Length, out var outputSize, out var tokenSize);
-        wildcardAnalyzer.GetOutputBuffersSize(term.Length, out var wildcardSize, out var wildcardTokenSize);
-
-        var tokenStructSize = Unsafe.SizeOf<Token>();
-        using var __ = Allocator.Allocate(outputSize + wildcardSize + tokenStructSize * (tokenSize + wildcardTokenSize),  out var buffer);
-        Span<byte> encodeBufferOriginal = buffer.ToSpan().Slice(0, outputSize);
-        Span<Token> tokensBufferOriginal = MemoryMarshal.Cast<byte, Token>(buffer.ToSpan().Slice(outputSize, tokenSize * tokenStructSize));
-
-        var wildcardAnalyzerBuffer = buffer.ToSpan().Slice(outputSize + tokenSize * tokenStructSize, wildcardSize);
-        var wildcardTokenizerBuffer = MemoryMarshal.Cast<byte, Token>(buffer.ToSpan().Slice(outputSize + tokenSize * tokenStructSize + wildcardSize));
-
-        var encodedWildcard = wildcardAnalyzerBuffer;
-        var tokensWildcard = wildcardTokenizerBuffer;
-
-
-        wildcardAnalyzer.Execute(term, ref encodedWildcard, ref tokensWildcard);
-        IQueryMatch match = null;
-        foreach (var tokenWildcard in tokensWildcard)
+        if (termMatches?.Count > 0)
         {
-            var encoded = encodeBufferOriginal;
-            var tokens = tokensBufferOriginal;
-            var originalWord = term.Slice(tokenWildcard.Offset, (int)tokenWildcard.Length);
-            searchAnalyzer.Execute(term.Slice(tokenWildcard.Offset, (int)tokenWildcard.Length), ref encoded, ref tokens);
-            if (tokens.Length == 0)
-                continue;
-
-
-            Constants.Search.SearchMatchOptions mode = Constants.Search.SearchMatchOptions.TermMatch;
-            if (originalWord[0] is Constants.Search.Wildcard)
-                mode |= Constants.Search.SearchMatchOptions.EndsWith;
-            if (originalWord[^1] is Constants.Search.Wildcard)
-                mode |= Constants.Search.SearchMatchOptions.StartsWith;
-            if (mode.HasFlag(Constants.Search.SearchMatchOptions.StartsWith | Constants.Search.SearchMatchOptions.EndsWith))
-                mode = Constants.Search.SearchMatchOptions.Contains;
-
-            int termStart = tokens[0].Offset;
-            int termLength = (int)tokens[0].Length;
-            if (manuallyCutWildcards)
+            var termMatchesQuery = @operator switch
             {
-                if (mode != Constants.Search.SearchMatchOptions.TermMatch)
-                {
-                    if (mode is Constants.Search.SearchMatchOptions.Contains && termLength <= 2)
-                        throw new InvalidDataException(
-                            "You are looking for an empty term. Search doesn't support it. If you want to find empty strings, you have to write an equal inside WHERE clause.");
-                    if (termLength == 1)
-                        throw new InvalidDataException("You are looking for all matches. To retrieve all matches you have to write `true` in WHERE clause.");
-                }
+                Constants.Search.Operator.And => AllInQuery(field, termMatches.ToHashSet(SliceComparer.Instance), skipEmptyItems: true),
+                Constants.Search.Operator.Or => InQuery(field, termMatches),
+                _ => throw new ArgumentOutOfRangeException(nameof(@operator), @operator, null)
+            };
 
-                (int startIncrement, int lengthIncrement) = mode switch
+            if (searchQuery is null)
+                searchQuery = termMatchesQuery;
+            else
+            {
+                searchQuery = @operator switch
                 {
-                    Constants.Search.SearchMatchOptions.StartsWith => (0,-1),
-                    Constants.Search.SearchMatchOptions.EndsWith => (1,0),
-                    Constants.Search.SearchMatchOptions.Contains => (1,-3),
-                    Constants.Search.SearchMatchOptions.TermMatch => (0,0),
-                    _ => throw new InvalidExpressionException("Unknown flag inside Search match.")
+                    Constants.Search.Operator.Or => Or(termMatchesQuery, searchQuery),
+                    Constants.Search.Operator.And => And(termMatchesQuery, searchQuery),
+                    _ => throw new ArgumentOutOfRangeException(nameof(@operator), @operator, null)
                 };
-
-                termStart += startIncrement;
-                termLength += lengthIncrement;
             }
-
-            _transaction.Allocator.Allocate(termLength, out ByteString encodedString);
-            unsafe
-            {
-                Unsafe.CopyBlockUnaligned(ref Unsafe.AsRef<byte>(encodedString.Ptr), ref encoded[termStart], (uint)termLength);
-            }
-
-            BuildExpression(Allocator, mode, new Slice(encodedString));
         }
 
-        return typeof(TScoreFunction) == typeof(NullScoreFunction)
-            ? match
-            : Boost(match, scoreFunction);
-
-        void BuildExpression(ByteStringContext ctx, Constants.Search.SearchMatchOptions mode, Slice encodedString)
+        
+        void AssertFieldIsSearched()
         {
-            switch (mode)
+            if (field.Analyzer == null && field.IsDynamic == false)
+                throw new InvalidOperationException($"{nameof(SearchQuery)} requires analyzer.");
+        }
+
+        return searchQuery ?? TermMatch.CreateEmpty(this, Allocator);
+        
+        
+        Constants.Search.SearchMatchOptions GetTermType(string termValue)
+        {
+            if (string.IsNullOrEmpty(termValue))
+                return Constants.Search.SearchMatchOptions.TermMatch;
+            Constants.Search.SearchMatchOptions mode = default;
+            if (termValue[0] == '*')
+                mode |= Constants.Search.SearchMatchOptions.EndsWith;
+
+            if (termValue[^1] == '*')
             {
-                case Constants.Search.SearchMatchOptions.TermMatch:
-                    IQueryMatch exactMatch = isNegated
-                        ? UnaryQuery(AllEntries(), field, encodedString, UnaryMatchOperation.NotEquals)
-                        : TermQuery(field, encodedString);
-
-                    if (match is null)
-                    {
-                        match = exactMatch;
-                        return;
-                    }
-
-                    match = @operator is Constants.Search.Operator.Or
-                        ? Or(match, exactMatch)
-                        : And(match, exactMatch);
-                    break;
-                case Constants.Search.SearchMatchOptions.StartsWith:
-                    if (match is null)
-                    {
-                        match = StartWithQuery(field, encodedString, isNegated);
-                        return;
-                    }
-
-                    match = @operator is Constants.Search.Operator.Or
-                        ? Or(match, StartWithQuery(field, encodedString, isNegated))
-                        : And(match, StartWithQuery(field, encodedString, isNegated));
-                    break;
-                case Constants.Search.SearchMatchOptions.EndsWith:
-                    if (match is null)
-                    {
-                        match = EndsWithQuery(field, encodedString, isNegated);
-                        return;
-                    }
-
-                    match = @operator is Constants.Search.Operator.Or
-                        ? Or(match, EndsWithQuery(field, encodedString, isNegated))
-                        : And(match, EndsWithQuery(field, encodedString, isNegated));
-                    break;
-                case Constants.Search.SearchMatchOptions.Contains:
-                    if (match is null)
-                    {
-                        match = ContainsQuery(field, encodedString, isNegated);
-                        return;
-                    }
-
-                    match = @operator is Constants.Search.Operator.Or
-                        ? Or(match, ContainsQuery(field, encodedString, isNegated))
-                        : And(match, ContainsQuery(field, encodedString, isNegated));
-                    break;
-                default:
-                    throw new InvalidExpressionException("Unknown flag inside Search match.");
+                if (termValue[^2] != '\\')
+                    mode |= Constants.Search.SearchMatchOptions.StartsWith;
             }
+
+            return mode;
         }
     }
 }

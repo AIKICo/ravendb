@@ -32,7 +32,7 @@ namespace FastTests.Issues
             var propertiesDeclaredInStudio = new List<string>
             {
                 /*
-                 *  __        ___    ____  _   _ ___ _   _  ____ 
+                 * __        ___    ____  _   _ ___ _   _  ____ 
                  * \ \      / / \  |  _ \| \ | |_ _| \ | |/ ___|
                  *  \ \ /\ / / _ \ | |_) |  \| || ||  \| | |  _ 
                  *   \ V  V / ___ \|  _ <| |\  || || |\  | |_| |
@@ -78,7 +78,10 @@ namespace FastTests.Issues
                 "Indexing.Lucene.IndexInputType",
                 "Indexing.MaxTimeToWaitAfterFlushAndSyncWhenReplacingSideBySideIndexInSec",
                 "Indexing.MinimumTotalSizeOfJournalsToRunFlushAndSyncWhenReplacingSideBySideIndexInMb",
-
+                "Indexing.OrderByTicksAutomaticallyWhenDatesAreInvolved",
+                "Query.RegexTimeoutInMs",
+                "Indexing.Lucene.ReaderTermsIndexDivisor",
+                
                 //Obsolete studio keys:
                 "Indexing.Static.SearchEngineType",
                 "Indexing.Analyzers.NGram.MaxGram",

@@ -102,6 +102,7 @@ class ongoingTaskSqlEtlEditModel extends ongoingTaskEditModel {
 
         if (dto.Configuration) {
             this.connectionStringName(dto.Configuration.ConnectionStringName);
+            this.allowEtlOnNonEncryptedChannel(dto.Configuration.AllowEtlOnNonEncryptedChannel);
             this.parameterizedDeletes(dto.Configuration.ParameterizeDeletes);
             this.forceRecompileQuery(dto.Configuration.ForceQueryRecompile);
             this.tableQuotation(dto.Configuration.QuoteTables);
@@ -126,15 +127,13 @@ class ongoingTaskSqlEtlEditModel extends ongoingTaskEditModel {
             Disabled: this.taskState() === "Disabled",
             MentorNode: this.manualChooseMentor() ? this.mentorNode() : undefined,
             PinToMentorNode: this.pinMentorNode(),
-            FactoryName: "System.Data.SqlClient",
             ForceQueryRecompile: this.forceRecompileQuery(),
             ParameterizeDeletes: this.parameterizedDeletes(),
             CommandTimeout: this.commandTimeout() || null,
             QuoteTables: this.tableQuotation(),
             Transforms: this.transformationScripts().map(x => x.toDto()),
             SqlTables: this.sqlTables().map(x => x.toDto())
-        
-        } as Raven.Client.Documents.Operations.ETL.SQL.SqlEtlConfiguration;
+        };
     }
     
     static empty(): ongoingTaskSqlEtlEditModel {

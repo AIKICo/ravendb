@@ -41,16 +41,15 @@ namespace Raven.Client.Documents.Operations.ETL.Queue
             switch (BrokerType)
             {
                 case QueueBrokerType.Kafka:
-                    if (Connection.KafkaConnectionSettings.ConnectionOptions.ContainsKey("SecurityProtocol"))
+                    if (Connection.KafkaConnectionSettings.ConnectionOptions.TryGetValue("security.protocol", out string protocol))
                     {
-                        string protocol = Connection.KafkaConnectionSettings.ConnectionOptions["SecurityProtocol"];
-                        return protocol.ToLower() == "ssl";
+                        return protocol.ToLower().Contains("ssl");
                     }
                     break;
                 case QueueBrokerType.RabbitMq:
-                    return Connection.RabbitMqConnectionSettings.ConnectionString.StartsWith("amqp", StringComparison.OrdinalIgnoreCase);
+                    return Connection.RabbitMqConnectionSettings.ConnectionString.StartsWith("amqps", StringComparison.OrdinalIgnoreCase);
                 default:
-                    return false;
+                    throw new NotSupportedException($"Unknown broker type: {BrokerType}");
             }
 
             return false;
@@ -71,8 +70,13 @@ namespace Raven.Client.Documents.Operations.ETL.Queue
 
             return json;
         }
+
+        public override DynamicJsonValue ToAuditJson()
+        {
+            return ToJson();
+        }
     }
-    
+
     public class EtlQueue
     {
         public string Name { get; set; }

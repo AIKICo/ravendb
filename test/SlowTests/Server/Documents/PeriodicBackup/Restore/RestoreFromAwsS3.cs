@@ -18,7 +18,6 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
         [Fact, Trait("Category", "Smuggler")]
         public void restore_s3_settings_tests()
         {
-            var backupPath = NewDataPath(suffix: "BackupFolder");
             using (var store = GetDocumentStore(new Options
             {
                 ModifyDatabaseName = s => $"{s}_2"
@@ -51,22 +50,37 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                 Assert.Contains("AWS Region Name cannot be null or empty", e.InnerException.Message);
             }
         }
-        
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
-        public async Task can_backup_and_restore() => await can_backup_and_restore_internal();
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
+
+        [AmazonS3RetryTheory, Trait("Category", "Smuggler")]
+        [InlineData(BackupUploadMode.Default)]
+        [InlineData(BackupUploadMode.DirectUpload)]
+        public async Task can_backup_and_restore(BackupUploadMode backupUploadMode) => await can_backup_and_restore_internal(backupUploadMode: backupUploadMode);
+
+        [AmazonS3RetryFact, Trait("Category", "Smuggler")]
         public async Task can_backup_and_restore_no_ascii() => await can_backup_and_restore_internal("żżżרייבן");
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
-        public async Task can_backup_and_restore_snapshot() => await can_backup_and_restore_snapshot_internal();
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
-        public async Task incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key() => 
-            await incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key_internal();
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
+
+        [AmazonS3RetryTheory, Trait("Category", "Smuggler")]
+        [InlineData(BackupUploadMode.Default)]
+        [InlineData(BackupUploadMode.DirectUpload)]
+        public async Task can_backup_and_restore_snapshot(BackupUploadMode backupUploadMode) => await can_backup_and_restore_snapshot_internal(backupUploadMode);
+
+        [AmazonS3RetryTheory, Trait("Category", "Smuggler")]
+        [InlineData(BackupUploadMode.Default)]
+        [InlineData(BackupUploadMode.DirectUpload)]
+        public async Task incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key(BackupUploadMode backupUploadMode) => 
+            await incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key_internal(backupUploadMode);
+
+        [AmazonS3RetryFact, Trait("Category", "Smuggler")]
         public async Task incremental_and_full_check_last_file_for_backup() => await incremental_and_full_check_last_file_for_backup_internal();
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
+
+        [AmazonS3RetryFact, Trait("Category", "Smuggler")]
         public async Task incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_provided_key() => 
             await incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_provided_key_internal();
-        [AmazonS3Fact, Trait("Category", "Smuggler")]
-        public async Task snapshot_encrypted_db_and_restore_to_encrypted_DB() => await snapshot_encrypted_db_and_restore_to_encrypted_DB_internal();
+
+        [AmazonS3RetryTheory, Trait("Category", "Smuggler")]
+        [InlineData(BackupUploadMode.Default)]
+        [InlineData(BackupUploadMode.DirectUpload)]
+        public async Task snapshot_encrypted_db_and_restore_to_encrypted_DB(BackupUploadMode backupUploadMode) => 
+            await snapshot_encrypted_db_and_restore_to_encrypted_DB_internal(backupUploadMode);
     }
 }

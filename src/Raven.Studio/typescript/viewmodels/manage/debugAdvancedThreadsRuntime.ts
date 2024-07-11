@@ -26,7 +26,7 @@ class debugAdvancedThreadsRuntime extends viewModelBase {
     isConnectedToWebSocket: KnockoutComputed<boolean>;
     
     threadsCount: KnockoutComputed<number>;
-    dedicatedThreadsCount: KnockoutComputed<number>;
+    dedicatedThreadsCount = ko.observable<number>(0);
     machineCpuUsage = ko.observable<number>(0);
     serverCpuUsage = ko.observable<number>(0);
 
@@ -44,15 +44,6 @@ class debugAdvancedThreadsRuntime extends viewModelBase {
             
             if (data) {
                 return data.length;
-            }
-            return 0;
-        });
-        
-        this.dedicatedThreadsCount = ko.pureComputed(() => {
-            const data = this.filteredData();
-            
-            if (data) {
-                return data.filter(x => x.Name !== "Unknown" && x.Name !== "Unmanaged Thread").length;
             }
             return 0;
         });
@@ -112,6 +103,10 @@ class debugAdvancedThreadsRuntime extends viewModelBase {
                         sortable: x => x.CpuUsage,
                         defaultSortOrder: "desc"
                     }),
+                    new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => x.UnmanagedAllocationsInBytes ? generalUtils.formatBytesToSize(x.UnmanagedAllocationsInBytes, 2) : "N/A", "Unmanged Allocations", "10%", {
+                        sortable: x => x.UnmanagedAllocationsInBytes ?? 0,
+                        defaultSortOrder: "desc",
+                    }),
                     new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => generalUtils.formatTimeSpan(x.Duration, false), "Overall CPU Time", "10%", {
                         sortable: x => x.Duration,
                         defaultSortOrder: "desc"
@@ -119,7 +114,7 @@ class debugAdvancedThreadsRuntime extends viewModelBase {
                     new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => x.Id + " (" + (x.ManagedThreadId || "n/a") + ")", "Thread Id", "10%", {
                         sortable: x => x.Id
                     }),
-                    new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => generalUtils.formatUtcDateAsLocal(x.StartingTime), "Start Time", "20%", {
+                    new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => generalUtils.formatUtcDateAsLocal(x.StartingTime), "Start Time", "10%", {
                         sortable: x => x.StartingTime
                     }),
                     new textColumn<Raven.Server.Dashboard.ThreadInfo>(grid, x => x.State, "State", "10%", {
@@ -166,8 +161,9 @@ class debugAdvancedThreadsRuntime extends viewModelBase {
         this.allData(data.List);
         this.machineCpuUsage(data.CpuUsage);
         this.serverCpuUsage(data.ProcessCpuUsage);
-        
-                this.filterEntries();
+        this.dedicatedThreadsCount(data.DedicatedThreadsCount);
+
+        this.filterEntries();
         
         this.gridController().reset(false);
     }

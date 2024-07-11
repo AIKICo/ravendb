@@ -108,16 +108,26 @@
                         <span class="text-warning" data-bind="visible: $root.leftRevisionIsNewer()">Older revision:</span>
                         <span class="text-success" data-bind="visible: !$root.leftRevisionIsNewer()">Newer revision:</span>
                     </span>
-                    <span class="margin-left margin-left-sm" data-bind="text: $root.comparingWith() ? $root.comparingWith().__metadata.lastModified() : ''"></span>
-                    <div class="dropdown pull-right" data-bind="if: comparingWith">
-                        <button type="button" class="btn btn-sm dropdown-toggle" data-toggle="dropdown">
-                            Compare with: <span class="caret margin-left margin-left-sm"></span>
-                        </button>
-                        <ul class="dropdown-menu" data-bind="foreach: revisionsToCompare">
-                            <li data-bind="css: { active: $data === $root.comparingWith() }">
-                                <a href="#" data-bind="text: $data.__metadata.lastModified(), click: _.partial($root.compareRevisions, $data)"></a>
-                            </li>
-                        </ul>
+                    <div data-bind="if: comparingWith" class="margin-left margin-left-sm inline-block">
+                        <div class="btn-group">
+                            <button class="btn btn-sm btn-default" title="Previous revision" 
+                                    data-bind="click: _.partial(revisionNavigate, 'backward', 'right'), enable: canNavigateObservable('backward', 'right')">
+                                <i class="icon-arrow-filled-left"></i>
+                            </button>
+                            <button type="button" class="btn btn-sm btn-default dropdown-toggle" data-toggle="dropdown" title="Choose revision">
+                                <span data-bind="text: $root.comparingWith().__metadata.lastModified()"></span> <span class="caret margin-left margin-left-sm"></span>
+                            </button>
+                            <ul class="dropdown-menu" data-bind="foreach: revisionsToCompare">
+                                <li data-bind="css: { active: $data === $root.comparingWith() }">
+                                    <a href="#" data-bind="text: $data.__metadata.lastModified(), click: _.partial($root.compareRevisions, $data)"></a>
+                                </li>
+                            </ul>
+                            <button class="btn btn-sm btn-default" title="Next revision" 
+                                    data-bind="click: _.partial(revisionNavigate, 'forward', 'right'), enable: canNavigateObservable('forward', 'right')">
+                                <i class="icon-arrow-filled-right"></i>
+                            </button>
+                        </div>
+                       
                     </div>
                 </div>
             </div>
@@ -279,8 +289,17 @@
                         <span data-placement="left" data-toggle="tooltip" data-html="true" data-animation="true"
                              data-bind="tooltipText: $root.documentSizeHtml()">
                             <span data-bind="text: $root.computedDocumentSize()"></span>
+                            <i class="icon-documents-compression margin-left-xs" data-bind="visible: $root.isCompressed()"></i>
                             <i class="icon-warning text-warning margin-left-xs" data-bind="visible: $root.isHugeDocument"></i>
                         </span>
+                    </dd>
+                    <dt data-bind="visible: $root.savedInClusterTransaction">
+                       <i class="icon-cmp-xchg"></i> 
+                    </dt>
+                    <dd data-bind="visible: $root.savedInClusterTransaction">
+                        Document was saved using Cluster Transaction.
+                        <br />
+                        <a data-bind="attr: { href: $root.atomicGuardUrl }">Go to atomic guard</a>
                     </dd>
                 </dl>
             </div>

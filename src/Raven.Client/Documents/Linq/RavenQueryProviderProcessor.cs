@@ -54,8 +54,8 @@ namespace Raven.Client.Documents.Linq
         private readonly Action<QueryResult> _afterQueryExecuted;
         private readonly LinqQueryHighlightings _highlightings;
         private bool _chainedWhere;
-        private int _insideWhere;
-        private int _insideFilter;
+        private int _insideWhereOrSearchCounter;
+        private int _insideFilterCounter;
         private bool _insideNegate;
         private bool _insideExact;
         private SpecialQueryType _queryType = SpecialQueryType.None;
@@ -232,7 +232,7 @@ namespace Raven.Client.Documents.Linq
 
         private void VisitBinaryExpression(BinaryExpression expression)
         {
-            if (_insideWhere > 0)
+            if (_insideWhereOrSearchCounter > 0)
             {
                 VerifyLegalBinaryExpression(expression);
             }
@@ -311,7 +311,6 @@ namespace Raven.Client.Documents.Linq
         {
             if (TryHandleBetween(andAlso))
                 return;
-
 
             if (_subClauseDepth > 0)
                 DocumentQuery.OpenSubclause();
@@ -1680,7 +1679,6 @@ The recommended method is to use full text search (mark the field as Analyzed an
             object value;
             while (true)
             {
-
                 expressions.Add(search);
 
                 if (LinqPathProvider.GetValueFromExpressionWithoutConversion(search.Arguments[4], out value) == false)
@@ -1700,7 +1698,12 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 target = search.Arguments[0];
             }
 
+            // This has to be set in order to have correct parentheses
+            // when using both search and where clause, e.g.
+            // where (Category = $p0 or Category = $p1) and search(Name, $p2)
+            _insideWhereOrSearchCounter++;
             VisitExpression(target);
+            _insideWhereOrSearchCounter--;
 
             if (expressions.Count > 1)
             {
@@ -1892,7 +1895,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     break;
                 case "Filter":
                 {
-                    _insideFilter++;
+                    _insideFilterCounter++;
                     VisitExpression(expression.Arguments[0]);
                     using (FilterModeScope(true))
                     {
@@ -1902,15 +1905,15 @@ The recommended method is to use full text search (mark the field as Analyzed an
                             DocumentQuery.OpenSubclause();
                         }
 
-                        if (_chainedWhere == false && _insideFilter > 1)
+                        if (_chainedWhere == false && _insideFilterCounter > 1)
                             DocumentQuery.OpenSubclause();
 
                         VisitExpression(((UnaryExpression)expression.Arguments[1]).Operand);
-                        if (_chainedWhere == false && _insideFilter > 1)
+                        if (_chainedWhere == false && _insideFilterCounter > 1)
                             DocumentQuery.CloseSubclause();
                         if (_chainedWhere)
                             DocumentQuery.CloseSubclause();
-                        _insideFilter--;
+                        _insideFilterCounter--;
                         if (expression.Arguments.Count is 3 && LinqPathProvider.GetValueFromExpressionWithoutConversion(expression.Arguments[2], out var limit))
                         {
                             AddFilterLimit((int)limit);
@@ -1923,14 +1926,14 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     {
                         using (FilterModeScope(@on: false))
                         {
-                            _insideWhere++;
+                            _insideWhereOrSearchCounter++;
                             VisitExpression(expression.Arguments[0]);
                             if (_chainedWhere)
                             {
                                 DocumentQuery.AndAlso();
                                 DocumentQuery.OpenSubclause();
                             }
-                            if (_chainedWhere == false && _insideWhere > 1)
+                            if (_chainedWhere == false && _insideWhereOrSearchCounter > 1)
                                 DocumentQuery.OpenSubclause();
 
                             if (expression.Arguments.Count == 3)
@@ -1939,12 +1942,12 @@ The recommended method is to use full text search (mark the field as Analyzed an
                             VisitExpression(((UnaryExpression)expression.Arguments[1]).Operand);
                             _insideExact = false;
 
-                            if (_chainedWhere == false && _insideWhere > 1)
+                            if (_chainedWhere == false && _insideWhereOrSearchCounter > 1)
                                 DocumentQuery.CloseSubclause();
                             if (_chainedWhere)
                                 DocumentQuery.CloseSubclause();
                             _chainedWhere = true;
-                            _insideWhere--;
+                            _insideWhereOrSearchCounter--;
                         }
                         break;
                     }
@@ -2055,12 +2058,18 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     }
                 case "Any":
                     {
+                        if (expression.Arguments.Count == 2 && expression.Arguments[0] is not ConstantExpression)
+                            _subClauseDepth++;
+                        
                         VisitExpression(expression.Arguments[0]);
                         if (expression.Arguments.Count == 2)
                         {
                             if (_chainedWhere)
                                 DocumentQuery.AndAlso();
                             VisitExpression(((UnaryExpression)expression.Arguments[1]).Operand);
+                            
+                            if (_subClauseDepth > 0)
+                                _subClauseDepth--;
                         }
 
                         VisitAny();
@@ -2570,6 +2579,8 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
         private void SelectCall(Expression body, LambdaExpression lambdaExpression)
         {
+            FieldsToFetch?.Clear();
+
             if (body is MethodCallExpression call)
             {
                 if (LinqPathProvider.IsTimeSeriesCall(call))
@@ -2581,6 +2592,12 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 if (LinqPathProvider.IsCompareExchangeCall(call))
                 {
                     AddToFieldsToFetch(ToJs(call), "cmpxchg");
+                    return;
+                }
+
+                if (IsRawCall(call))
+                {
+                    HandleSelectRaw(call, lambdaExpression);
                     return;
                 }
             }
@@ -2603,13 +2620,14 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 throw new NotSupportedException($"Using constructor with parameters in projection is not supported. {memberInitExpression}");
             
             _newExpressionType = memberInitExpression.NewExpression.Type;
+            FieldsToFetch?.Clear();
 
             if (_declareBuilder != null)
             {
                 AddReturnStatementToOutputFunction(memberInitExpression);
                 return;
             }
-
+            
             if (FromAlias != null)
             {
                 //lambda 2 js
@@ -2664,7 +2682,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     AddFromAlias(lambdaExpression?.Parameters[0].Name);
                 }
 
-                FieldsToFetch.Clear();
+                FieldsToFetch?.Clear();
                 _jsSelectBody = TranslateSelectBodyToJs(memberInitExpression);
 
                 break;
@@ -2681,6 +2699,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
             }
 
             _newExpressionType = newExpression.Type;
+            FieldsToFetch?.Clear();
 
             if (_declareBuilder != null)
             {
@@ -2741,7 +2760,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     AddFromAlias(lambdaExpression?.Parameters[0].Name);
                 }
 
-                FieldsToFetch.Clear();
+                FieldsToFetch?.Clear();
                 _jsSelectBody = TranslateSelectBodyToJs(newExpression);
                 break;
             }
@@ -2752,9 +2771,10 @@ The recommended method is to use full text search (mark the field as Analyzed an
             var memberExpression = ((MemberExpression)body);
 
             var selectPath = GetSelectPath(memberExpression);
+            FieldsToFetch?.Clear(); // this overwrite any previous projection
             AddToFieldsToFetch(selectPath, selectPath);
 
-            if (_insideSelect == 1)
+            if (_insideSelect == 1 && FieldsToFetch != null)
             {
                 foreach (var fieldToFetch in FieldsToFetch)
                 {
@@ -2764,6 +2784,9 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     fieldToFetch.Alias = null;
                 }
             }
+
+            if (_declareBuilder != null)
+                AddReturnStatementToOutputFunction(body);
         }
 
         private void AddFromAliasOrRenameArgument(ref string arg)
@@ -2819,6 +2842,12 @@ The recommended method is to use full text search (mark the field as Analyzed an
             AddToFieldsToFetch(path, alias);
         }
 
+        private void HandleSelectRaw(MethodCallExpression callExpression, LambdaExpression lambdaExpression)
+        {
+            AddFromAlias(lambdaExpression.Parameters[0].Name);
+            _declareBuilder ??= new StringBuilder();
+            AddReturnStatementToOutputFunction(callExpression);
+        }
 
         private string GetSelectPathOrConstantValue(MemberExpression member)
         {
@@ -2882,7 +2911,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
         private void VisitLet(NewExpression expression)
         {
-            if (_insideWhere > 0)
+            if (_insideWhereOrSearchCounter > 0)
                 throw new NotSupportedException("Queries with a LET clause before a WHERE clause are not supported. " +
                                                 "WHERE clauses should appear before any LET clauses.");
 
@@ -2967,7 +2996,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
             {
                 arg = DocumentQuery.ProjectionParameter(constantExpression.Value);
             }
-            else if (loadSupport.Arg is MemberExpression memberExpression)
+            else if (loadSupport.Arg is MemberExpression memberExpression && IsDictionaryOnDictionaryExpression(memberExpression) == false)
             {
                 // if memberExpression is <>h__TransparentIdentifierN...TransparentIdentifier1.TransparentIdentifier0.something
                 // then the load-argument is 'something' which is not a real path (a real path should be 'x.something')
@@ -2998,6 +3027,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     AppendLineToOutputFunction(name, ToJs(expression), wrapper);
                     return;
                 }
+                
                 arg = ToJs(loadSupport.Arg, true);
             }
             else
@@ -3082,6 +3112,16 @@ The recommended method is to use full text search (mark the field as Analyzed an
             AppendLineToOutputFunction(name, doc + js, wrapper);
         }
 
+        private bool IsDictionaryOnDictionaryExpression(Expression expression)
+        {
+            //We want to wrap expressions like doc.SomeDictionary.Values inside a JS declared function
+            //because they are translated to JS map
+            return expression is MemberExpression memberExpression && 
+                   memberExpression.Expression.Type.GetInterfaces().Contains(typeof(IDictionary)) &&
+                   memberExpression.Member.DeclaringType != null &&
+                   memberExpression.Member.DeclaringType.GetInterfaces().Contains(typeof(IDictionary));
+        }
+
         private void AddLoadToken(string arg, string alias)
         {
             _loadTokens.Add(LoadToken.Create(arg, alias));
@@ -3117,6 +3157,8 @@ The recommended method is to use full text search (mark the field as Analyzed an
         {
             FromAlias = RenameAliasIfNeeded(alias);
             DocumentQuery.AddFromAliasToWhereTokens(FromAlias);
+            DocumentQuery.AddFromAliasToFilterTokens(FromAlias);
+            DocumentQuery.AddFromAliasToOrderByTokens(FromAlias);
         }
 
         private void AddAliasToIncludeTokensIfNeeded()
@@ -3152,11 +3194,11 @@ The recommended method is to use full text search (mark the field as Analyzed an
         private string TranslateSelectBodyToJs(Expression expression)
         {
             var sb = new StringBuilder();
-
-            sb.Append("{ ");
-
+          
             if (expression is NewExpression newExpression)
             {
+                sb.Append("{ ");
+
                 for (int index = 0; index < newExpression.Arguments.Count; index++)
                 {
                     var name = GetSelectPath(newExpression.Members[index]);
@@ -3165,7 +3207,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     {
                         if (index > 0)
                             sb.Append(", ");
-                        
+
                         _jsProjectionNames.Add(name);
                         sb.Append(name).Append(" : ").Append(TranslateSelectBodyToJs(newExpression.Arguments[index]));
                     }
@@ -3174,10 +3216,13 @@ The recommended method is to use full text search (mark the field as Analyzed an
                         AddJsProjection(name, newExpression.Arguments[index], sb, index != 0);
                     }
                 }
+                sb.Append(" }");
             }
 
             if (expression is MemberInitExpression mie)
             {
+                sb.Append("{ ");
+
                 for (int index = 0; index < mie.Bindings.Count; index++)
                 {
                     var field = mie.Bindings[index] as MemberAssignment;
@@ -3189,18 +3234,25 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     {
                         if (index > 0)
                             sb.Append(", ");
-                        
+
                         _jsProjectionNames.Add(name);
                         sb.Append(name).Append(" : ").Append(TranslateSelectBodyToJs(field.Expression));
                         continue;
                     }
-                   
+
                     AddJsProjection(name, field.Expression, sb, index != 0);
-                    
+
                 }
+                sb.Append(" }");
             }
 
-            sb.Append(" }");
+            if (expression is MemberExpression or MethodCallExpression)
+            { 
+                if (IsRawOrTimeSeriesCall(expression, out string script) == false)
+                    script = ToJs(expression);
+                
+                sb.Append(script);
+            }
 
             return sb.ToString();
         }
@@ -3282,12 +3334,15 @@ The recommended method is to use full text search (mark the field as Analyzed an
         private bool IsRawOrTimeSeriesCall(Expression expression, out string script)
         {
             script = null;
-
             if (!(expression is MethodCallExpression mce))
                 return false;
-
+            
             if (IsRawCall(mce))
             {
+
+                if (typeof(T).IsPrimitive || typeof(T) == typeof(string))
+                    throw new NotSupportedException($"Unsupported parameter type {expression.Type.Name}. Primitive types/string types are not allowed in Raw<T>() method.");
+
                 if (mce.Arguments.Count == 1)
                 {
                     script = (mce.Arguments[0] as ConstantExpression)?.Value.ToString();
@@ -3912,8 +3967,16 @@ The recommended method is to use full text search (mark the field as Analyzed an
             var i = 0;
             foreach (var fieldToFetch in FieldsToFetch)
             {
-                fields[i] = fieldToFetch.Name;
-                projections[i] = fieldToFetch.Alias ?? fieldToFetch.Name;
+                var fieldName = fieldToFetch.Name;
+                var fieldAlias = fieldToFetch.Alias;
+
+                if (_isProjectInto)
+                {
+                    HandleKeywordsIfNeeded(ref fieldName, ref fieldAlias);
+                }
+                
+                fields[i] = fieldName;
+                projections[i] = fieldAlias ?? fieldName;
 
                 i++;
             }
@@ -4038,7 +4101,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
         protected bool Equals(FieldToFetch other)
         {
-            return string.Equals(Name, other.Name, StringComparison.OrdinalIgnoreCase) && string.Equals(Alias, other.Alias, StringComparison.Ordinal);
+            return string.Equals(Name, other.Name) && string.Equals(Alias, other.Alias, StringComparison.Ordinal);
         }
 
         public override bool Equals(object obj)
@@ -4056,7 +4119,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
         {
             unchecked
             {
-                return ((Name != null ? StringComparer.OrdinalIgnoreCase.GetHashCode(Name) : 0) * 397) ^ (Alias != null ? StringComparer.Ordinal.GetHashCode(Alias) : 0);
+                return ((Name != null ? StringComparer.Ordinal.GetHashCode(Name) : 0) * 397) ^ (Alias != null ? StringComparer.Ordinal.GetHashCode(Alias) : 0);
             }
         }
     }

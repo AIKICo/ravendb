@@ -35,7 +35,10 @@ class configurationItem {
         "Indexing.Lucene.UseCompoundFileInMerging",
         "Indexing.Lucene.IndexInputType",
         "Indexing.MaxTimeToWaitAfterFlushAndSyncWhenReplacingSideBySideIndexInSec",
-        "Indexing.MinimumTotalSizeOfJournalsToRunFlushAndSyncWhenReplacingSideBySideIndexInMb"
+        "Indexing.MinimumTotalSizeOfJournalsToRunFlushAndSyncWhenReplacingSideBySideIndexInMb",
+        "Indexing.OrderByTicksAutomaticallyWhenDatesAreInvolved",
+        "Query.RegexTimeoutInMs",
+        "Indexing.Lucene.ReaderTermsIndexDivisor"
         // "Indexing.Static.SearchEngineType" - ignoring as we have dedicated widget to set that
         /*
             Obsolete keys:
@@ -52,6 +55,8 @@ class configurationItem {
     key = ko.observable<string>();
     value = ko.observable<string>();
 
+    unknownKey: KnockoutComputed<boolean>;
+
     validationGroup: KnockoutObservable<any>;
     dirtyFlag: () => DirtyFlag;
 
@@ -59,6 +64,14 @@ class configurationItem {
         this.key(key);
         this.value(value);
 
+        this.unknownKey = ko.pureComputed(() => {
+            const key = this.key();
+            if (!key) {
+                return false;
+            }
+            return configurationItem.PerDatabaseIndexingConfigurationOptions.indexOf(key) === -1;
+        });
+        
         this.initValidation();
 
         this.dirtyFlag = new ko.DirtyFlag([

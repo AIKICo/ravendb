@@ -18,8 +18,8 @@ namespace Sparrow.Utils
         public ReadWriteCompressedStream(Stream inner)
         {
             _inner = inner ?? throw new ArgumentNullException(nameof(inner));
-            _input = ZstdStream.Decompress(inner);
-            _output = ZstdStream.Compress(inner);
+            _input = ZstdStream.Decompress(inner, leaveOpen: true);
+            _output = ZstdStream.Compress(inner, leaveOpen: true);
             _dispose = new DisposeOnce<SingleAttempt>(DisposeInternal);
         }
 
@@ -150,14 +150,14 @@ namespace Sparrow.Utils
             return _input.Read(buffer);
         }
 
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = new CancellationToken())
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = new CancellationToken())
         {
-            return await _input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            return _input.ReadAsync(buffer, cancellationToken);
         }
 
-        public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
-            return await _input.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+            return _input.ReadAsync(buffer, offset, count, cancellationToken);
         }
 
         public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)

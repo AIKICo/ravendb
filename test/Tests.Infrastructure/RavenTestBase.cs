@@ -57,6 +57,7 @@ namespace FastTests
                 {
                     options ??= Options.Default;
                     var serverToUse = options.Server ?? Server;
+                    AsyncHelpers.RunSync(() => serverToUse.ServerStore.EnsureNotPassiveAsync());
 
                     var name = GetDatabaseName(caller);
 
@@ -102,6 +103,7 @@ namespace FastTests
                             [RavenConfiguration.GetKey(x => x.Core.RunInMemory)] = runInMemory.ToString(),
                             [RavenConfiguration.GetKey(x => x.Core.ThrowIfAnyIndexCannotBeOpened)] = "true",
                             [RavenConfiguration.GetKey(x => x.Indexing.MinNumberOfMapAttemptsAfterWhichBatchWillBeCanceledIfRunningLowOnMemory)] = int.MaxValue.ToString(),
+                            [RavenConfiguration.GetKey(x => x.Queries.RegexTimeout)] = (250).ToString()
                         }
                     };
 
@@ -387,12 +389,12 @@ namespace FastTests
             Assert.Equal(expectedVal, val);
         }
 
-        protected static async Task<T> AssertWaitFoGreaterAsync<T>(Func<T> act, T value, int timeout = 15000, int interval = 100) where T : IComparable
+        protected static async Task<T> AssertWaitForGreaterAsync<T>(Func<T> act, T value, int timeout = 15000, int interval = 100) where T : IComparable
         {
-            return await AssertWaitFoGreaterAsync(() => Task.FromResult(act()), value, timeout, interval);
+            return await AssertWaitForGreaterAsync(() => Task.FromResult(act()), value, timeout, interval);
         }
 
-        protected static async Task<T> AssertWaitFoGreaterAsync<T>(Func<Task<T>> act, T value, int timeout = 15000, int interval = 100) where T : IComparable
+        protected static async Task<T> AssertWaitForGreaterAsync<T>(Func<Task<T>> act, T value, int timeout = 15000, int interval = 100) where T : IComparable
         {
             var ret = await WaitForPredicateAsync(r => r.CompareTo(value) > 0, act, timeout, interval);
             Assert.NotNull(ret);
@@ -514,6 +516,8 @@ namespace FastTests
             if (debug && Debugger.IsAttached == false)
                 return;
 
+            RavenTestHelper.AssertNotRunningOnCi();
+
             if (clientCert != null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 using (var userPersonalStore = new X509Store(StoreName.My, StoreLocation.CurrentUser))
@@ -549,6 +553,11 @@ namespace FastTests
 
         public static void WaitForUserToContinueTheTest(IDocumentStore documentStore, bool debug = true, string database = null, X509Certificate2 clientCert = null)
         {
+            if (debug && Debugger.IsAttached == false)
+                return;
+
+            RavenTestHelper.AssertNotRunningOnCi();
+
             if (clientCert != null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 using (var userPersonalStore = new X509Store(StoreName.My, StoreLocation.CurrentUser))
@@ -560,9 +569,6 @@ namespace FastTests
 
             try
             {
-                if (debug && Debugger.IsAttached == false)
-                    return;
-
                 var urls = documentStore.Urls;
                 if (clientCert != null)
                     Console.WriteLine($"Using certificate with serial: {clientCert.SerialNumber}");
@@ -631,7 +637,7 @@ namespace FastTests
             {
             }
 
-            public static Options ForSearchEngine( RavenSearchEngineMode mode)
+            public static Options ForSearchEngine(RavenSearchEngineMode mode)
             {
                 var config = new RavenTestParameters() {SearchEngine = mode};
                 return ForSearchEngine(config);
@@ -661,13 +667,13 @@ namespace FastTests
 
             public static Options ForMode(RavenDatabaseMode mode)
             {
+                var options = new Options();
                 switch (mode)
                 {
                     case RavenDatabaseMode.Single:
-                        var single = new Options();
-                        single.AddToDescription($"{nameof(RavenDataAttribute.DatabaseMode)} = {nameof(RavenDatabaseMode.Single)}");
-
-                        return single;
+                        options.DatabaseMode = RavenDatabaseMode.Single;
+                        options.AddToDescription($"{nameof(RavenDataAttribute.DatabaseMode)} = {nameof(RavenDatabaseMode.Single)}");
+                        return options;
                     case RavenDatabaseMode.All:
                     default:
                         throw new ArgumentOutOfRangeException(nameof(mode), mode, null);
@@ -826,6 +832,10 @@ namespace FastTests
                     _encrypted = value;
                 }
             }
+
+            public RavenDatabaseMode DatabaseMode { get; private set; }
+
+            public RavenSearchEngineMode SearchEngineMode { get; internal set; }
 
             private void AssertNotFrozen()
             {

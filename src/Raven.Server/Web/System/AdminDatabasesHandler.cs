@@ -8,7 +8,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -30,13 +29,13 @@ using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Migration;
 using Raven.Client.Util;
 using Raven.Server.Config;
-using Raven.Server.Config.Categories;
 using Raven.Server.Config.Settings;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Documents.PeriodicBackup.Restore;
+using Raven.Server.Exceptions;
 using Raven.Server.Json;
 using Raven.Server.Rachis;
 using Raven.Server.Routing;
@@ -53,7 +52,9 @@ using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Sparrow.Server;
+using Voron;
 using Voron.Util.Settings;
+using BackupUtils = Raven.Server.Utils.BackupUtils;
 using DatabaseSmuggler = Raven.Server.Smuggler.Documents.DatabaseSmuggler;
 using Index = Raven.Server.Documents.Indexes.Index;
 using Size = Sparrow.Size;
@@ -104,7 +105,7 @@ namespace Raven.Server.Web.System
                     if (databaseRecord.Topology.RelevantFor(node))
                         throw new InvalidOperationException($"Can't add node {node} to {name} topology because it is already part of it");
 
-                    ValidateNodeForAddingToDb(name, node, databaseRecord, clusterTopology, baseMessage: $"Can't add node {node} to database '{name}' topology");
+                    ValidateNodeForAddingToDb(name, node, databaseRecord, clusterTopology, Server, baseMessage: $"Can't add node {node} to database '{name}' topology");
                 }
 
                 //The case were we don't care where the database will be added to
@@ -115,10 +116,13 @@ namespace Raven.Server.Web.System
                         .Concat(clusterTopology.Watchers.Keys)
                         .ToList();
 
-                    allNodes.RemoveAll(n => databaseRecord.Topology.AllNodes.Contains(n) || (databaseRecord.Encrypted && NotUsingHttps(clusterTopology.GetUrlFromTag(n))));
+                    if (Server.AllowEncryptedDatabasesOverHttp == false)
+                    {
+                        allNodes.RemoveAll(n => databaseRecord.Topology.AllNodes.Contains(n) || (databaseRecord.Encrypted && NotUsingHttps(clusterTopology.GetUrlFromTag(n))));
 
-                    if (databaseRecord.Encrypted && allNodes.Count == 0)
-                        throw new InvalidOperationException($"Database {name} is encrypted and requires a node which supports SSL. There is no such node available in the cluster.");
+                        if (databaseRecord.Encrypted && allNodes.Count == 0)
+                            throw new InvalidOperationException($"Database {name} is encrypted and requires a node which supports SSL. There is no such node available in the cluster.");
+                    }
 
                     if (allNodes.Count == 0)
                         throw new InvalidOperationException($"Database {name} already exists on all the nodes of the cluster");
@@ -151,7 +155,7 @@ namespace Raven.Server.Web.System
 
                 try
                 {
-                    await WaitForExecutionOnSpecificNode(context, clusterTopology, node, newIndex);
+                    await ServerStore.WaitForExecutionOnSpecificNode(context, node, newIndex);
                 }
                 catch (DatabaseLoadFailureException e)
                 {
@@ -195,10 +199,7 @@ namespace Raven.Server.Web.System
 
                 if (LoggingSource.AuditLog.IsInfoEnabled)
                 {
-                    var clientCert = GetCurrentCertificate();
-
-                    var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
-                    auditLog.Info($"Database {databaseRecord.DatabaseName} PUT by {clientCert?.Subject} ({clientCert?.Thumbprint})");
+                    LogAuditFor("DbMgmt", "PUT", $"Database '{databaseRecord.DatabaseName}'");
                 }
 
                 if (ServerStore.LicenseManager.LicenseStatus.HasDocumentsCompression && databaseRecord.DocumentsCompression == null)
@@ -247,7 +248,7 @@ namespace Raven.Server.Web.System
                     throw licenseLimit;
                 }
 
-                if (databaseRecord.Encrypted && databaseRecord.Topology?.DynamicNodesDistribution == true)
+                if (databaseRecord.Encrypted && databaseRecord.Topology?.DynamicNodesDistribution == true && Server.AllowEncryptedDatabasesOverHttp == false)
                 {
                     throw new InvalidOperationException($"Cannot enable '{nameof(DatabaseTopology.DynamicNodesDistribution)}' for encrypted database: " + databaseRecord.DatabaseName);
                 }
@@ -316,7 +317,7 @@ namespace Raven.Server.Web.System
                         if (documentDatabase.DatabaseShutdown.IsCancellationRequested)
                             return;
 
-                        index = Index.Open(indexPath, documentDatabase, generateNewDatabaseId: false);
+                        index = Index.Open(indexPath, documentDatabase, generateNewDatabaseId: false, out var _);
                         if (index == null)
                             continue;
 
@@ -404,8 +405,9 @@ namespace Raven.Server.Web.System
             else
             {
                 databaseRecord.Topology ??= new DatabaseTopology();
-
                 databaseRecord.Topology.ReplicationFactor = Math.Min(replicationFactor, clusterTopology.AllNodes.Count);
+
+                Server.ServerStore.AssignNodesToDatabase(clusterTopology, databaseRecord);
             }
 
             databaseRecord.Topology.ClusterTransactionIdBase64 ??= Guid.NewGuid().ToBase64Unpadded();
@@ -415,7 +417,15 @@ namespace Raven.Server.Web.System
             await ServerStore.WaitForCommitIndexChange(RachisConsensus.CommitIndexModification.GreaterOrEqual, newIndex);
 
             var members = (List<string>)result;
-            await WaitForExecutionOnRelevantNodes(context, name, clusterTopology, members, newIndex);
+            try
+            {
+                await ServerStore.WaitForExecutionOnRelevantNodesAsync(context, members, newIndex);
+            }
+            catch (RaftIndexWaitAggregateException e)
+            {
+                throw new InvalidDataException(
+                    $"The database '{name}' was created but is not accessible, because one or more of the nodes on which this database was supposed to reside on, threw an exception.", e);
+            }
 
             var nodeUrlsAddedTo = new List<string>();
             foreach (var member in members)
@@ -488,7 +498,7 @@ namespace Raven.Server.Web.System
                     throw new InvalidOperationException($"node '{node}' already exists. This is not allowed. Database Topology : {topology}");
 
                 var url = clusterTopology.GetUrlFromTag(node);
-                if (databaseRecord.Encrypted && NotUsingHttps(url))
+                if (databaseRecord.Encrypted && NotUsingHttps(url) && Server.AllowEncryptedDatabasesOverHttp == false)
                     throw new InvalidOperationException($"{databaseRecord.DatabaseName} is encrypted but node {node} with url {url} doesn't use HTTPS. This is not allowed.");
             }
         }
@@ -539,7 +549,7 @@ namespace Raven.Server.Web.System
 
                     case PeriodicBackupConnectionType.S3:
                         var s3Settings = JsonDeserializationServer.S3Settings(restorePathBlittable);
-                        using (var s3RestoreUtils = new S3RestorePoints(ServerStore.Configuration.Backup, sortedList, context, s3Settings))
+                        using (var s3RestoreUtils = new S3RestorePoints(ServerStore.Configuration, sortedList, context, s3Settings))
                         {
                             await s3RestoreUtils.FetchRestorePoints(s3Settings.RemoteFolderName);
                         }
@@ -548,7 +558,7 @@ namespace Raven.Server.Web.System
 
                     case PeriodicBackupConnectionType.Azure:
                         var azureSettings = JsonDeserializationServer.AzureSettings(restorePathBlittable);
-                        using (var azureRestoreUtils = new AzureRestorePoints(ServerStore.Configuration.Backup, sortedList, context, azureSettings))
+                        using (var azureRestoreUtils = new AzureRestorePoints(ServerStore.Configuration, sortedList, context, azureSettings))
                         {
                             await azureRestoreUtils.FetchRestorePoints(azureSettings.RemoteFolderName);
                         }
@@ -556,7 +566,7 @@ namespace Raven.Server.Web.System
 
                     case PeriodicBackupConnectionType.GoogleCloud:
                         var googleCloudSettings = JsonDeserializationServer.GoogleCloudSettings(restorePathBlittable);
-                        using (var googleCloudRestoreUtils = new GoogleCloudRestorePoints(ServerStore.Configuration.Backup, sortedList, context, googleCloudSettings))
+                        using (var googleCloudRestoreUtils = new GoogleCloudRestorePoints(ServerStore.Configuration, sortedList, context, googleCloudSettings))
                         {
                             await googleCloudRestoreUtils.FetchRestorePoints(googleCloudSettings.RemoteFolderName);
                         }
@@ -597,7 +607,7 @@ namespace Raven.Server.Web.System
                     restoreType = RestoreType.Local;
                 }
                 var operationId = ServerStore.Operations.GetNextOperationId();
-                var cancelToken = CreateOperationToken();
+                var cancelToken = CreateBackgroundOperationToken();
                 RestoreBackupTaskBase restoreBackupTask;
                 switch (restoreType)
                 {
@@ -655,12 +665,37 @@ namespace Raven.Server.Web.System
             }
         }
 
+        [RavenAction("/admin/backup-task/delay", "POST", AuthorizationStatus.Operator)]
+        public async Task DelayBackupTask()
+        {
+            var id = GetLongQueryString("taskId");
+            var delay = GetTimeSpanQueryString("duration");
+            if (delay <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(delay));
+
+            var databaseName = GetStringQueryString("database");
+            var database = await ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).ConfigureAwait(false);
+            if (database == null)
+                DatabaseDoesNotExistException.Throw(databaseName);
+
+            var delayUntil = DateTime.UtcNow.AddTicks(delay.Value.Ticks);
+            await database.PeriodicBackupRunner.DelayAsync(id, delayUntil);
+
+            if (LoggingSource.AuditLog.IsInfoEnabled)
+            {
+                LogAuditFor(databaseName, "DELAY", $"Backup task with task id '{id}' until '{delayUntil}' UTC");
+            }
+
+
+            NoContentStatus();
+        }
+
         [RavenAction("/admin/databases", "DELETE", AuthorizationStatus.Operator)]
         public async Task Delete()
         {
             await ServerStore.EnsureNotPassiveAsync();
 
-            var waitOnRecordDeletion = new List<string>();
+            var waitOnDeletion = new List<string>();
             var pendingDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var databasesToDelete = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -673,10 +708,7 @@ namespace Raven.Server.Web.System
 
                 if (LoggingSource.AuditLog.IsInfoEnabled)
                 {
-                    clientCertificate = GetCurrentCertificate();
-
-                    var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
-                    auditLog.Info($"Attempt to delete [{string.Join(", ", parameters.DatabaseNames)}] database(s) from ({string.Join(", ", parameters.FromNodes ?? Enumerable.Empty<string>())}) by {clientCertificate?.Subject} ({clientCertificate?.Thumbprint})");
+                    LogAuditFor("DbMgmt", "DELETE", $"Attempt to delete database(s) [{string.Join(", ", parameters.DatabaseNames)}] from ({string.Join(", ", parameters.FromNodes ?? Enumerable.Empty<string>())})");
                 }
 
                 using (context.OpenReadTransaction())
@@ -690,6 +722,11 @@ namespace Raven.Server.Web.System
                         {
                             if (rawRecord == null)
                                 continue;
+
+                            if (rawRecord.DatabaseState == DatabaseStateStatus.RestoreInProgress)
+                                throw new InvalidOperationException($"Can't delete database '{databaseName}' while the restore " +
+                                                                    $"process is in progress. In order to delete the database, " +
+                                                                    $"you can cancel the restore task from node {rawRecord.Topology.Members[0]}");
 
                             switch (rawRecord.LockMode)
                             {
@@ -726,23 +763,15 @@ namespace Raven.Server.Web.System
                                 pendingDeletes.Add(node);
                                 topology.RemoveFromTopology(node);
                             }
-
-                            if (topology.Count == 0)
-                                waitOnRecordDeletion.Add(databaseName);
-
-                            continue;
                         }
 
-                        waitOnRecordDeletion.Add(databaseName);
+                        waitOnDeletion.Add(databaseName);
                     }
                 }
 
                 if (LoggingSource.AuditLog.IsInfoEnabled)
                 {
-                    var clientCert = GetCurrentCertificate();
-
-                    var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
-                    auditLog.Info($"Delete [{string.Join(", ", databasesToDelete)}] database(s) from ({string.Join(", ", parameters.FromNodes ?? Enumerable.Empty<string>())}) by {clientCert?.Subject} ({clientCert?.Thumbprint})");
+                    LogAuditFor("DbMgmt", "DELETE", $"Database(s) [{string.Join(", ", databasesToDelete)}] from ({string.Join(", ", parameters.FromNodes ?? Enumerable.Empty<string>())})");
                 }
 
                 long index = -1;
@@ -753,22 +782,45 @@ namespace Raven.Server.Web.System
                 }
 
                 await ServerStore.Cluster.WaitForIndexNotification(index);
-
                 long actualDeletionIndex = index;
 
                 var timeToWaitForConfirmation = parameters.TimeToWaitForConfirmation ?? TimeSpan.FromSeconds(15);
 
                 var sp = Stopwatch.StartNew();
                 int databaseIndex = 0;
-                while (waitOnRecordDeletion.Count > databaseIndex)
+
+
+                while (waitOnDeletion.Count > databaseIndex)
                 {
-                    var databaseName = waitOnRecordDeletion[databaseIndex];
+                    var databaseName = waitOnDeletion[databaseIndex];
                     using (context.OpenReadTransaction())
+                    using (var raw = ServerStore.Cluster.ReadRawDatabaseRecord(context, databaseName))
                     {
-                        if (ServerStore.Cluster.DatabaseExists(context, databaseName) == false)
+                        if (raw == null)
                         {
-                            waitOnRecordDeletion.RemoveAt(databaseIndex);
+                            waitOnDeletion.RemoveAt(databaseIndex);
                             continue;
+                        }
+
+                        if (parameters.FromNodes != null && parameters.FromNodes.Length > 0)
+                        {
+                            {
+                                var allNodesDeleted = true;
+                                foreach (var node in parameters.FromNodes)
+                                {
+                                    if (raw.DeletionInProgress.ContainsKey(node) == false)
+                                        continue;
+
+                                    allNodesDeleted = false;
+                                    break;
+                                }
+
+                                if (allNodesDeleted)
+                                {
+                                    waitOnDeletion.RemoveAt(databaseIndex);
+                                    continue;
+                                }
+                            }
                         }
                     }
                     // we'll now wait for the _next_ operation in the cluster
@@ -791,6 +843,18 @@ namespace Raven.Server.Web.System
                     catch (TimeoutException)
                     {
                         databaseIndex++;
+                    }
+                }
+
+                if (parameters.FromNodes != null && parameters.FromNodes.Length > 0)
+                {
+                    try
+                    {
+                        await ServerStore.WaitForExecutionOnRelevantNodesAsync(context, parameters.FromNodes.ToList(), actualDeletionIndex);
+                    }
+                    catch (RaftIndexWaitAggregateException e)
+                    {
+                        throw new InvalidDataException($"Deletion of databases {string.Join(", ", parameters.DatabaseNames)} was performed, but it could not be propagated due to errors on one or more target nodes.", e);
                     }
                 }
 
@@ -972,6 +1036,8 @@ namespace Raven.Server.Web.System
                     {
                         console.Log.Operations($"The certificate that was used to initiate the operation: {clientCert ?? "None"}");
                     }
+                    if (LoggingSource.AuditLog.IsInfoEnabled)
+                        LogAuditFor("Server", "Execute", $"AdminJSConsole Script: \"{adminJsScript.Script}\"");
 
                     result = console.ApplyScript(adminJsScript);
                 }
@@ -989,6 +1055,9 @@ namespace Raven.Server.Web.System
                     {
                         console.Log.Operations($"The certificate that was used to initiate the operation: {clientCert ?? "None"}");
                     }
+                    if (LoggingSource.AuditLog.IsInfoEnabled)
+                        LogAuditFor("Database", "Execute", $"AdminJSConsole Script: \"{adminJsScript.Script}\"");
+
                     result = console.ApplyScript(adminJsScript);
                 }
                 else
@@ -1042,7 +1111,7 @@ namespace Raven.Server.Web.System
                 }
             }
         }
-        
+
         [RavenAction("/admin/compact", "POST", AuthorizationStatus.Operator, DisableOnCpuCreditsExhaustion = true)]
         public async Task CompactDatabase()
         {
@@ -1070,7 +1139,7 @@ namespace Raven.Server.Web.System
 
                 var database = await ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(compactSettings.DatabaseName).ConfigureAwait(false);
 
-                var token = CreateOperationToken();
+                var token = CreateBackgroundOperationToken();
                 var compactDatabaseTask = new CompactDatabaseTask(
                     ServerStore,
                     compactSettings.DatabaseName,
@@ -1176,17 +1245,70 @@ namespace Raven.Server.Web.System
         public async Task SetUnusedDatabaseIds()
         {
             var database = GetStringQueryString("name");
+            var validate = GetBoolValueQueryString("validate", required: false) ?? false;
+
             await ServerStore.EnsureNotPassiveAsync();
 
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var json = await context.ReadForDiskAsync(RequestBodyStream(), "unused-databases-ids"))
             {
                 var parameters = JsonDeserializationServer.Parameters.UnusedDatabaseParameters(json);
+                if (validate)
+                {
+                    using (var token = CreateHttpRequestBoundTimeLimitedOperationToken(ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan))
+                        await ValidateUnusedIdsAsync(parameters.DatabaseIds, database, token.Token);
+                }
+
                 var command = new UpdateUnusedDatabaseIdsCommand(database, parameters.DatabaseIds, GetRaftRequestIdFromQuery());
                 await ServerStore.SendToLeaderAsync(command);
             }
 
             NoContentStatus();
+        }
+
+        private async Task ValidateUnusedIdsAsync(HashSet<string> unusedIds, string databaseName, CancellationToken token)
+        {
+            foreach (var id in unusedIds)
+            {
+                ValidateDatabaseId(id);
+            }
+
+            DatabaseTopology topology;
+            ClusterTopology clusterTopology;
+            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+            using (context.OpenReadTransaction())
+            using (var rawRecord = ServerStore.Cluster.ReadRawDatabaseRecord(context, databaseName))
+            {
+                topology = rawRecord.Topology;
+                clusterTopology = ServerStore.GetClusterTopology(context);
+            }
+
+            if (unusedIds.Contains(topology.DatabaseTopologyIdBase64))
+                throw new InvalidOperationException($"'DatabaseTopologyIdBase64' ({topology.DatabaseTopologyIdBase64}) cannot be added to the 'unused ids' list (of '{databaseName}').");
+
+            if (unusedIds.Contains(topology.ClusterTransactionIdBase64))
+                throw new InvalidOperationException($"'ClusterTransactionIdBase64' ({topology.ClusterTransactionIdBase64}) cannot be added to the 'unused ids' list (of '{databaseName}').");
+
+            var nodesUrls = topology.AllNodes.Select(clusterTopology.GetUrlFromTag).ToArray();
+
+            using var requestExecutor = RequestExecutor.Create(nodesUrls, databaseName, Server.Certificate.Certificate, DocumentConventions.Default);
+
+            foreach (var nodeTag in topology.AllNodes)
+            {
+                using (requestExecutor.ContextPool.AllocateOperationContext(out var context))
+                {
+                    var cmd = new GetStatisticsOperation.GetStatisticsCommand(debugTag: "unused-database-validation", nodeTag);
+                    await requestExecutor.ExecuteAsync(cmd, context, token: token);
+                    var stats = cmd.Result;
+
+                    if (unusedIds.Contains(stats.DatabaseId))
+                    {
+                        throw new InvalidOperationException(
+                            $"'{stats.DatabaseId}' cannot be added to the 'unused ids' list (of '{databaseName}'), because it's the database id of '{databaseName}' on node {nodeTag}.");
+                    }
+                }
+            }
+
         }
 
         [RavenAction("/admin/migrate", "POST", AuthorizationStatus.Operator, DisableOnCpuCreditsExhaustion = true)]
@@ -1249,7 +1371,7 @@ namespace Raven.Server.Web.System
             }
             var (commandline, tmpFile) = configuration.GenerateExporterCommandLine();
             var processStartInfo = new ProcessStartInfo(dataExporter, commandline);
-            var token = new OperationCancelToken(database.DatabaseShutdown, HttpContext.RequestAborted);
+            var token = new OperationCancelToken(database.DatabaseShutdown);
             Task timeout = null;
             if (configuration.Timeout.HasValue)
             {
@@ -1341,7 +1463,7 @@ namespace Raven.Server.Web.System
                                 onProgress(overallProgress);
                                 using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                                 await using (var reader = File.OpenRead(configuration.OutputFilePath))
-                                await using (var stream = new GZipStream(reader, CompressionMode.Decompress))
+                                await using (var stream = await BackupUtils.GetDecompressionStreamAsync(reader))
                                 using (var source = new StreamSource(stream, context, database))
                                 {
                                     var destination = new DatabaseDestination(database);
@@ -1467,6 +1589,26 @@ namespace Raven.Server.Web.System
                 progressLine = await readline.WithCancellation(token);
             }
             return (false, progressLine);
+        }
+
+        private static unsafe void ValidateDatabaseId(string id)
+        {
+            const int fixedLength = StorageEnvironment.Base64IdLength + StorageEnvironment.Base64IdLength % 4;
+
+            if (id is not { Length: StorageEnvironment.Base64IdLength })
+                throw new InvalidOperationException($"Database ID '{id}' isn't valid because its length ({id.Length}) isn't {StorageEnvironment.Base64IdLength}.");
+
+            Span<byte> bytes = stackalloc byte[fixedLength / 3 * 4];
+            char* buffer = stackalloc char[fixedLength];
+            fixed (char* str = id)
+            {
+                Buffer.MemoryCopy(str, buffer, 24 * sizeof(char), StorageEnvironment.Base64IdLength * sizeof(char));
+                for (int i = StorageEnvironment.Base64IdLength; i < fixedLength; i++)
+                    buffer[i] = '=';
+
+                if (Convert.TryFromBase64Chars(new ReadOnlySpan<char>(buffer, fixedLength), bytes, out _) == false)
+                    throw new InvalidOperationException($"Database ID '{id}' isn't valid because it isn't Base64Id (it contains chars which cannot be in Base64String).");
+            }
         }
     }
 }

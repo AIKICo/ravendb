@@ -34,7 +34,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
     [LicenseRequiredFact]
     public async Task Should_Create_Secured_Cluster_Generating_Self_Singed_Cert_And_Setup_Zip_File_From_Rvn_Three_Nodes()
     {
-        DoNotReuseServer();
+        DoNotReuseServerAndUseStagingLetsEncrypt();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
         var license = Environment.GetEnvironmentVariable("RAVEN_LICENSE");
         Assert.True(license != null, nameof(license) + " != null");
@@ -54,9 +55,9 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             License = licenseObj,
             NodeSetupInfos = new Dictionary<string,NodeInfo>()
             {
-                ["A"] = new() { Port = 443, TcpPort = 38887, Addresses = new List<string> { "127.0.0.1" } },
-                ["B"] = new() { Port = 448, TcpPort = 38888, Addresses = new List<string> { "127.0.0.1" } },
-                ["C"] = new() { Port = 446, TcpPort = 38889, Addresses = new List<string> { "127.0.0.1" } }
+                ["A"] = new() { Port = 30443, TcpPort = 38887, Addresses = new List<string> { "127.0.0.1" } },
+                ["B"] = new() { Port = 30448, TcpPort = 38888, Addresses = new List<string> { "127.0.0.1" } },
+                ["C"] = new() { Port = 30446, TcpPort = 38889, Addresses = new List<string> { "127.0.0.1" } }
             }
         };
 
@@ -72,7 +73,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             {
                 Output.WriteLine(tuple.Exception.Message);
             }
-        }), CancellationToken.None);
+        }), cts.Token);
 
 
         var settingsJsonObject = SetupManager.ExtractCertificatesAndSettingsJsonFromZip(zipBytes, "A",
@@ -109,6 +110,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = url1,
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -123,6 +125,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = url2,
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -137,6 +140,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = url3,
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -206,10 +210,18 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
 
     }
 
+    private void DoNotReuseServerAndUseStagingLetsEncrypt()
+    {
+        DoNotReuseServer();
+
+        Server.Configuration.Core.AcmeUrl = StagingAcmeClientUrl;
+    }
+
     [LicenseRequiredFact]
     public async Task Should_Create_Secured_Cluster_Generating_Self_Singed_Cert_And_Setup_Zip_File_From_Rvn_One_Node()
     {
-        DoNotReuseServer();
+        DoNotReuseServerAndUseStagingLetsEncrypt();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
         var license = Environment.GetEnvironmentVariable("RAVEN_LICENSE");
         Assert.True(license != null, nameof(license) + " != null");
@@ -229,7 +241,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             License = licenseObj,
             NodeSetupInfos = new Dictionary<string, NodeInfo>()
             {
-                ["A"] = new() { Port = 443, TcpPort = 38887, Addresses = new List<string> { "127.0.0.1" } },
+                ["A"] = new() { Port = 30443, TcpPort = 38887, Addresses = new List<string> { "127.0.0.1" } },
             }
         };
 
@@ -246,7 +258,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             {
                 Output.WriteLine(tuple.Exception.Message);
             }
-        }), CancellationToken.None);
+        }), cts.Token);
 
 
         var settingsJsonObject = SetupManager.ExtractCertificatesAndSettingsJsonFromZip(zipBytes, "A",
@@ -281,6 +293,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = url1,
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -309,10 +322,11 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
 
     }
 
-    [LicenseRequiredFact]
+    [LicenseRequiredRetryFact(delayBetweenRetriesMs: 1000)]
     public async Task Should_Create_Secured_Cluster_From_Rvn_Using_Lets_Encrypt_Mode_One_Node()
     {
-        DoNotReuseServer();
+        DoNotReuseServerAndUseStagingLetsEncrypt();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
         var license = Environment.GetEnvironmentVariable("RAVEN_LICENSE");
         Assert.True(license != null, nameof(license) + " != null");
@@ -322,7 +336,6 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
         const string rootDomain = "development.run";
         const string publicTcpServerUrl1 = $"tcp://a.{domain}.{rootDomain}:38879";
         const string tcpServerUrl1 = "tcp://127.0.0.1:38879";
-
 
         var setupInfo = new SetupInfo
         {
@@ -334,7 +347,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             LocalNodeTag = "A",
             NodeSetupInfos = new Dictionary<string, NodeInfo>
             {
-                {"A", new NodeInfo {Port = 443, TcpPort = 38879, Addresses = new List<string> {"127.0.0.1"}}},
+                {"A", new NodeInfo {Port = 30443, TcpPort = 38879, Addresses = new List<string> {"127.0.0.1"}}},
             }
         };
 
@@ -357,7 +370,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             Total = 4
         },
             false,
-            CancellationToken.None);
+            StagingAcmeClientUrl,
+            cts.Token);
 
         X509Certificate2 serverCert;
         X509Certificate2 clientCert;
@@ -408,6 +422,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
                 [RavenConfiguration.GetKey(x => x.Core.TcpServerUrls)] = tcpServerUrl1,
                 [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl1,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
 
         });
@@ -437,10 +452,11 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             Assert.True(await WaitForValueAsync(() => server.ServerStore.GetClusterTopology().Members.Count == numberOfExpectedNodes, true));
     }
 
-    [LicenseRequiredFact]
+    [LicenseRequiredRetryFact(delayBetweenRetriesMs: 1000)]
     public async Task Should_Create_Secured_Cluster_From_Rvn_Using_Lets_Encrypt_Mode_Three_Nodes()
     {
-        DoNotReuseServer();
+        DoNotReuseServerAndUseStagingLetsEncrypt();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
 
         var license = Environment.GetEnvironmentVariable("RAVEN_LICENSE");
         Assert.True(license != null, nameof(license) + " != null");
@@ -448,8 +464,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
 
         const string domain = "rvnTest";
         const string rootDomain = "development.run";
-        const string serverUrl2 = "https://127.0.0.1:444";
-        const string serverUrl3 = "https://127.0.0.1:446";
+        const string serverUrl2 = "https://127.0.0.1:30444";
+        const string serverUrl3 = "https://127.0.0.1:30446";
         const string publicTcpServerUrl1 = $"tcp://a.{domain}.{rootDomain}:38879";
         const string publicTcpServerUrl2 = $"tcp://b.{domain}.{rootDomain}:38880";
         const string publicTcpServerUrl3 = $"tcp://c.{domain}.{rootDomain}:38888";
@@ -468,9 +484,9 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             LocalNodeTag = "A",
             NodeSetupInfos = new Dictionary<string, NodeInfo>
             {
-                {"A", new NodeInfo {Port = 443, TcpPort = 38879, Addresses = new List<string> {"127.0.0.1"}}},
-                {"B", new NodeInfo {Port = 444, TcpPort = 38880, Addresses = new List<string> {"127.0.0.1"}}},
-                {"C", new NodeInfo {Port = 446, TcpPort = 38888, Addresses = new List<string> {"127.0.0.1"}}}
+                {"A", new NodeInfo {Port = 30443, TcpPort = 38879, Addresses = new List<string> {"127.0.0.1"}}},
+                {"B", new NodeInfo {Port = 30444, TcpPort = 38880, Addresses = new List<string> {"127.0.0.1"}}},
+                {"C", new NodeInfo {Port = 30446, TcpPort = 38888, Addresses = new List<string> {"127.0.0.1"}}}
             }
         };
         Assert.True(setupInfo.ZipOnly == false, nameof(setupInfo.ZipOnly) + " != false");
@@ -492,7 +508,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
             Total = 4
         },
             false,
-            CancellationToken.None);
+            StagingAcmeClientUrl,
+            cts.Token);
 
         X509Certificate2 serverCert;
         X509Certificate2 clientCert;
@@ -547,6 +564,7 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
                 [RavenConfiguration.GetKey(x => x.Core.TcpServerUrls)] = tcpServerUrl1,
                 [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl1,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
 
         });
@@ -563,7 +581,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
                 [RavenConfiguration.GetKey(x => x.Core.TcpServerUrls)] = tcpServerUrl2,
-                [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl2
+                [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl2,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -579,7 +598,8 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
                 [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
                 [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
                 [RavenConfiguration.GetKey(x => x.Core.TcpServerUrls)] = tcpServerUrl3,
-                [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl3
+                [RavenConfiguration.GetKey(x => x.Core.PublicTcpServerUrl)] = publicTcpServerUrl3,
+                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = StagingAcmeClientUrl
             }
         });
 
@@ -649,4 +669,6 @@ public class SetupSecuredClusterUsingRvn : ClusterTestBase
 
         Assert.True(await WaitForValueAsync(() => server.ServerStore.GetClusterTopology().Members.Count == numberOfExpectedNodes, true));
     }
+
+    private const string StagingAcmeClientUrl = "https://acme-staging-v02.api.letsencrypt.org/directory";
 }

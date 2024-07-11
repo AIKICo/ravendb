@@ -3,10 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net.Security;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.X509;
@@ -20,7 +20,6 @@ using Org.BouncyCastle.X509;
 using Org.BouncyCastle.X509.Extension;
 using Raven.Client;
 using Raven.Client.Documents.Operations;
-using Raven.Client.Util;
 using Raven.Server.Commercial;
 using Raven.Server.Commercial.SetupWizard;
 using Raven.Server.Config.Categories;
@@ -38,9 +37,29 @@ namespace Raven.Server.Utils
 
         private static readonly Logger Logger = LoggingSource.Instance.GetLogger("Server", typeof(CertificateUtils).FullName);
 
-        internal static bool CertHasKnownIssuer(X509Certificate2 userCertificate, X509Certificate2 knownCertificate, SecurityConfiguration securityConfiguration, out string issuerPinningHash)
+        private static string GetCertificateName(X509Certificate2 certificate)
         {
-            issuerPinningHash = null;
+            if (certificate == null)
+                return string.Empty;
+
+            return string.IsNullOrEmpty(certificate.FriendlyName) == false ? certificate.FriendlyName : certificate.Subject;
+        }
+
+        private static string GenerateCertificateChainDebugLog(X509Chain chain)
+        {
+            var stringBuilder = new StringBuilder();
+            stringBuilder.AppendLine("Certificate Chain (from leaf to CA) (name - pinning hash):");
+            foreach (var element in chain.ChainElements)
+            {
+                var certificate = element.Certificate;
+                stringBuilder.AppendLine($"{GetCertificateName(certificate)} - {certificate.GetPublicKeyPinningHash()}");
+            }
+
+            return stringBuilder.ToString();
+        }
+
+        internal static bool CertHasKnownIssuer(X509Certificate2 userCertificate, X509Certificate2 knownCertificate, SecurityConfiguration securityConfiguration, List<string> explanations = null)
+        {
             X509Certificate2 issuerCertificate = null;
 
             var userChain = new X509Chain();
@@ -53,14 +72,19 @@ namespace Raven.Server.Utils
             // in order to do that properly it needs to be able to verify the chain by download the certificates
             //knownCertChain.ChainPolicy.DisableCertificateDownloads = true;
 
+            explanations?.Add($"Try building client certificate chain - {GetCertificateName(userCertificate)}.");
             try
             {
                 userChain.Build(userCertificate);
             }
             catch (Exception e)
             {
-                if (Logger.IsInfoEnabled)
-                    Logger.Info($"Cannot validate new client certificate '{userCertificate.FriendlyName} {userCertificate.Thumbprint}', failed to build the chain.", e);
+                var message = $"Cannot validate new client certificate '{GetCertificateName(userCertificate)} - ({userCertificate.Thumbprint})'," +
+                              $" failed to build the chain.";
+                explanations?.Add(message);
+                if (Logger.IsInfoEnabled) 
+                    Logger.Info(message, e);
+
                 return false;
             }
 
@@ -69,57 +93,106 @@ namespace Raven.Server.Utils
                 issuerCertificate = userChain.ChainElements.Count > 1
                     ? userChain.ChainElements[1].Certificate
                     : userChain.ChainElements[0].Certificate;
-                issuerPinningHash = issuerCertificate.GetPublicKeyPinningHash();
             }
             catch (Exception e)
             {
-                if (Logger.IsInfoEnabled)
-                    Logger.Info($"Cannot extract pinning hash from the client certificate's issuer '{issuerCertificate?.FriendlyName} {issuerCertificate?.Thumbprint}'.", e);
+                var message = $"Cannot extract pinning hash from the client certificate's issuer '{issuerCertificate?.FriendlyName} {issuerCertificate?.Thumbprint}'.";
+                explanations?.Add(message);
+                if (Logger.IsInfoEnabled) 
+                    Logger.Info(message, e);
+
                 return false;
             }
 
-            var wellKnown = securityConfiguration.WellKnownIssuerHashes;
-            if (wellKnown != null && wellKnown.Contains(issuerPinningHash, StringComparer.Ordinal)) // Case sensitive, base64
-                return true;
-
+            explanations?.Add($"Try building know certificate chain - {GetCertificateName(knownCertificate)}.");
             try
             {
                 knownCertChain.Build(knownCertificate);
             }
             catch (Exception e)
             {
-                if (Logger.IsInfoEnabled)
-                    Logger.Info($"Cannot validate new client certificate '{userCertificate.FriendlyName} {userCertificate.Thumbprint}'. Found a known certificate '{knownCertificate.Thumbprint}' with the same hash but failed to build its chain.", e);
+                var message = $"Cannot validate new client certificate '{GetCertificateName(userCertificate)} {userCertificate.Thumbprint}'." +
+                              $" Found a known certificate '{knownCertificate.Thumbprint}' with the same hash but failed to build its chain.";
+                explanations?.Add(message);
+                if (Logger.IsInfoEnabled) 
+                    Logger.Info(message, e);
+
                 return false;
             }
 
-            if (knownCertChain.ChainElements.Count != userChain.ChainElements.Count)
-                return false;
-
-            for (var i = 0; i < knownCertChain.ChainElements.Count; i++)
+            explanations?.Add("Comparing certificates (leafs):\n" +
+                              $"Client certificate - {GetCertificateName(userCertificate)} - {userCertificate.GetPublicKeyPinningHash()}\n" +
+                              $"Known certificate - {GetCertificateName(knownCertificate)} - {knownCertificate.GetPublicKeyPinningHash()}");
+            // client certificates (leafs) Public Key pinning hashes must match
+            if (userCertificate.GetPublicKeyPinningHash() != knownCertificate.GetPublicKeyPinningHash())
             {
-                // We walk the chain and compare the user certificate vs one of the existing certificate with same pinning hash
-                var currentElementPinningHash = userChain.ChainElements[i].Certificate.GetPublicKeyPinningHash();
-                if (currentElementPinningHash != knownCertChain.ChainElements[i].Certificate.GetPublicKeyPinningHash())
+                explanations?.Add("Client Certificate Public Key pinning hashes does not match");
+                return false;
+            }
+
+            // support self-signed certs
+            if (knownCertChain.ChainElements.Count == 1 && userChain.ChainElements.Count == 1)
+            {
+                explanations?.Add("Client certificate and known certificate are self-signed and have matching public key pinning hashes.");
+                return true;
+            }
+
+            if (explanations != null)
+            {
+                explanations.Add("Comparing issuers pinning hashes of client certificate and known certificate.");
+                explanations.Add($"Client certificate chain info:\n{GenerateCertificateChainDebugLog(userChain)}");
+                explanations.Add($"Known certificate chain info:\n{GenerateCertificateChainDebugLog(knownCertChain)}");
+            }
+            
+            // compare issuers pinning hashes starting from top of the chain (CA) since it's least likely to change
+            // chain may have additional elements due to cross-signing, that's why we compare every issuer with each other
+            for (var i = knownCertChain.ChainElements.Count - 1; i > 0; i--)
+            {
+                var knownPinningHash = knownCertChain.ChainElements[i].Certificate.GetPublicKeyPinningHash();
+                for (int j = userChain.ChainElements.Count - 1; j > 0; j--)
                 {
-                    issuerPinningHash = currentElementPinningHash;
-                    return false;
+                    if (knownPinningHash == userChain.ChainElements[j].Certificate.GetPublicKeyPinningHash())
+                    {
+                        explanations?.Add($"Client certificate has issuer with matching public key pinning hash - {userChain.ChainElements[j].Certificate.FriendlyName}");
+                        return true;
+                    }
                 }
             }
 
-            return true;
+            explanations?.Add("None of the issuers Public Key pinning hashes match.");
+            return false;
         }
 
         public class CertificateHolder : IDisposable
         {
-            public string CertificateForClients;
-            public X509Certificate2 Certificate;
-            public AsymmetricKeyEntry PrivateKey;
+            public readonly string CertificateForClients;
+            public readonly X509Certificate2 Certificate;
+            public readonly SslStreamCertificateContext CertificateContext;
+            public readonly AsymmetricKeyEntry PrivateKey;
+
+            private CertificateHolder()
+            {
+            }
+
+            public CertificateHolder(X509Certificate2 certificate, AsymmetricKeyEntry privateKey)
+                : this(certificate, privateKey, certificateForClients: null)
+            {
+            }
+
+            public CertificateHolder(X509Certificate2 certificate, AsymmetricKeyEntry privateKey, string certificateForClients)
+            {
+                Certificate = certificate ?? throw new ArgumentNullException(nameof(certificate));
+                CertificateContext = SslStreamCertificateContext.Create(Certificate, additionalCertificates: null);
+                PrivateKey = privateKey ?? throw new ArgumentNullException(nameof(privateKey));
+                CertificateForClients = certificateForClients;
+            }
 
             public void Dispose()
             {
                 Certificate?.Dispose();
             }
+
+            public static CertificateHolder CreateEmpty() => new();
         }
         public static byte[] CreateSelfSignedTestCertificate(string commonNameValue, string issuerName, StringBuilder log = null)
         {
@@ -331,7 +404,7 @@ namespace Raven.Server.Utils
             log?.AppendLine($"cert in base64 = {Convert.ToBase64String(certBytes)}");
         }
 
-        public static void CreateCertificateAuthorityCertificate(string commonNameValue,
+        public static X509Certificate2 CreateCertificateAuthorityCertificate(string commonNameValue,
             out (AsymmetricKeyParameter PrivateKey, AsymmetricKeyParameter PublicKey) ca,
             out X509Name name, StringBuilder log = null)
         {
@@ -354,6 +427,13 @@ namespace Raven.Server.Utils
             log?.AppendLine($"issuerDN = {issuerDN}");
             log?.AppendLine($"subjectDN = {subjectDN}");
 
+            certificateGenerator.AddExtension(
+                X509Extensions.BasicConstraints.Id, true, new BasicConstraints(true));
+            certificateGenerator.AddExtension(X509Extensions.KeyUsage.Id, true,
+                new KeyUsage(KeyUsage.DigitalSignature | KeyUsage.CrlSign | KeyUsage.KeyCertSign));
+            certificateGenerator.AddExtension(X509Extensions.ExtendedKeyUsage.Id, true,
+                new ExtendedKeyUsage(KeyPurposeID.IdKPServerAuth, KeyPurposeID.IdKPClientAuth));
+
             // Valid For
             DateTime notBefore = DateTime.UtcNow.Date.AddDays(-7);
             DateTime notAfter = notBefore.AddYears(2);
@@ -373,11 +453,39 @@ namespace Raven.Server.Utils
             var issuerKeyPair = subjectKeyPair;
             ISignatureFactory signatureFactory = new Asn1SignatureFactory("SHA512WITHRSA", issuerKeyPair.Private, random);
 
+            var authorityKeyIdentifier =
+                new AuthorityKeyIdentifier(
+                    SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(issuerKeyPair.Public),
+                    new GeneralNames(new GeneralName(issuerDN)),
+                    serialNumber);
+            certificateGenerator.AddExtension(
+                X509Extensions.AuthorityKeyIdentifier.Id, false, authorityKeyIdentifier);
+
+            var subjectKeyIdentifier =
+                new SubjectKeyIdentifier(
+                    SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(subjectKeyPair.Public));
+            certificateGenerator.AddExtension(
+                X509Extensions.SubjectKeyIdentifier.Id, false, subjectKeyIdentifier);
+
             // selfsign certificate
             var certificate = certificateGenerator.Generate(signatureFactory);
 
             ca = (issuerKeyPair.Private, issuerKeyPair.Public);
             name = certificate.SubjectDN;
+
+            var store = new Pkcs12Store();
+            string friendlyName = certificate.SubjectDN.ToString();
+            var certificateEntry = new X509CertificateEntry(certificate);
+            var keyEntry = new AsymmetricKeyEntry(subjectKeyPair.Private);
+
+            log?.AppendLine($"certificateEntry.Certificate = {certificateEntry.Certificate}");
+
+            store.SetCertificateEntry(friendlyName, certificateEntry);
+            store.SetKeyEntry(friendlyName, keyEntry, new[] { certificateEntry });
+            var stream = new MemoryStream();
+            store.Save(stream, Array.Empty<char>(), random);
+
+            return new X509Certificate2(stream.ToArray());
         }
 
         // generating this can take a while, so we cache that at the process level, to significantly speed up the tests
@@ -496,7 +604,7 @@ namespace Raven.Server.Utils
                 }
             }
         }
-        
+
         public static async Task<X509Certificate2> CompleteAuthorizationAndGetCertificate(CompleteAuthorizationAndGetCertificateParameters parameters)
         {
             if (parameters.ChallengeResult.Challange == null && parameters.ChallengeResult.Cache != null)
@@ -553,7 +661,7 @@ namespace Raven.Server.Utils
                 if (item.Certificate.Thumbprint == certificate.Thumbprint)
                 {
                     var key = new AsymmetricKeyEntry(DotNetUtilities.GetKeyPair(certWithKey.GetRSAPrivateKey()).Private);
-                    store.SetKeyEntry(x509Certificate.SubjectDN.ToString(), key, new[] {new X509CertificateEntry(x509Certificate)});
+                    store.SetKeyEntry(x509Certificate.SubjectDN.ToString(), key, new[] { new X509CertificateEntry(x509Certificate) });
                     continue;
                 }
 
@@ -563,11 +671,16 @@ namespace Raven.Server.Utils
             var memoryStream = new MemoryStream();
             store.Save(memoryStream, Array.Empty<char>(), new SecureRandom(new CryptoApiRandomGenerator()));
             var certBytes = memoryStream.ToArray();
-            
+
             Debug.Assert(certBytes != null);
             setupInfo.Certificate = Convert.ToBase64String(certBytes);
 
             return CertificateLoaderUtil.CreateCertificate(certBytes, flags: CertificateLoaderUtil.FlagsForExport);
+        }
+
+        public static string GetBasicCertificateInfo(this X509Certificate2 certificate)
+        {
+            return $"Thumbprint: {certificate.Thumbprint}, Subject: {certificate.Subject}";
         }
     }
     public static class PublicKeyPinningHashHelpers

@@ -33,7 +33,7 @@ using TimeoutException = System.TimeoutException;
 
 namespace Raven.Server.Monitoring.Snmp
 {
-    public class SnmpWatcher
+    public class SnmpWatcher : IDisposable
     {
         private readonly ConcurrentDictionary<string, SnmpDatabase> _loadedDatabases = new ConcurrentDictionary<string, SnmpDatabase>(StringComparer.OrdinalIgnoreCase);
 
@@ -245,8 +245,9 @@ namespace Raven.Server.Monitoring.Snmp
             engine.Listener.AddBinding(new IPEndPoint(IPAddress.Any, server.Configuration.Monitoring.Snmp.Port));
             engine.Listener.ExceptionRaised += (sender, e) =>
             {
+                // MessageFactoryException hides inner exception
                 if (Logger.IsOperationsEnabled)
-                    Logger.Operations("SNMP error: " + e.Exception.Message, e.Exception);
+                    Logger.Operations($"SNMP error: {e.Exception.Message}. Inner: {e.Exception.InnerException}", e.Exception);
             };
 
             return engine;
@@ -385,7 +386,8 @@ namespace Raven.Server.Monitoring.Snmp
 
             store.Add(new ServerConcurrentRequests(server.Metrics));
             store.Add(new ServerTotalRequests(server.Metrics));
-            store.Add(new ServerRequestsPerSecond(server.Metrics));
+            store.Add(new ServerRequestsPerSecond(server.Metrics, ServerRequestsPerSecond.RequestRateType.OneMinute));
+            store.Add(new ServerRequestsPerSecond(server.Metrics, ServerRequestsPerSecond.RequestRateType.FiveSeconds));
             store.Add(new ServerRequestAverageDuration(server.Metrics));
 
             store.Add(new ProcessCpu(server.MetricCacher, server.CpuUsageCalculator));
@@ -430,6 +432,28 @@ namespace Raven.Server.Monitoring.Snmp
             store.Add(new TotalDatabaseNumberOfErrorIndexes(server.ServerStore));
             store.Add(new TotalDatabaseNumberOfFaultyIndexes(server.ServerStore));
 
+            store.Add(new TotalNumberOfActiveBackupTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveElasticSearchEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveExternalReplicationTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveOlapEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveOngoingTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActivePullReplicationAsSinkTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveQueueEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveRavenEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveSqlEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfActiveSubscriptionTasks(server.ServerStore));
+
+            store.Add(new TotalNumberOfBackupTasks(server.ServerStore));
+            store.Add(new TotalNumberOfElasticSearchEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfExternalReplicationTasks(server.ServerStore));
+            store.Add(new TotalNumberOfOlapEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfOngoingTasks(server.ServerStore));
+            store.Add(new TotalNumberOfPullReplicationAsSinkTasks(server.ServerStore));
+            store.Add(new TotalNumberOfQueueEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfRavenEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfSqlEtlTasks(server.ServerStore));
+            store.Add(new TotalNumberOfSubscriptionTasks(server.ServerStore));
+
             store.Add(new TotalDatabaseMapIndexIndexedPerSecond(server.ServerStore));
             store.Add(new TotalDatabaseMapReduceIndexMappedPerSecond(server.ServerStore));
             store.Add(new TotalDatabaseMapReduceIndexReducedPerSecond(server.ServerStore));
@@ -459,7 +483,7 @@ namespace Raven.Server.Monitoring.Snmp
             store.Add(new ServerStorageDiskReadThroughput(server.ServerStore));
             store.Add(new ServerStorageDiskWriteThroughput(server.ServerStore));
             store.Add(new ServerStorageDiskQueueLength(server.ServerStore));
-            
+
             store.Add(new ServerCertificateExpiration(server.ServerStore));
             store.Add(new ServerCertificateExpirationLeft(server.ServerStore));
             store.Add(new WellKnownAdminCertificates(server.ServerStore));
@@ -477,10 +501,14 @@ namespace Raven.Server.Monitoring.Snmp
 
             store.Add(new FeatureAnyExperimental(server.ServerStore));
 
+            ServerLimits.Register(store, server.MetricCacher);
+
             AddGc(GCKind.Any);
             AddGc(GCKind.Background);
             AddGc(GCKind.Ephemeral);
             AddGc(GCKind.FullBlocking);
+
+            store.Add(new MonitorLockContentionCount());
 
             return store;
 
@@ -502,6 +530,7 @@ namespace Raven.Server.Monitoring.Snmp
                 store.Add(new ServerGcPromoted(server.MetricCacher, gcKind));
                 store.Add(new ServerGcTotalAvailableMemory(server.MetricCacher, gcKind));
                 store.Add(new ServerGcTotalCommitted(server.MetricCacher, gcKind));
+                store.Add(new ServerGcLohSize(server.MetricCacher, gcKind));
             }
         }
 
@@ -615,6 +644,12 @@ namespace Raven.Server.Monitoring.Snmp
             }
 
             return result;
+        }
+
+        public void Dispose()
+        {
+            _snmpEngine?.Dispose();
+            _snmpEngine = null;
         }
 
         private class SnmpLogger : ILogger

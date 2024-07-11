@@ -4,6 +4,8 @@ using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
+using Raven.Client;
+using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
@@ -11,7 +13,6 @@ using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations.Certificates;
-using Raven.Client;
 using Raven.Server.Commercial;
 using Raven.Server.Extensions;
 using Raven.Server.Json;
@@ -22,15 +23,18 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.ServerWide.Maintenance;
 using Raven.Server.Storage.Schema;
+using Raven.Server.TrafficWatch;
 using Raven.Server.Utils;
 using Raven.Server.Web;
 using Raven.Server.Web.System;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Logging;
+
 
 namespace Raven.Server.Documents.Handlers.Admin
 {
-    public class RachisAdminHandler : RequestHandler
+    public class RachisAdminHandler : ServerRequestHandler
     {
         [RavenAction("/admin/rachis/send", "POST", AuthorizationStatus.Operator)]
         public async Task ApplyCommand()
@@ -48,16 +52,11 @@ namespace Raven.Server.Documents.Handlers.Admin
                 try
                 {
                     var command = CommandBase.CreateFrom(commandJson);
-                    switch (command)
-                    {
-                        case AddOrUpdateCompareExchangeBatchCommand batchCmpExchangeCommand:
-                            batchCmpExchangeCommand.ContextToWriteResult = context;
-                            break;
-
-                        case CompareExchangeCommandBase cmpExchange:
-                            cmpExchange.ContextToWriteResult = context;
-                            break;
-                    }
+                    if (command is IBlittableResultCommand blittableResultCommand)
+                        blittableResultCommand.ContextToWriteResult = context;
+                    
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(commandJson.ToString(), TrafficWatchChangeType.ClusterCommands);
 
                     var isClusterAdmin = IsClusterAdmin();
                     command.VerifyCanExecuteCommand(ServerStore, context, isClusterAdmin);
@@ -188,7 +187,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             }
         }
 
-        [RavenAction("/cluster/topology", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, IsDebugInformationEndpoint = true)]
+        [RavenAction("/cluster/topology", "GET", AuthorizationStatus.ValidUser, EndpointType.Read, IsDebugInformationEndpoint = true, CheckForChanges = false)]
         public async Task GetClusterTopology()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -237,6 +236,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                         ["LeaderShipDuration"] = ServerStore.Engine.CurrentLeader?.LeaderShipDuration,
                         ["CurrentState"] = ServerStore.CurrentRachisState,
                         [nameof(ClusterTopologyResponse.NodeTag)] = nodeTag,
+                        [nameof(ClusterTopologyResponse.ServerRole)] = topology.GetServerRoleForTag(nodeTag),
                         ["CurrentTerm"] = ServerStore.Engine.CurrentTerm,
                         ["NodeLicenseDetails"] = nodeLicenseDetails,
                         [nameof(ServerStore.Engine.LastStateChangeReason)] = ServerStore.LastStateChangeReason()
@@ -317,7 +317,7 @@ namespace Raven.Server.Documents.Handlers.Admin
 
             Client.ServerWide.Commands.NodeInfo nodeInfo;
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(nodeUrl, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
             {
                 requestExecutor.DefaultTimeout = ServerStore.Engine.OperationTimeout;
 
@@ -454,6 +454,11 @@ namespace Raven.Server.Documents.Handlers.Admin
 
                     await ServerStore.AddNodeToClusterAsync(nodeUrl, nodeTag, validateNotInTopology: true, asWatcher: watcher ?? false);
 
+                    if (LoggingSource.AuditLog.IsInfoEnabled)
+                        LogAuditFor("Server", "ADD", $"Node {nodeTag} to cluster. Term: {ServerStore.Engine.CurrentTerm}.");
+
+
+
                     using (ctx.OpenReadTransaction())
                     {
                         clusterTopology = ServerStore.GetClusterTopology(ctx);
@@ -552,6 +557,10 @@ namespace Raven.Server.Documents.Handlers.Admin
                 }
 
                 await ServerStore.RemoveFromClusterAsync(nodeTag);
+
+                if (LoggingSource.AuditLog.IsInfoEnabled)
+                    LogAuditFor("Server", "DELETE", $"Node {nodeTag} from cluster. Term: {ServerStore.Engine.CurrentTerm}.");
+
                 NoContentStatus();
                 return;
             }
@@ -597,10 +606,12 @@ namespace Raven.Server.Documents.Handlers.Admin
         [RavenAction("/admin/cluster/promote", "POST", AuthorizationStatus.ClusterAdmin, CorsMode = CorsMode.Cluster)]
         public async Task PromoteNode()
         {
+            var nodeTag = GetStringQueryString("nodeTag");
+
             if (ServerStore.LeaderTag == null)
             {
-                NoContentStatus();
-                return;
+                throw new NoLeaderException(
+                    $"Failed to promote node {nodeTag} because there is no leader in the cluster topology");
             }
 
             if (ServerStore.IsLeader() == false)
@@ -609,7 +620,6 @@ namespace Raven.Server.Documents.Handlers.Admin
                 return;
             }
 
-            var nodeTag = GetStringQueryString("nodeTag");
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (context.OpenReadTransaction())
             {
@@ -631,10 +641,12 @@ namespace Raven.Server.Documents.Handlers.Admin
         [RavenAction("/admin/cluster/demote", "POST", AuthorizationStatus.ClusterAdmin, CorsMode = CorsMode.Cluster)]
         public async Task DemoteNode()
         {
+            var nodeTag = GetStringQueryString("nodeTag");
+
             if (ServerStore.LeaderTag == null)
             {
-                NoContentStatus();
-                return;
+                throw new NoLeaderException(
+                    $"Failed to demote node {nodeTag} because there is no leader in the cluster topology");
             }
 
             if (ServerStore.IsLeader() == false)
@@ -643,7 +655,6 @@ namespace Raven.Server.Documents.Handlers.Admin
                 return;
             }
 
-            var nodeTag = GetStringQueryString("nodeTag");
             if (nodeTag == ServerStore.LeaderTag)
             {
                 throw new InvalidOperationException(
@@ -689,7 +700,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                         }
 
                         var cmd = new RemoveEntryFromRaftLogCommand(index);
-                        using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(node.Value, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
+                        using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(node.Value, Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
                         {
                             await requestExecutor.ExecuteAsync(cmd, context);
                             nodeList.AddRange(cmd.Result);

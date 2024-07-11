@@ -22,7 +22,7 @@ namespace Raven.Client.Documents.Operations.ETL.ElasticSearch
         }
 
         public override EtlType EtlType => EtlType.ElasticSearch;
-        
+
         public override bool UsingEncryptedCommunicationChannel()
         {
             foreach (var url in Connection.Nodes)
@@ -47,6 +47,11 @@ namespace Raven.Client.Documents.Operations.ETL.ElasticSearch
             json[nameof(ElasticIndexes)] = new DynamicJsonArray(ElasticIndexes.Select(x => x.ToJson()));
 
             return json;
+        }
+
+        public override DynamicJsonValue ToAuditJson()
+        {
+            return ToJson();
         }
     }
     

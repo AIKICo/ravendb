@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.Documents.Smuggler;
@@ -14,12 +15,13 @@ using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 
 namespace Raven.Server.Smuggler.Documents.Data
 {
     public interface ISmugglerDestination
     {
-        IAsyncDisposable InitializeAsync(DatabaseSmugglerOptionsServerSide options, SmugglerResult result, long buildVersion);
+        IAsyncDisposable InitializeAsync(DatabaseSmugglerOptionsServerSide options, SmugglerResult result, Action<IOperationProgress> onProgress, long buildVersion);
 
         IDatabaseRecordActions DatabaseRecord();
 
@@ -46,11 +48,13 @@ namespace Raven.Server.Smuggler.Documents.Data
         IReplicationHubCertificateActions ReplicationHubCertificates();
 
         ITimeSeriesActions TimeSeries();
+
+        ITimeSeriesActions TimeSeriesDeletedRanges();
     }
 
     public interface IDocumentActions : INewDocumentActions, IAsyncDisposable
     {
-        ValueTask WriteDocumentAsync(DocumentItem item, SmugglerProgressBase.CountsWithLastEtagAndAttachments progress);
+        ValueTask WriteDocumentAsync(DocumentItem item, SmugglerProgressBase.CountsWithLastEtagAndAttachments progress, Func<ValueTask> beforeFlushing = null);
 
         ValueTask WriteTombstoneAsync(Tombstone tombstone, SmugglerProgressBase.CountsWithLastEtag progress);
 
@@ -65,10 +69,17 @@ namespace Raven.Server.Smuggler.Documents.Data
         JsonOperationContext GetContextForNewCompareExchangeValue();
     }
 
-    public interface INewDocumentActions
+    public interface INewItemActions
     {
         DocumentsOperationContext GetContextForNewDocument();
 
+        BlittableJsonDocumentBuilder GetBuilderForNewDocument(UnmanagedJsonParser parser, JsonParserState state, BlittableMetadataModifier modifier = null);
+
+        BlittableMetadataModifier GetMetadataModifierForNewDocument(string firstEtagOfLegacyRevision = null, long legacyRevisionsCount = 0, bool legacyImport = false, bool readLegacyEtag = false, DatabaseItemType operateOnTypes = DatabaseItemType.None);
+    }
+    
+    public interface INewDocumentActions : INewItemActions
+    {
         Stream GetTempStream();
     }
 
@@ -108,15 +119,24 @@ namespace Raven.Server.Smuggler.Documents.Data
         ValueTask WriteKeyValueAsync(string key, BlittableJsonReaderObject value, Document existingDocument);
 
         ValueTask WriteTombstoneKeyAsync(string key);
+
+        ValueTask FlushAsync();
     }
 
     public interface IDatabaseRecordActions : IAsyncDisposable
     {
-        ValueTask WriteDatabaseRecordAsync(DatabaseRecord databaseRecord, SmugglerProgressBase.DatabaseRecordProgress progress, AuthorizationStatus authorizationStatus, DatabaseRecordItemType databaseRecordItemType);
+        ValueTask WriteDatabaseRecordAsync(DatabaseRecord databaseRecord, SmugglerResult result, AuthorizationStatus authorizationStatus, DatabaseRecordItemType databaseRecordItemType);
     }
 
-    public interface ITimeSeriesActions : IAsyncDisposable
+    public interface ITimeSeriesActions : IAsyncDisposable, INewItemActions
     {
         ValueTask WriteTimeSeriesAsync(TimeSeriesItem ts);
+
+        ValueTask WriteTimeSeriesDeletedRangeAsync(TimeSeriesDeletedRangeItemForSmuggler deletedRange);
+
+
+        void RegisterForDisposal(IDisposable data);
+
+        void RegisterForReturnToTheContext(AllocatedMemoryData data);
     }
 }

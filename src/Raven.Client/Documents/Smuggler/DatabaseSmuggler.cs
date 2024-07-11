@@ -277,7 +277,7 @@ namespace Raven.Client.Documents.Smuggler
                 }
 
                 return new Operation(_requestExecutor, () => _store.Changes(_databaseName, getOperationIdCommand.NodeTag), _requestExecutor.Conventions, operationId,
-                    nodeTag: getOperationIdCommand.NodeTag, additionalTask: task);
+                    nodeTag: getOperationIdCommand.NodeTag, afterOperationCompleted: task);
 
             }
             catch (Exception e)
@@ -409,6 +409,11 @@ namespace Raven.Client.Documents.Smuggler
             protected override async Task SerializeToStreamAsync(Stream stream, TransportContext context)
             {
                 _parent.ForTestingPurposes?.BeforeSerializeToStreamAsync?.Invoke();
+
+                // Immediately flush request stream to send headers
+                // https://github.com/dotnet/corefx/issues/39586#issuecomment-516210081
+                // https://github.com/dotnet/runtime/issues/96223#issuecomment-1865009861
+                await stream.FlushAsync().ConfigureAwait(false);
 
                 await base.SerializeToStreamAsync(stream, context).ConfigureAwait(false);
                 _tcs.TrySetResult(null);

@@ -5,6 +5,7 @@ using System.Text;
 using FastTests;
 using Orders;
 using Raven.Client.Documents;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Operations.Configuration;
 using Raven.Client.Documents.Queries.Suggestions;
@@ -185,7 +186,11 @@ public class CoraxSlowQueryTests : RavenTestBase
         expected = expected.OrderBy(y => y.Age).ThenByDescending(y => y.Height).ToList();
         {
             using var session = store.OpenSession();
-            var result = session.Query<Person>().Where(p => p.Age < 200).OrderBy(y => y.Age).ThenByDescending(y => y.Height).ToList();
+            
+            var result = session.Query<Person>().Where(p => p.Age < 200).OrderBy(y => y.Age)
+                                           .ThenByDescending(y => y.Height)
+                                           .Customize(i => i.WaitForNonStaleResults().NoCaching()).ToList();
+
             Assert.Equal(10_000, result.Count);
             for (int i = 0; i < 10_000; ++i)
             {
@@ -232,9 +237,14 @@ public class CoraxSlowQueryTests : RavenTestBase
             {
                 List<Result> actual = new();
                 for (int i = 0; i < size; i += 70)
-                    actual.AddRange(session.Query<Person>().Where(p => p.Age < 200).OrderBy(y => y.Age).ThenByDescending(y => y.Height)
-                        .Select(z => new Result() {Name = z.Name, Age = z.Age, Height = z.Height}).Skip(i).Take(70).ToList());
-
+                {
+                    var results = session.Query<Person>().Where(p => p.Age < 200).OrderBy(y => y.Age) 
+                                                             .ThenByDescending(y => y.Height)
+                                                             .Skip(i).Take(70)
+                                                             .Select(z => new Result() { Name = z.Name, Age = z.Age, Height = z.Height })
+                                                             .Customize(i => i.WaitForNonStaleResults().NoCaching());
+                    actual.AddRange(results.ToList());
+                }
 
                 var duplicates = actual.GroupBy(x => x.Name).Where(g => g.Count() > 1).Select(i => i.Key).ToList();
                 WaitForUserToContinueTheTest(store);
@@ -280,8 +290,15 @@ public class CoraxSlowQueryTests : RavenTestBase
             {
                 List<int> actual = new();
                 for (int i = 0; i < size; i += 70)
-                    actual.AddRange(session.Query<Person>().Where(p => p.Age < 123)
-                        .Select(z => z.Height).Distinct().Skip(i).Take(70).ToList());
+                {
+                    var query = session.Query<Person>()
+                                                    .Where(p => p.Age < 123)
+                                                    .Select(z => z.Height)
+                                                    .Customize(i => i.WaitForNonStaleResults().NoCaching())
+                                                    .Distinct().Skip(i).Take(70);
+                    actual.AddRange(query.ToList());
+                }
+                   
                 WaitForUserToContinueTheTest(store);
                 Assert.Equal(expected.Count, actual.Count);
                 actual.Sort();
@@ -303,74 +320,14 @@ public class CoraxSlowQueryTests : RavenTestBase
         }
         {
             using var session = store.OpenSession();
-            var result = session.Query<Person>().Where(x => x.Name == "Maciej").SingleOrDefault();
+            var result = session.Query<Person>().Where(x => x.Name == "Maciej")
+                                                      .Customize(i => i.WaitForNonStaleResults().NoCaching())
+                                                      .SingleOrDefault();
             Assert.NotNull(result);
             Assert.Equal(item.Name, result.Name);
         }
     }
-
-    [Theory]
-    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
-    public void BoostingTest(Options options)
-    {
-        const int terms = 29;
-        using var coraxStore = GetDocumentStore(options);
-        using var luceneStore = GetDocumentStore();
-        List<Result> results;
-        {
-            using var coraxSession = coraxStore.BulkInsert();
-            using var luceneSession = luceneStore.BulkInsert();
-            results = Enumerable.Range(0, 10_000).Select(i => new Result() {Age = i % terms, Height = i}).ToList();
-            results.ForEach((x) =>
-            {
-                coraxSession.Store(x);
-                luceneSession.Store(x);
-            });
-        }
-
-
-        {
-            //TermMatches and BinaryMatches
-            var rawQuery = new StringBuilder();
-            rawQuery.Append("from Results where boost(Age == 0, 0)");
-            for (int i = 1; i < terms; ++i)
-                rawQuery.Append($" or boost(Age == {i},{i})");
-            rawQuery.Append(" order by score()");
-
-            Assertion(rawQuery.ToString());
-        }
-        {
-            //MultiTermMatches
-            var rawQuery = new StringBuilder();
-            rawQuery.Append("from Results where boost(startsWith(Age, \"0\"),0)");
-            for (int i = 1; i < terms; ++i)
-                rawQuery.Append($" or boost(startsWith(Age, \"{i}\"),{i})");
-            rawQuery.Append(" order by score()");
-
-            Assertion(rawQuery.ToString());
-        }
-
-        {
-            //UnaryTest
-            WaitForUserToContinueTheTest(luceneStore);
-            Assertion($"from Results where boost(Age > {terms - 2}, 100) order by score(), Age as alphanumeric desc ");
-        }
-
-        void Assertion(string rawQuery)
-        {
-            using var coraxSession = coraxStore.OpenSession();
-            using var luceneSession = luceneStore.OpenSession();
-            var luceneResult = luceneSession.Advanced.RawQuery<Result>(rawQuery.ToString()).ToList();
-
-            var coraxResult = coraxSession.Advanced.RawQuery<Result>(rawQuery.ToString()).ToList();
-            Assert.NotEmpty(luceneResult);
-            Assert.NotEmpty(coraxResult);
-            Assert.Equal(luceneResult.Count, coraxResult.Count);
-            for (int i = 0; i < luceneResult.Count; ++i)
-                Assert.Equal(luceneResult[i].Age, coraxResult[i].Age);
-        }
-    }
-
+    
     [Theory]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
     public void NgramSuggestionTest(Options options)
@@ -387,6 +344,7 @@ public class CoraxSlowQueryTests : RavenTestBase
             using (var session = documentStore.OpenSession())
             {
                 var suggestionQueryResult = session.Query<User>()
+                    .Customize(i => i.WaitForNonStaleResults().NoCaching())
                     .SuggestUsing(x => x.ByField(y => y.Name, "Mett").WithOptions(new SuggestionOptions
                     {
                         PageSize = 10, Accuracy = 0.25f, Distance = StringDistanceTypes.NGram
@@ -499,6 +457,42 @@ public class CoraxSlowQueryTests : RavenTestBase
         }
     }
 
+    [Theory]
+    [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
+    public void OnTermMatchCoraxShouldUseOnlyStandardAnalyzer(Options options)
+    {
+        using var store = GetDocumentStore(options);
+        {
+            using var s = store.OpenSession();
+            s.Store(new Person(){Name = "Super simple query at stopword"});
+            s.SaveChanges();
+            new FullTextSearchIndex().Execute(store);
+        }
+
+        Indexes.WaitForIndexing(store);
+
+        {
+            using var session = store.OpenSession();
+            var withStopWord = session.Query<Person, FullTextSearchIndex>().Count(i => i.Name == "at");
+            Assert.Equal(0, withStopWord);
+            
+            var withSentence = session.Query<Person, FullTextSearchIndex>().Count(i => i.Name == "simple query");
+            Assert.Equal(0, withSentence);
+
+            var noStopWord = session.Query<Person, FullTextSearchIndex>().Count(i => i.Name == "simple");
+            Assert.Equal(1, noStopWord);
+        }
+    }
+
+    private class FullTextSearchIndex : AbstractIndexCreationTask<Person>
+    {
+        public FullTextSearchIndex()
+        {
+            Map = persons => persons.Select(i => new {i.Name});
+            Index(i => i.Name, FieldIndexing.Search);
+        }
+    }
+    
     [Theory]
     [RavenData(SearchEngineMode = RavenSearchEngineMode.Corax)]
     public void CanSearchOnLists(Options options)

@@ -1,13 +1,17 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Subscriptions;
+using Raven.Client.Exceptions.Database;
 using Raven.Client.Exceptions.Documents.Subscriptions;
+using Raven.Client.ServerWide;
 using Raven.Client.Util;
 using Raven.Server.Documents.TcpHandlers;
 using Raven.Server.ServerWide;
@@ -38,22 +42,22 @@ namespace Raven.Server.Documents.Subscriptions
         public Task GetSubscriptionInUseAwaiter => Task.WhenAll(_connections.Select(c => c.SubscriptionConnectionTask));
         public string SubscriptionName => _subscriptionName;
         public long SubscriptionId => _subscriptionId;
-        public SubscriptionState SubscriptionState => _subscriptionState;
 
         public bool IsConcurrent => _connections.FirstOrDefault()?.Strategy == SubscriptionOpeningStrategy.Concurrent;
 
-        private readonly ConcurrentSet<SubscriptionConnection> _pendingConnections = new ();
-        private readonly ConcurrentQueue<SubscriptionConnection> _recentConnections = new ();
-        private readonly ConcurrentQueue<SubscriptionConnection> _rejectedConnections = new ();
-        public IEnumerable<SubscriptionConnection> RecentConnections => _recentConnections;
-        public IEnumerable<SubscriptionConnection> RecentRejectedConnections => _rejectedConnections;
-        public ConcurrentSet<SubscriptionConnection> PendingConnections => _pendingConnections;
+        internal ConcurrentSet<SubscriptionConnectionInfo> _pendingConnections = new ();
+        private readonly ConcurrentQueue<SubscriptionConnectionInfo> _recentConnections = new ();
+        private readonly ConcurrentQueue<SubscriptionConnectionInfo> _rejectedConnections = new ();
+        public IEnumerable<SubscriptionConnectionInfo> RecentConnections => _recentConnections;
+        public IEnumerable<SubscriptionConnectionInfo> RecentRejectedConnections => _rejectedConnections;
+        public IEnumerable<SubscriptionConnectionInfo> PendingConnections => _pendingConnections;
 
         public CancellationTokenSource CancellationTokenSource;
 
         public DocumentDatabase DocumentDatabase => _documentsStorage.DocumentDatabase;
 
         private readonly SemaphoreSlim _subscriptionActivelyWorkingLock;
+        private readonly SemaphoreSlim _subscriptionConnectingLock = new SemaphoreSlim(1);
 
         public string LastChangeVectorSent;
 
@@ -71,23 +75,105 @@ namespace Raven.Server.Documents.Subscriptions
             _waitForMoreDocuments = new AsyncManualResetEvent(CancellationTokenSource.Token);
         }
 
-        public void Initialize(SubscriptionConnection connection, bool afterSubscribe = false)
+        public async Task InitializeAsync(SubscriptionConnection connection, bool afterSubscribe = false)
         {
             _subscriptionName = connection.Options.SubscriptionName ?? _subscriptionId.ToString();
-            _subscriptionState = connection.SubscriptionState;
             Query = connection.SubscriptionState.Query;
 
+            if (afterSubscribe == false)
+                return;
+
             // update the subscription data only on new concurrent connection or regular connection
-            if (afterSubscribe && _connections.Count == 1)
+            if (IsConcurrent == false)
             {
-                using (var old = _disposableNotificationsRegistration)
+                RefreshFeatures(connection);
+                return;
+            }
+
+            connection.AddToStatusDescription("Starting to subscribe.");
+
+            if (_subscriptionState == null)
+            {
+                // this connection is the first one, we initialize everything
+                RefreshFeatures(connection);
+                return;
+            }
+
+            if (connection.SubscriptionState.RaftCommandIndex < _subscriptionState.RaftCommandIndex)
+            {
+                // this connection was modified while waiting to subscribe, lets try to drop it
+                DropSingleConnection(connection, new SubscriptionClosedException($"The subscription '{_subscriptionName}' was modified, connection have to be restarted.", canReconnect: true));
+                return;
+            }
+
+            if (connection.SubscriptionState.RaftCommandIndex == _subscriptionState.RaftCommandIndex)
+            {
+                // no changes in the subscription task 
+                // the LastChangeVectorSent have to be refreshed since the concurrent subscription task might got processed on different node
+                if (_connections.Count == 1)
                 {
-                    _disposableNotificationsRegistration = RegisterForNotificationOnNewDocuments(connection);
+                    InitializeLastChangeVectorSent(connection.SubscriptionState.ChangeVectorForNextBatchStartingPoint);
                 }
 
-                LastChangeVectorSent = connection.SubscriptionState.ChangeVectorForNextBatchStartingPoint;
-                PreviouslyRecordedChangeVector = LastChangeVectorSent;
+                return;
             }
+
+            if (connection.SubscriptionState.RaftCommandIndex > _subscriptionState.RaftCommandIndex)
+            {
+                // we have new connection after subscription have changed
+                // we have to wait until old connections (with smaller raft index) will get disconnected
+                // then we continue and will re-initialize 
+
+                var sp = Stopwatch.StartNew();
+                while (_connections.Any(c => c.SubscriptionState.RaftCommandIndex == _subscriptionState.RaftCommandIndex))
+                {
+                    connection.CancellationTokenSource.Token.ThrowIfCancellationRequested();
+                    await Task.Delay(300);
+                    await connection.SendHeartBeatIfNeededAsync(sp, $"A connection from IP '{connection.ClientUri}' is waiting for old subscription connections to disconnect.");
+                }
+
+                RefreshFeatures(connection);
+            }
+        }
+
+        public void ReleaseConcurrentConnectionLock(SubscriptionConnection connection)
+        {
+            if (connection.Strategy != SubscriptionOpeningStrategy.Concurrent)
+                return;
+
+            _subscriptionConnectingLock.Release();
+        }
+
+        public async Task TakeConcurrentConnectionLockAsync(SubscriptionConnection connection)
+        {
+            if (connection.Strategy != SubscriptionOpeningStrategy.Concurrent)
+                return;
+
+            DocumentDatabase.ForTestingPurposes?.ConcurrentSubscription_ActionToCallDuringWaitForSubscribe?.Invoke(_connections);
+
+            while (await _subscriptionConnectingLock.WaitAsync(SubscriptionConnection.WaitForChangedDocumentsTimeoutInMs) == false)
+            {
+                connection.CancellationTokenSource.Token.ThrowIfCancellationRequested();
+                await connection.SendHeartBeatAsync($"A connection from IP '{connection.ClientUri}' is waiting for other concurrent connections to subscribe.");
+            }
+        }
+
+        private void RefreshFeatures(SubscriptionConnection connection)
+        {
+            using (var old = _disposableNotificationsRegistration)
+            {
+                _disposableNotificationsRegistration = RegisterForNotificationOnNewDocuments(connection);
+            }
+
+            InitializeLastChangeVectorSent(connection.SubscriptionState.ChangeVectorForNextBatchStartingPoint);
+
+            _subscriptionState = connection.SubscriptionState;
+        }
+
+        internal void InitializeLastChangeVectorSent(string changeVectorForNextBatchStartingPoint)
+        {
+            LastChangeVectorSent = changeVectorForNextBatchStartingPoint;
+            PreviouslyRecordedChangeVector = LastChangeVectorSent;
         }
 
         public IEnumerable<DocumentRecord> GetDocumentsFromResend(ClusterOperationContext context, HashSet<long> activeBatches)
@@ -256,9 +342,11 @@ namespace Raven.Server.Documents.Subscriptions
                 {
                     while (_recentConnections.Count > _maxConcurrentConnections + 10)
                     {
-                        _recentConnections.TryDequeue(out SubscriptionConnection _);
+                        _recentConnections.TryDequeue(out SubscriptionConnectionInfo _);
                     }
-                    _recentConnections.Enqueue(incomingConnection);
+
+                    _recentConnections.Enqueue(new SubscriptionConnectionInfo(incomingConnection));
+
                     DropSingleConnection(incomingConnection);
                 });
             }
@@ -370,9 +458,10 @@ namespace Raven.Server.Documents.Subscriptions
 
             while (_rejectedConnections.Count > 10)
             {
-                _rejectedConnections.TryDequeue(out SubscriptionConnection _);
+                _rejectedConnections.TryDequeue(out SubscriptionConnectionInfo _);
             }
-            _rejectedConnections.Enqueue(connection);
+
+            _rejectedConnections.Enqueue(new SubscriptionConnectionInfo(connection));
         }
 
         public SubscriptionConnectionsDetails GetSubscriptionConnectionsDetails()
@@ -404,7 +493,6 @@ namespace Raven.Server.Documents.Subscriptions
             {
                 connection.ConnectionException = ex;
                 connection.CancellationTokenSource.Cancel();
-                RegisterRejectedConnection(connection, ex);
             }
             catch
             {
@@ -441,7 +529,7 @@ namespace Raven.Server.Documents.Subscriptions
                 });
         }
 
-        public SubscriptionConnection MostRecentEndedConnection()
+        public SubscriptionConnectionInfo MostRecentEndedConnection()
         {
             if (_recentConnections.TryPeek(out var recentConnection))
                 return recentConnection;
@@ -634,5 +722,89 @@ namespace Raven.Server.Documents.Subscriptions
         }
 
         public static SubscriptionConnectionsState CreateDummyState(DocumentsStorage storage, SubscriptionState state) => new(storage, state);
+
+        private long _lastNoopAckTicks;
+        private Task _lastNoopAckTask = Task.CompletedTask;
+
+        public Task SendNoopAck(bool force = false)
+        {
+            if (ClusterCommandsVersionManager.CurrentClusterMinimalVersion >= 53_000)
+            {
+                if (IsConcurrent)
+                {
+                    var localLastNoopAckTicks = Interlocked.Read(ref _lastNoopAckTicks);
+                    var nowTicks = DateTime.Now.Ticks;
+                    if ((nowTicks - localLastNoopAckTicks) / TimeSpan.TicksPerMillisecond < SubscriptionConnection.WaitForChangedDocumentsTimeoutInMs)
+                    {
+                        return _lastNoopAckTask;
+                    }
+
+                    var currentLastNoopAckTicks = Interlocked.CompareExchange(ref _lastNoopAckTicks, nowTicks, localLastNoopAckTicks);
+                    if (currentLastNoopAckTicks != localLastNoopAckTicks)
+                        return _lastNoopAckTask;
+
+                    var ackTask = SendNoopAckAsync(SubscriptionId, SubscriptionName, force);
+
+                    Interlocked.Exchange(ref _lastNoopAckTask, ackTask);
+
+                    return ackTask;
+                }
+
+                return SendNoopAckAsync(SubscriptionId, SubscriptionName, force);
+            }
+
+            return DocumentDatabase.SubscriptionStorage.LegacyAcknowledgeBatchProcessed(
+                SubscriptionId,
+                SubscriptionName,
+                nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
+                nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange));
+        }
+
+        private async Task SendNoopAckAsync(long subscriptionId, string name, bool force)
+        {
+            var command = new AcknowledgeSubscriptionBatchCommand(_documentsStorage.DocumentDatabase.Name, RaftIdGenerator.NewId())
+            {
+                ChangeVector = nameof(Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
+                NodeTag = _documentsStorage.DocumentDatabase.ServerStore.NodeTag,
+                HasHighlyAvailableTasks = _documentsStorage.DocumentDatabase.ServerStore.LicenseManager.HasHighlyAvailableTasks(),
+                SubscriptionId = subscriptionId,
+                SubscriptionName = name,
+                BatchId = SubscriptionConnection.NonExistentBatch,
+                LastTimeServerMadeProgressWithDocuments = DateTime.UtcNow,
+                DatabaseName = _documentsStorage.DocumentDatabase.Name,
+            };
+
+            var state = _documentsStorage.DocumentDatabase.ServerStore.Engine.CurrentState;
+            if (state == RachisState.Leader || state == RachisState.Follower)
+            {
+                // there are no changes for this subscription but we still want to check if we are the node that is responsible for this task.
+                // we can do that locally if we have a functional cluster (in a leader or follower state).
+
+                using (_documentsStorage.DocumentDatabase.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                using (context.OpenReadTransaction())
+                {
+                    var rawDatabaseRecord = _documentsStorage.DocumentDatabase.ServerStore.Cluster.ReadRawDatabaseRecord(context, command.DatabaseName);
+                    if (rawDatabaseRecord == null)
+                        throw new DatabaseDoesNotExistException($"Cannot set command value of type {nameof(AcknowledgeSubscriptionBatchCommand)} for database {command.DatabaseName}, because it does not exist");
+
+                    var subscription = _documentsStorage.DocumentDatabase.ServerStore.Cluster.Read(context, command.GetItemId());
+                    if (subscription == null)
+                        throw new SubscriptionDoesNotExistException($"Subscription with name '{command.SubscriptionName}' does not exist");
+
+                    var subscriptionTask = new AcknowledgeSubscriptionBatchCommand.SubscriptionTask(subscription);
+                    command.AssertSubscriptionState(rawDatabaseRecord, subscriptionTask, command.SubscriptionName);
+                    return;
+                }
+            }
+
+            if (force == false && _subscriptionStorage.ShouldWaitForClusterStabilization())
+            {
+                // in case of unstable cluster, we will try to heartbeat the client for 30 seconds and then send actual no-op command
+                return;
+            }
+
+            var (etag, _) = await _documentsStorage.DocumentDatabase.ServerStore.SendToLeaderAsync(command);
+            await _documentsStorage.DocumentDatabase.RachisLogIndexNotifications.WaitForIndexNotification(etag, _documentsStorage.DocumentDatabase.ServerStore.Engine.OperationTimeout);
+        }
     }
 }

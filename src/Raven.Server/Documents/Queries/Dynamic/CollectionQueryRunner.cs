@@ -23,6 +23,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
 {
     public class CollectionQueryRunner : AbstractQueryRunner
     {
+        public const int UnboundedQueryResultMarker = 0;
         public const string CollectionIndexPrefix = "collection/";
 
         public CollectionQueryRunner(DocumentDatabase database) : base(database)
@@ -32,6 +33,8 @@ namespace Raven.Server.Documents.Queries.Dynamic
         public override async Task<DocumentQueryResult> ExecuteQuery(IndexQueryServerSide query, QueryOperationContext queryContext, long? existingResultEtag, OperationCancelToken token)
         {
             var result = new DocumentQueryResult();
+            
+            QueryRunner.AssertValidQuery(query, result);
 
             if (queryContext.AreTransactionsOpened() == false)
                 queryContext.OpenReadTransaction();
@@ -59,7 +62,9 @@ namespace Raven.Server.Documents.Queries.Dynamic
         public override async Task ExecuteStreamQuery(IndexQueryServerSide query, QueryOperationContext queryContext, HttpResponse response, IStreamQueryResultWriter<Document> writer,
             OperationCancelToken token)
         {
-            var result = new StreamDocumentQueryResult(response, writer, token);
+            var result = new StreamDocumentQueryResult(response, writer, queryContext.Documents, token);
+            
+            QueryRunner.AssertValidQuery(query, result);
 
             using (queryContext.OpenReadTransaction())
             {
@@ -105,6 +110,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
             return runner.ExecutePatch(query.Metadata.CollectionName, query.Start, query.PageSize, new CollectionOperationOptions
             {
+                IgnoreMaxStepsForScript = options.IgnoreMaxStepsForScript,
                 MaxOpsPerSecond = options.MaxOpsPerSecond
             }, patch, patchArgs, onProgress, token);
         }
@@ -134,20 +140,21 @@ namespace Raven.Server.Documents.Queries.Dynamic
                 resultToFill.IndexTimestamp = DateTime.MinValue;
                 resultToFill.IncludedPaths = query.Metadata.Includes;
 
-                var fieldsToFetch = new FieldsToFetch(query, null);
+                var fieldsToFetch = new FieldsToFetch(query, null, IndexType.None);
                 var includeDocumentsCommand  = new IncludeDocumentsCommand(Database.DocumentsStorage, context.Documents, query.Metadata.Includes, fieldsToFetch.IsProjection);
                 var includeRevisionsCommand  = new IncludeRevisionsCommand(Database, context.Documents, query.Metadata.RevisionIncludes);
                 
                 var includeCompareExchangeValuesCommand = IncludeCompareExchangeValuesCommand.ExternalScope(context, query.Metadata.CompareExchangeValueIncludes);
 
-                var totalResults = new Reference<int>();
+                var totalResults = new Reference<long>();
                 var skippedResults = new Reference<long>();
                 var scannedResults = new Reference<int>();
                 IEnumerator<Document> enumerator;
 
+                var lastRaftId = Database.RachisLogIndexNotifications.LastModifiedIndex;
                 if (pulseReadingTransaction == false)
                 {
-                    var documents = new CollectionQueryEnumerable(Database, Database.DocumentsStorage, SearchEngineType.None, fieldsToFetch, collection, query, queryScope, context.Documents,
+                    var documents = new CollectionQueryEnumerable(Database, Database.DocumentsStorage, fieldsToFetch, collection, query, queryScope, context.Documents,
                         includeDocumentsCommand, includeRevisionsCommand: includeRevisionsCommand,
                         includeCompareExchangeValuesCommand: includeCompareExchangeValuesCommand, totalResults: totalResults, scannedResults, skippedResults, token);
 
@@ -155,12 +162,12 @@ namespace Raven.Server.Documents.Queries.Dynamic
                 }
                 else
                 {
-                    enumerator = new PulsedTransactionEnumerator<Document, CollectionQueryResultsIterationState>(context.Documents,
+                    enumerator = new TransactionForgetAboutDocumentEnumerator(new PulsedTransactionEnumerator<Document, CollectionQueryResultsIterationState>(context.Documents,
                         state =>
                         {
                             query.Start = state.Start;
                             query.PageSize = state.Take;
-                            var documents = new CollectionQueryEnumerable(Database, Database.DocumentsStorage, SearchEngineType.None, fieldsToFetch, collection, query, queryScope,
+                            var documents = new CollectionQueryEnumerable(Database, Database.DocumentsStorage, fieldsToFetch, collection, query, queryScope,
                                 context.Documents, includeDocumentsCommand, includeRevisionsCommand, includeCompareExchangeValuesCommand, totalResults, scannedResults,
                                 skippedResults, token);
 
@@ -170,7 +177,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
                         {
                             Start = query.Start,
                             Take = query.PageSize
-                        });
+                        }), context.Documents);
                 }
 
                 IncludeCountersCommand includeCountersCommand = null;
@@ -238,7 +245,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
                 {
                     includeDocumentsCommand.Fill(resultToFill.Includes);
 
-                    includeCompareExchangeValuesCommand.Materialize();
+                    includeCompareExchangeValuesCommand.Materialize(lastRaftId);
                 }
 
                 if (includeCompareExchangeValuesCommand != null)
@@ -254,8 +261,8 @@ namespace Raven.Server.Documents.Queries.Dynamic
                     resultToFill.AddRevisionIncludes(includeRevisionsCommand);
 
                 resultToFill.RegisterTimeSeriesFields(query, fieldsToFetch);
-                resultToFill.TotalResults = (totalResults.Value == 0 && resultToFill.Results.Count != 0) ? -1 : totalResults.Value;
-                resultToFill.LongTotalResults = resultToFill.TotalResults;
+                resultToFill.LongTotalResults = (totalResults.Value == UnboundedQueryResultMarker && resultToFill.Results.Count != 0) ? -1 : totalResults.Value;
+                resultToFill.TotalResults = (int)resultToFill.LongTotalResults;
                 resultToFill.SkippedResults = Convert.ToInt32(skippedResults.Value);
                 resultToFill.ScannedResults = scannedResults.Value;
 

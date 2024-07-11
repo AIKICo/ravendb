@@ -25,19 +25,7 @@ namespace SlowTests.Client.Indexing.Counters
         {
         }
 
-        private class MyCounterIndex : AbstractCountersIndexCreationTask<Company>
-        {
-            public MyCounterIndex()
-            {
-                AddMap("HeartRate", counters => from counter in counters
-                                                select new
-                                                {
-                                                    HeartBeat = counter.Value,
-                                                    Name = counter.Name,
-                                                    User = counter.DocumentId
-                                                });
-            }
-        }
+
 
         private class MyCounterIndex_Load : AbstractCountersIndexCreationTask<Company>
         {
@@ -246,8 +234,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public void BasicMapIndex(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -263,7 +251,7 @@ namespace SlowTests.Client.Indexing.Counters
 
                 store.Maintenance.Send(new StopIndexingOperation());
 
-                var countersIndex = new MyCounterIndex();
+                var countersIndex = new FastTests.Corax.CoraxProjections.MyCounterIndex();
                 var indexDefinition = countersIndex.CreateIndexDefinition();
                 RavenTestHelper.AssertEqualRespectingNewLines("counters.Companies.HeartRate.Select(counter => new {\r\n    HeartBeat = counter.Value,\r\n    Name = counter.Name,\r\n    User = counter.DocumentId\r\n})", indexDefinition.Maps.First());
 
@@ -454,8 +442,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task BasicMapIndexWithLoad(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -614,8 +602,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public void BasicMapReduceIndex(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -776,8 +764,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task BasicMapReduceIndexWithLoad(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -925,8 +913,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public void CanMapAllCountersFromCollection(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -1092,8 +1080,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public void CanMapAllCounters(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -1193,8 +1181,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task BasicMultiMapIndex(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -1253,8 +1241,8 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
 
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task CanCalculateNumberOfReferencesCorrectly(Options options)
         {
             using (var store = GetDocumentStore(options))
@@ -1401,15 +1389,15 @@ namespace SlowTests.Client.Indexing.Counters
             }
         }
         
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task CounterIndexProgress_WhenMapMultipleCounterGroups_ShouldDisplayNumberOfCounterGroups1_CounterMapReduceIndexForMultipleCounterGroups(Options options)
         {
             await CounterIndexProgress_WhenMapMultipleCounterGroups_ShouldDisplayNumberOfCounterGroups1(options, new CounterMapReduceIndexForMultipleCounterGroups());
         }
         
-        [Theory]
-        [RavenData(SearchEngineMode = RavenSearchEngineMode.Lucene)]
+        [RavenTheory(RavenTestCategory.Counters | RavenTestCategory.Indexes)]
+        [RavenData(SearchEngineMode = RavenSearchEngineMode.All)]
         public async Task CounterIndexProgress_WhenMapMultipleCounterGroups_ShouldDisplayNumberOfCounterGroups1_CounterIndexForMultipleCounterGroups(Options options)
         {
             await CounterIndexProgress_WhenMapMultipleCounterGroups_ShouldDisplayNumberOfCounterGroups1(options, new CounterIndexForMultipleCounterGroups());

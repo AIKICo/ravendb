@@ -1,13 +1,10 @@
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Data.Common;
-using System.Data.SqlClient;
+using Microsoft.Data.SqlClient;
 using System.Linq;
 using System.Text;
 using System.Threading;
-using MySql.Data.MySqlClient;
-using NpgsqlTypes;
 using Oracle.ManagedDataAccess.Client;
 using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Server.Documents.ETL.Providers.SQL.Test;
@@ -89,7 +86,8 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                             param = new Npgsql.NpgsqlParameter();
                             break;
                         case SqlProvider.MySqlClient:
-                            param = new MySqlParameter();
+                        case SqlProvider.MySqlConnectorFactory:
+                            param = new MySqlConnector.MySqlParameter();
                             break;
                         case SqlProvider.OracleClient:
                             param = new OracleParameter();

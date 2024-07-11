@@ -70,12 +70,13 @@ public class RavenDataAttribute : DataAttribute
         //    yield return (RavenDatabaseMode.Sharded, RavenTestBase.Options.ForMode(RavenDatabaseMode.Sharded));
     }
 
-    internal static IEnumerable<(RavenSearchEngineMode SearchMode, RavenTestBase.Options Options)> FillOptions(RavenTestBase.Options options, RavenSearchEngineMode mode)
+    internal static IEnumerable<(RavenSearchEngineMode SearchEngineMode, RavenTestBase.Options Options)> FillOptions(RavenTestBase.Options options, RavenSearchEngineMode mode)
     {
-        if (mode.HasFlag(RavenSearchEngineMode.Corax))
+        //We do not have the possibility to easily skip the test when only inline data is Corax, so let's run it. In the case of 'All,' we will not run Corax.
+        if (mode is RavenSearchEngineMode.Corax)
         {
             var coraxOptions = options.Clone();
-
+            coraxOptions.SearchEngineMode = RavenSearchEngineMode.Corax;
             coraxOptions.ModifyDatabaseRecord += record =>
             {
                 record.Settings[RavenConfiguration.GetKey(x => x.Indexing.AutoIndexingEngineType)] = "Corax";
@@ -88,6 +89,7 @@ public class RavenDataAttribute : DataAttribute
         if (mode.HasFlag(RavenSearchEngineMode.Lucene))
         {
             var luceneOptions = options.Clone();
+            luceneOptions.SearchEngineMode = RavenSearchEngineMode.Lucene;
 
             luceneOptions.ModifyDatabaseRecord += record =>
             {

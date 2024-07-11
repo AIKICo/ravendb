@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations;
@@ -27,7 +28,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             _remoteFolderName = GetRemoteFolder(GetType().Name);
         }
 
-        protected async Task can_backup_and_restore_internal(string dbName = null)
+        protected async Task can_backup_and_restore_internal(string dbName = null, BackupUploadMode backupUploadMode = BackupUploadMode.Default)
         {
             var s3Settings = GetS3Settings();
             Options options = null;
@@ -49,9 +50,10 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                     await session.SaveChangesAsync();
                 }
 
-                var config = Backup.CreateBackupConfiguration(s3Settings: s3Settings);
-                var backupTaskId = Backup.UpdateConfigAndRunBackup(Server, config, store);
-                var backupResult = (BackupResult)store.Maintenance.Send(new GetOperationStateOperation(Backup.GetBackupOperationId(store, backupTaskId))).Result;
+                var config = Backup.CreateBackupConfiguration(s3Settings: s3Settings, backupUploadMode: backupUploadMode);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
+                var id = await Backup.GetBackupOperationIdAsync(store, backupTaskId);
+                var backupResult = (await store.Maintenance.SendAsync(new GetOperationStateOperation(id))).Result as BackupResult;
                 Assert.NotNull(backupResult);
                 Assert.True(backupResult.Counters.Processed, "backupResult.Counters.Processed");
                 Assert.Equal(1, backupResult.Counters.ReadCount);
@@ -100,7 +102,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             }
         }
 
-        protected async Task can_backup_and_restore_snapshot_internal()
+        protected async Task can_backup_and_restore_snapshot_internal(BackupUploadMode backupUploadMode)
         {
             var s3Settings = GetS3Settings();
 
@@ -128,7 +130,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                     await session.SaveChangesAsync();
                 }
 
-                var config = Backup.CreateBackupConfiguration(backupType: BackupType.Snapshot, s3Settings: s3Settings);
+                var config = Backup.CreateBackupConfiguration(backupType: BackupType.Snapshot, s3Settings: s3Settings, backupUploadMode: backupUploadMode);
                 var backupTaskId = Backup.UpdateConfigAndRunBackup(Server, config, store);
                 using (var session = store.OpenAsyncSession())
                 {
@@ -185,7 +187,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             }
         }
 
-        protected async Task incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key_internal()
+        protected async Task incremental_and_full_backup_encrypted_db_and_restore_to_encrypted_DB_with_database_key_internal(BackupUploadMode backupUploadMode)
         {
             var s3Settings = GetS3Settings();
 
@@ -212,7 +214,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                 var config = Backup.CreateBackupConfiguration(s3Settings: s3Settings, fullBackupFrequency: null, incrementalBackupFrequency: "0 */6 * * *", backupEncryptionSettings: new BackupEncryptionSettings
                 {
                     EncryptionMode = EncryptionMode.UseDatabaseKey
-                });
+                }, backupUploadMode: backupUploadMode);
                 var backupTaskId = Backup.UpdateConfigAndRunBackup(Server, config, store);
 
                 using (var session = store.OpenAsyncSession())
@@ -266,7 +268,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                 }
 
                 var config = Backup.CreateBackupConfiguration(s3Settings: s3Settings, fullBackupFrequency: null, incrementalBackupFrequency: "0 */6 * * *");
-                var backupTaskId = Backup.UpdateConfigAndRunBackup(Server, config, store);
+                var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
 
                 using (var session = store.OpenAsyncSession())
                 {
@@ -279,7 +281,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                 var backupStatus = await Backup.RunBackupAndReturnStatusAsync(Server, backupTaskId, store, isFullBackup: false, expectedEtag: lastEtag);
 
                 string lastFileToRestore;
-                using (var client = new RavenAwsS3Client(s3Settings, DefaultConfiguration))
+                using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                using (var client = new RavenAwsS3Client(s3Settings, DefaultConfiguration, cancellationToken: cts.Token))
                 {
                     var fullBackupPath = $"{s3Settings.RemoteFolderName}/{backupStatus.FolderName}";
                     lastFileToRestore = (await client.ListObjectsAsync(fullBackupPath, string.Empty, false)).FileInfoDetails.Last().FullPath;
@@ -388,7 +391,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             }
         }
 
-        protected async Task snapshot_encrypted_db_and_restore_to_encrypted_DB_internal()
+        protected async Task snapshot_encrypted_db_and_restore_to_encrypted_DB_internal(BackupUploadMode backupUploadMode)
         {
             var key = Encryption.EncryptedServer(out var certificates, out string dbName);
 
@@ -410,7 +413,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                     await session.SaveChangesAsync();
                 }
 
-                var config = Backup.CreateBackupConfiguration(backupType: BackupType.Snapshot, s3Settings: s3Settings);
+                var config = Backup.CreateBackupConfiguration(backupType: BackupType.Snapshot, s3Settings: s3Settings, backupUploadMode: backupUploadMode);
                 var backupTaskId = Backup.UpdateConfigAndRunBackup(Server, config, store);
                 var backupStatus = store.Maintenance.Send(new GetPeriodicBackupStatusOperation(backupTaskId)).Status;
                 var databaseName = GetDatabaseName();
@@ -439,7 +442,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
 
         public S3Settings GetS3Settings(string subPath = null, [CallerMemberName] string caller = null)
         {
-            var s3Settings = _isCustom ? CustomS3FactAttribute.S3Settings : AmazonS3FactAttribute.S3Settings;
+            var s3Settings = _isCustom ? CustomS3RetryFactAttribute.S3Settings : AmazonS3RetryFactAttribute.S3Settings;
             if (s3Settings == null)
                 return null;
 
@@ -469,13 +472,14 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
         {
             base.Dispose();
 
-            var s3Settings = _isCustom ? CustomS3FactAttribute.S3Settings : AmazonS3FactAttribute.S3Settings;
+            var s3Settings = _isCustom ? CustomS3RetryFactAttribute.S3Settings : AmazonS3RetryFactAttribute.S3Settings;
             if (s3Settings == null)
                 return;
 
             try
             {
-                using (var s3Client = new RavenAwsS3Client(s3Settings, DefaultConfiguration))
+                using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                using (var s3Client = new RavenAwsS3Client(s3Settings, DefaultConfiguration, cancellationToken: cts.Token))
                 {
                     var cloudObjects = s3Client.ListObjects($"{s3Settings.RemoteFolderName}/{_remoteFolderName}/", string.Empty, false, includeFolders: true);
                     var pathsToDelete = cloudObjects.FileInfoDetails.Select(x => x.FullPath).ToList();

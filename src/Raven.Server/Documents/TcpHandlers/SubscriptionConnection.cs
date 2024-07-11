@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -25,6 +24,7 @@ using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Tcp;
+using Raven.Client.Util;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
@@ -35,14 +35,12 @@ using Raven.Server.Documents.Subscriptions.SubscriptionProcessor;
 using Raven.Server.Json;
 using Raven.Server.Rachis;
 using Raven.Server.ServerWide;
-using Raven.Server.ServerWide.Commands.Subscriptions;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Sparrow.Logging;
-using Sparrow.Threading;
 using Sparrow.Utils;
 using Constants = Voron.Global.Constants;
 using Exception = System.Exception;
@@ -66,8 +64,10 @@ namespace Raven.Server.Documents.TcpHandlers
 
     public class SubscriptionConnection : IDisposable
     {
-        public const long NonExistentBatch = -1;
-        private const int WaitForChangedDocumentsTimeoutInMs = 3000;
+        public static long NonExistentBatch = -1;
+        internal static int WaitForChangedDocumentsTimeoutInMs = 3000;
+        private static readonly int MaxBatchSizeInBytes = Constants.Size.Megabyte;
+        private static readonly int MaxBufferCapacityInBytes = 2 * MaxBatchSizeInBytes;
         private static readonly StringSegment DataSegment = new StringSegment("Data");
         private static readonly StringSegment IncludesSegment = new StringSegment(nameof(QueryResult.Includes));
         private static readonly StringSegment CounterIncludesSegment = new StringSegment(nameof(QueryResult.CounterIncludes));
@@ -81,7 +81,7 @@ namespace Raven.Server.Documents.TcpHandlers
         public readonly TcpConnectionOptions TcpConnection;
         public readonly string ClientUri;
         private readonly MemoryStream _buffer = new MemoryStream();
-        private readonly Logger _logger;
+        private  Logger _logger;
         public readonly SubscriptionConnectionStats Stats;
 
         private SubscriptionConnectionStatsScope _connectionScope;
@@ -91,6 +91,7 @@ namespace Raven.Server.Documents.TcpHandlers
         private static int _connectionStatsId;
         private int _connectionStatsIdForConnection;
         private static int _batchStatsId;
+        private Task<SubscriptionConnectionClientMessage> _lastReplyFromClientTask;
 
         private SubscriptionConnectionStatsAggregator _lastConnectionStats; // inProgress connection data
         public SubscriptionConnectionStatsAggregator GetPerformanceStats()
@@ -181,10 +182,11 @@ namespace Raven.Server.Documents.TcpHandlers
 
                 if (string.IsNullOrEmpty(_options.SubscriptionName))
                     return;
-
+                
+                _logger = LoggingSource.Instance.GetLogger(TcpConnection.DocumentDatabase.Name, $"{nameof(SubscriptionConnection)}<{_options.SubscriptionName}>");
                 context.OpenReadTransaction();
 
-                var subscriptionItemKey = SubscriptionState.GenerateSubscriptionItemKeyName(TcpConnection.DocumentDatabase.Name, _options.SubscriptionName);
+                var subscriptionItemKey = Client.Documents.Subscriptions.SubscriptionState.GenerateSubscriptionItemKeyName(TcpConnection.DocumentDatabase.Name, _options.SubscriptionName);
                 var translation = TcpConnection.DocumentDatabase.ServerStore.Cluster.Read(context, subscriptionItemKey);
                 if (translation == null)
                     throw new SubscriptionDoesNotExistException("Cannot find any Subscription Task with name: " + _options.SubscriptionName);
@@ -229,12 +231,14 @@ namespace Raven.Server.Documents.TcpHandlers
             Subscription = ParseSubscriptionQuery(SubscriptionState.Query);
 
             // update the state if above data changed
-            _subscriptionConnectionsState.Initialize(this, afterSubscribe: true);
+            await _subscriptionConnectionsState.InitializeAsync(this, afterSubscribe: true);
+
+            CancellationTokenSource.Token.ThrowIfCancellationRequested();
 
             await TcpConnection.DocumentDatabase.SubscriptionStorage.UpdateClientConnectionTime(SubscriptionState.SubscriptionId,
                 SubscriptionState.SubscriptionName, SubscriptionState.MentorNode);
 
-            await SendNoopAck();
+            await SubscriptionConnectionsState.SendNoopAck(force: true);
             await WriteJsonAsync(new DynamicJsonValue
             {
                 [nameof(SubscriptionConnectionServerMessage.Type)] = nameof(SubscriptionConnectionServerMessage.MessageType.ConnectionStatus),
@@ -242,47 +246,68 @@ namespace Raven.Server.Documents.TcpHandlers
             });
         }
 
-        private async Task<(IDisposable DisposeOnDisconnect, long RegisterConnectionDurationInTicks)> SubscribeAsync()
+        private async Task<(IDisposable DisposeOnDisconnect, long RegisterConnectionDurationInTicks)> SubscribeAsync(Stopwatch registerConnectionDuration)
         {
             var random = new Random();
-            var registerConnectionDuration = Stopwatch.StartNew();
+            var sp = Stopwatch.StartNew();
+            while (true)
+            {
+                CancellationTokenSource.Token.ThrowIfCancellationRequested();
 
+                try
+                {
+                    var disposeOnce = _subscriptionConnectionsState.RegisterSubscriptionConnection(this);
+                    registerConnectionDuration.Stop();
+                    return (disposeOnce, registerConnectionDuration.ElapsedTicks);
+                }
+                catch (TimeoutException)
+                {
+                    if (_logger.IsInfoEnabled)
+                    {
+                        _logger.Info(
+                            $"A connection from IP {TcpConnection.TcpClient.Client.RemoteEndPoint} is starting to wait until previous connection from " +
+                            $"{_subscriptionConnectionsState.GetConnectionsAsString()} is released");
+                    }
+
+                    var timeout = TimeSpan.FromMilliseconds(Math.Max(250, (long)_options.TimeToWaitBeforeConnectionRetry.TotalMilliseconds / 2) + random.Next(15, 50));
+                    await Task.Delay(timeout);
+                    await SendHeartBeatIfNeededAsync(sp,
+                        $"A connection from IP {TcpConnection.TcpClient.Client.RemoteEndPoint} is waiting for Subscription Task that is serving a connection from IP " +
+                        $"{_subscriptionConnectionsState.GetConnectionsAsString()} to be released");
+                }
+            }
+        }
+
+        private async Task<IDisposable> AddPendingConnectionUnderLockAsync()
+        {
+             var connectionInfo = new SubscriptionConnectionInfo(this);
             _connectionScope.RecordConnectionInfo(SubscriptionState, ClientUri, _options.Strategy, WorkerId);
 
-            _subscriptionConnectionsState.PendingConnections.Add(this);
+            _subscriptionConnectionsState._pendingConnections.Add(connectionInfo);
 
             try
             {
-                while (true)
-                {
-                    CancellationTokenSource.Token.ThrowIfCancellationRequested();
-
-                    try
-                    {
-                        var disposeOnce = _subscriptionConnectionsState.RegisterSubscriptionConnection(this);
-                        registerConnectionDuration.Stop();
-                        return (disposeOnce, registerConnectionDuration.ElapsedTicks);
-                    }
-                    catch (TimeoutException)
-                    {
-                        if (_logger.IsInfoEnabled)
-                        {
-                            _logger.Info(
-                                $"A connection from IP {TcpConnection.TcpClient.Client.RemoteEndPoint} is starting to wait until previous connection from " +
-                                $"{_subscriptionConnectionsState.GetConnectionsAsString()} is released");
-                        }
-
-                        var timeout = TimeSpan.FromMilliseconds(Math.Max(250, (long)_options.TimeToWaitBeforeConnectionRetry.TotalMilliseconds / 2) + random.Next(15, 50));
-                        await Task.Delay(timeout);
-                        await SendHeartBeat(
-                            $"A connection from IP {TcpConnection.TcpClient.Client.RemoteEndPoint} is waiting for Subscription Task that is serving a connection from IP " +
-                            $"{_subscriptionConnectionsState.GetConnectionsAsString()} to be released");
-                    }
-                }
+                await _subscriptionConnectionsState.TakeConcurrentConnectionLockAsync(this);
             }
-            finally
+            catch
             {
-                _subscriptionConnectionsState.PendingConnections.TryRemove(this);
+                _subscriptionConnectionsState._pendingConnections.TryRemove(connectionInfo);
+                throw;
+            }
+
+            return new DisposableAction(() =>
+            {
+                _subscriptionConnectionsState._pendingConnections.TryRemove(connectionInfo);
+                _subscriptionConnectionsState.ReleaseConcurrentConnectionLock(this);
+            });
+        }
+
+        internal async Task SendHeartBeatIfNeededAsync(Stopwatch sp, string reason)
+        {
+            if (sp.ElapsedMilliseconds >= WaitForChangedDocumentsTimeoutInMs)
+            {
+                await SendHeartBeatAsync(reason);
+                sp.Restart();
             }
         }
 
@@ -360,15 +385,19 @@ namespace Raven.Server.Documents.TcpHandlers
 
                     try
                     {
-                        long registerConnectionDurationInTicks;
                         using (_pendingConnectionScope)
                         {
                             await InitAsync();
-                            _subscriptionConnectionsState = TcpConnection.DocumentDatabase.SubscriptionStorage.OpenSubscription(this);
-                            (disposeOnDisconnect, registerConnectionDurationInTicks) = await SubscribeAsync();
+                            _subscriptionConnectionsState = await TcpConnection.DocumentDatabase.SubscriptionStorage.OpenSubscriptionAsync(this);
+                            var registerConnectionDuration = Stopwatch.StartNew();
+                            using (await AddPendingConnectionUnderLockAsync())
+                            {
+                                (disposeOnDisconnect, long registerConnectionDurationInTicks) = await SubscribeAsync(registerConnectionDuration);
+                                _pendingConnectionScope.Dispose();
+                                await NotifyClientAboutSuccess(registerConnectionDurationInTicks);
+                            }
                         }
 
-                        await NotifyClientAboutSuccess(registerConnectionDurationInTicks);
                         await ProcessSubscriptionAsync();
                     }
                     finally
@@ -516,7 +545,7 @@ namespace Raven.Server.Documents.TcpHandlers
                                 {
                                     // check that the subscription exists on AppropriateNode
                                     var clusterTopology = server.GetClusterTopology(ctx);
-                                    using (var requester = ClusterRequestExecutor.CreateForSingleNode(
+                                    using (var requester = ClusterRequestExecutor.CreateForShortTermUse(
                                     clusterTopology.GetUrlFromTag(subscriptionDoesNotBelongException.AppropriateNode), server.Server.Certificate.Certificate, DocumentConventions.DefaultForServer))
                                     {
                                         await requester.ExecuteAsync(new WaitForRaftIndexCommand(subscriptionDoesNotBelongException.Index), ctx);
@@ -664,7 +693,7 @@ namespace Raven.Server.Documents.TcpHandlers
 
             using (_processor = SubscriptionProcessor.Create(this))
             {
-                var replyFromClientTask = GetReplyFromClientAsync();
+                var replyFromClientTask = _lastReplyFromClientTask = GetReplyFromClientAsync();
 
                 _processor.AddScript(SetupFilterAndProjectionScript());
 
@@ -711,7 +740,7 @@ namespace Raven.Server.Documents.TcpHandlers
                                     UpdateBatchPerformanceStats(0, false);
 
                                     if (sendingCurrentBatchStopwatch.ElapsedMilliseconds > 1000)
-                                        await SendHeartBeat("Didn't find any documents to send and more then 1000ms passed");
+                                        await SendHeartBeatAsync("Didn't find any documents to send and more then 1000ms passed");
 
                                     using (docsContext.OpenReadTransaction())
                                     {
@@ -723,6 +752,13 @@ namespace Raven.Server.Documents.TcpHandlers
                                     }
 
                                     AssertCloseWhenNoDocsLeft();
+
+                                    // we might wait for new documents for a long times, lets reduce the stream capacity
+                                    if (_buffer.Capacity > MaxBufferCapacityInBytes)
+                                    {
+                                        Debug.Assert(_buffer.Length <= MaxBufferCapacityInBytes, $"{_buffer.Length} <= {MaxBufferCapacityInBytes}");
+                                        _buffer.Capacity = MaxBufferCapacityInBytes;
+                                    }
 
                                     if (await WaitForChangedDocs(replyFromClientTask))
                                         continue;
@@ -782,24 +818,32 @@ namespace Raven.Server.Documents.TcpHandlers
             SubscriptionConnectionClientMessage clientReply;
             while (true)
             {
-                var result = await Task.WhenAny(replyFromClientTask,
-                    TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(5000), CancellationTokenSource.Token)).ConfigureAwait(false);
+                var timeoutTask = TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(5000), CancellationTokenSource.Token);
+                var result = await Task.WhenAny(replyFromClientTask, timeoutTask).ConfigureAwait(false);
                 CancellationTokenSource.Token.ThrowIfCancellationRequested();
                 if (result == replyFromClientTask)
                 {
-                    clientReply = await replyFromClientTask;
-                    if (clientReply.Type == SubscriptionConnectionClientMessage.MessageType.DisposedNotification)
+                    if (TcpConnection.DocumentDatabase.SubscriptionStorage.ShouldWaitForClusterStabilization())
                     {
-                        CancellationTokenSource.Cancel();
+                        // we have unstable cluster
+                        await timeoutTask;
+                    }
+                    else
+                    {
+                        clientReply = await replyFromClientTask;
+                        if (clientReply.Type == SubscriptionConnectionClientMessage.MessageType.DisposedNotification)
+                        {
+                            await CancellationTokenSource.CancelAsync();
+                            break;
+                        }
+
+                        replyFromClientTask = _lastReplyFromClientTask = GetReplyFromClientAsync();
                         break;
                     }
-
-                    replyFromClientTask = GetReplyFromClientAsync();
-                    break;
                 }
 
-                await SendHeartBeat("Waiting for client ACK");
-                await SendNoopAck();
+                await SendHeartBeatAsync("Waiting for client ACK");
+                await SubscriptionConnectionsState.SendNoopAck();
             }
 
             CancellationTokenSource.Token.ThrowIfCancellationRequested();
@@ -908,7 +952,7 @@ namespace Raven.Server.Documents.TcpHandlers
                                 {
                                     if (sendingCurrentBatchStopwatch.ElapsedMilliseconds > 1000)
                                     {
-                                        await SendHeartBeat("Skipping docs for more than 1000ms without sending any data");
+                                        await SendHeartBeatAsync("Skipping docs for more than 1000ms without sending any data");
                                         sendingCurrentBatchStopwatch.Restart();
                                     }
 
@@ -954,7 +998,7 @@ namespace Raven.Server.Documents.TcpHandlers
 
                                 TcpConnection._lastEtagSent = -1;
                                 // perform flush for current batch after 1000ms of running or 1 MB
-                                if (_buffer.Length > Constants.Size.Megabyte ||
+                                if (_buffer.Length > MaxBatchSizeInBytes ||
                                     sendingCurrentBatchStopwatch.ElapsedMilliseconds > 1000)
                                 {
                                     await FlushDocsToClient(writer, docsToFlush);
@@ -1068,7 +1112,7 @@ namespace Raven.Server.Documents.TcpHandlers
             }
         }
 
-        private async Task SendHeartBeat(string reason)
+        internal async Task SendHeartBeatAsync(string reason)
         {
             try
             {
@@ -1113,9 +1157,9 @@ namespace Raven.Server.Documents.TcpHandlers
             do
             {
                 var hasMoreDocsTask = _subscriptionConnectionsState.WaitForMoreDocs();
-
+                var timeoutTask = TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(WaitForChangedDocumentsTimeoutInMs));
                 var resultingTask = await Task
-                    .WhenAny(hasMoreDocsTask, pendingReply, TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(WaitForChangedDocumentsTimeoutInMs))).ConfigureAwait(false);
+                    .WhenAny(hasMoreDocsTask, pendingReply, timeoutTask).ConfigureAwait(false);
 
                 TcpConnection.DocumentDatabase.ForTestingPurposes?.Subscription_ActionToCallDuringWaitForChangedDocuments?.Invoke();
 
@@ -1127,32 +1171,22 @@ namespace Raven.Server.Documents.TcpHandlers
 
                 if (hasMoreDocsTask == resultingTask)
                 {
-                    _subscriptionConnectionsState.NotifyNoMoreDocs();
-                    return true;
+                    if (TcpConnection.DocumentDatabase.SubscriptionStorage.ShouldWaitForClusterStabilization())
+                    {
+                        // we have unstable cluster
+                        await timeoutTask;
+                    }
+                    else
+                    {
+                        _subscriptionConnectionsState.NotifyNoMoreDocs();
+                        return true;
+                    }
                 }
 
-                await SendHeartBeat("Waiting for changed documents");
-                await SendNoopAck();
+                await SendHeartBeatAsync("Waiting for changed documents");
+                await SubscriptionConnectionsState.SendNoopAck();
             } while (CancellationTokenSource.IsCancellationRequested == false);
             return false;
-        }
-
-        private Task SendNoopAck()
-        {
-            if (ClusterCommandsVersionManager.CurrentClusterMinimalVersion >= 53_000)
-            {
-                return TcpConnection.DocumentDatabase.SubscriptionStorage.AcknowledgeBatchProcessed(
-                    SubscriptionId,
-                    Options.SubscriptionName,
-                    nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
-                    NonExistentBatch, docsToResend: null);
-            }
-
-            return TcpConnection.DocumentDatabase.SubscriptionStorage.LegacyAcknowledgeBatchProcessed(
-                SubscriptionId,
-                Options.SubscriptionName,
-                nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
-                nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange));
         }
 
         private SubscriptionPatchDocument SetupFilterAndProjectionScript()
@@ -1213,12 +1247,41 @@ namespace Raven.Server.Documents.TcpHandlers
                     // ignored
                 }
 
+                try
+                {
+                    if (_lastReplyFromClientTask is { IsCompleted: false })
+                    {
+                        // it's supposed this task will fail here since we disposed all resources used by connection
+                        // but we must wait for it before we release _copiedBuffer
+                        _lastReplyFromClientTask.Wait();
+                    }
+                    else if (_lastReplyFromClientTask is { IsFaulted: true })
+                    {
+                        // need to catch the exception here to prevent UnobservedTaskException 
+                        _lastReplyFromClientTask.Wait();
+                    }
+                }
+                catch
+                {
+                    // ignored
+                }
+
                 Stats.Dispose();
 
                 RecentSubscriptionStatuses?.Clear();
 
+                _pendingConnectionScope?.Dispose();
                 _activeConnectionScope?.Dispose();
                 _connectionScope.Dispose();
+
+                try
+                {
+                   _buffer.Dispose();
+                }
+                catch (Exception)
+                {
+                    // ignored
+                }
             }
         }
 

@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using EmbeddedTests.Platform;
+using Raven.Embedded;
 using Sparrow.Collections;
 
 namespace EmbeddedTests
@@ -38,13 +39,13 @@ namespace EmbeddedTests
                 Directory.CreateDirectory(dataDirectory);
 
 #if DEBUG
-            var runtimeConfigPath = @"../../../../../src/Raven.Server/bin/x64/Debug/net7.0/Raven.Server.runtimeconfig.json";
+            var runtimeConfigPath = @"../../../../../src/Raven.Server/bin/x64/Debug/net8.0/Raven.Server.runtimeconfig.json";
             if (File.Exists(runtimeConfigPath) == false) // this can happen when running directly from CLI e.g. dotnet xunit
-                runtimeConfigPath = @"../../../../../src/Raven.Server/bin/Debug/net7.0/Raven.Server.runtimeconfig.json";
+                runtimeConfigPath = @"../../../../../src/Raven.Server/bin/Debug/net8.0/Raven.Server.runtimeconfig.json";
 #else
-                var runtimeConfigPath = @"../../../../../src/Raven.Server/bin/x64/Release/net7.0/Raven.Server.runtimeconfig.json";
+                var runtimeConfigPath = @"../../../../../src/Raven.Server/bin/x64/Release/net8.0/Raven.Server.runtimeconfig.json";
                 if (File.Exists(runtimeConfigPath) == false) // this can happen when running directly from CLI e.g. dotnet xunit
-                    runtimeConfigPath = @"../../../../../src/Raven.Server/bin/Release/net7.0/Raven.Server.runtimeconfig.json";
+                    runtimeConfigPath = @"../../../../../src/Raven.Server/bin/Release/net8.0/Raven.Server.runtimeconfig.json";
 #endif
 
             var runtimeConfigFileInfo = new FileInfo(runtimeConfigPath);
@@ -76,6 +77,12 @@ namespace EmbeddedTests
             return (serverDirectory, dataDirectory);
         }
 
+        protected ServerOptions CopyServerAndCreateOptions()
+        {
+            var (severDirectory, dataDirectory) = CopyServer();
+            return new ServerOptions { ServerDirectory = severDirectory, DataDirectory = dataDirectory, LogsPath = Path.Combine(severDirectory, "Logs") };
+        }
+        
         public virtual void Dispose()
         {
             foreach (var path in _localPathsToDelete)

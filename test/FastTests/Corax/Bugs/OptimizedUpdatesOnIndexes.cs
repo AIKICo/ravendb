@@ -3,6 +3,7 @@ using System.Text;
 using Corax;
 using Corax.Mappings;
 using Corax.Queries;
+using Corax.Utils;
 using FastTests.Voron;
 using Sparrow.Json;
 using Sparrow.Server;
@@ -34,8 +35,7 @@ public unsafe class OptimizedUpdatesOnIndexes : StorageTest
 
             using var _ = Allocator.From("cars/1", ByteStringType.Immutable, out var str);
             var lowerId = new LazyStringValue(null, str.Ptr, str.Size, JsonOperationContext.ShortTermSingleUse());
-            long numberOfEntries =0;
-            oldId = indexWriter.Update("id()", str.ToSpan(), lowerId, entrySpan.ToSpan(), ref numberOfEntries);
+            oldId = indexWriter.Update("id()", str.ToSpan(), lowerId, entrySpan.ToSpan());
             
             indexWriter.Commit();
         }
@@ -46,7 +46,7 @@ public unsafe class OptimizedUpdatesOnIndexes : StorageTest
             var ids = new long[16];
             var read = termQuery.Fill(ids);
             Assert.Equal(1, read);
-            Assert.Equal(oldId, ids[0]);
+            Assert.Equal(EntryIdEncodings.Decode(oldId).EntryId, ids[0]);
         }
 
         long newId;
@@ -60,8 +60,7 @@ public unsafe class OptimizedUpdatesOnIndexes : StorageTest
 
             using var _ = Allocator.From("cars/1", ByteStringType.Immutable, out var str);
             var lowerId = new LazyStringValue(null, str.Ptr, str.Size, JsonOperationContext.ShortTermSingleUse());
-            long numberOfEntries =0;
-            newId = indexWriter.Update("id()", str.ToSpan(), lowerId, entrySpan.ToSpan(), ref numberOfEntries);
+            newId = indexWriter.Update("id()", str.ToSpan(), lowerId, entrySpan.ToSpan());
             
             indexWriter.Commit();
         }
@@ -77,7 +76,7 @@ public unsafe class OptimizedUpdatesOnIndexes : StorageTest
             ids = new long[16];
             read = termQuery.Fill(ids);
             Assert.Equal(1, read);
-            Assert.Equal(oldId, ids[0]);
+            Assert.Equal(EntryIdEncodings.Decode(oldId).EntryId, ids[0]);
         }
 
     }

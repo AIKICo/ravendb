@@ -29,8 +29,9 @@ namespace Raven.Server.Documents
         FromClusterTransaction = 0x1000,
         Reverted = 0x2000,
 
-        HasTimeSeries = 0x4000
+        HasTimeSeries = 0x4000,
 
+        ForceCreated = 0x10000 // 0x8000 is already taken in 6.0 branch
     }
 
     [Flags]

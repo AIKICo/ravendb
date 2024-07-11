@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime;
 using System.Threading;
 using Sparrow.Collections;
 using Sparrow.Logging;
@@ -44,21 +45,32 @@ namespace Sparrow.LowMemory
         private int _clearInactiveHandlersCounter;
         private bool _wasLowMemory;
         private DateTime _lastLoggedLowMemory = DateTime.MinValue;
-        private readonly TimeSpan _logLowMemoryInterval = TimeSpan.FromSeconds(5);
+        private readonly TimeSpan _logLowMemoryInterval = TimeSpan.FromSeconds(3);
 
-        private void RunLowMemoryHandlers(bool isLowMemory, MemoryInfoResult memoryInfo, LowMemorySeverity lowMemorySeverity = LowMemorySeverity.ExtremelyLow)
+        private readonly TimeSpan _lohCompactionInterval = TimeSpan.FromMinutes(15);
+        private DateTime _lastLohCompactionRequest = DateTime.MinValue;
+
+        private void RunLowMemoryHandlers(bool isLowMemory, MemoryInfoResult memoryInfo, LowMemorySeverity lowMemorySeverity)
         {
+
             try
             {
                 try
                 {
                     var now = DateTime.UtcNow;
-                    if (isLowMemory && _logger.IsOperationsEnabled && now - _lastLoggedLowMemory > _logLowMemoryInterval)
+                    
+                    if (((isLowMemory && _logger.IsOperationsEnabled) || _logger.IsInfoEnabled)
+                        && now - _lastLoggedLowMemory > _logLowMemoryInterval)
                     {
                         _lastLoggedLowMemory = now;
                         _logger.Operations($"Running {_lowMemoryHandlers.Count} low memory handlers with severity: {lowMemorySeverity}. " +
-                                           $"{MemoryUtils.GetExtendedMemoryInfo(memoryInfo)}");
+                                           $"{MemoryUtils.GetExtendedMemoryInfo(memoryInfo, _lowMemoryMonitor.GetDirtyMemoryState())}");
                     }
+
+#if NET7_0_OR_GREATER
+                    if (SupportsCompactionOfLargeObjectHeap)
+                        RequestLohCompactionIfNeeded(memoryInfo, now);
+#endif
                 }
                 catch
                 {
@@ -111,6 +123,44 @@ namespace Sparrow.LowMemory
             }
         }
 
+#if NET7_0_OR_GREATER
+        internal bool SupportsCompactionOfLargeObjectHeap { get; set; }
+        
+        private void RequestLohCompactionIfNeeded(MemoryInfoResult memoryInfo, DateTime now)
+        {
+            if (now - _lastLohCompactionRequest <= _lohCompactionInterval ||
+                GCSettings.LargeObjectHeapCompactionMode == GCLargeObjectHeapCompactionMode.CompactOnce)
+                return;
+            
+            var threshold = LargeObjectHeapCompactionThresholdPercentage;
+
+            var envVariableThreshold = Environment.GetEnvironmentVariable("RAVEN_LOH_COMPACTION_THRESHOLD");
+
+            if (string.IsNullOrEmpty(envVariableThreshold) == false && float.TryParse(envVariableThreshold, out var parsedValue))
+                threshold = parsedValue;
+
+            if (threshold <= 0)
+                return;
+            
+            var info = GC.GetGCMemoryInfo(GCKind.Any);
+
+            if (info.Index == 0) // no GC was run
+                return;
+
+            var lohSizeAfter = new Size(info.GenerationInfo[3].SizeAfterBytes, SizeUnit.Bytes);
+
+            if (lohSizeAfter > threshold * memoryInfo.TotalPhysicalMemory)
+            {
+                GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+
+                _lastLohCompactionRequest = now;
+
+                if (_logger.IsOperationsEnabled)
+                    _logger.Operations($"Forcing LOH compaction during next blocking generation 2 GC. LOH size after last GC: {lohSizeAfter} (threshold: {threshold})");
+            }
+        }
+#endif
+
         private void ClearInactiveHandlers()
         {
             var inactiveHandlers = new List<WeakReference<ILowMemoryHandler>>();
@@ -145,11 +195,14 @@ namespace Sparrow.LowMemory
 
         public float TemporaryDirtyMemoryAllowedPercentage { get; private set; }
 
+        public float LargeObjectHeapCompactionThresholdPercentage { get; private set; }
+
         public void Initialize(
             Size lowMemoryThreshold, 
             bool useTotalDirtyMemInsteadOfMemUsage,
             bool enableHighTemporaryDirtyMemoryUse,
             float temporaryDirtyMemoryAllowedPercentage,
+            float largeObjectHeapCompactionThresholdPercentage,
             AbstractLowMemoryMonitor monitor,
             CancellationToken shutdownNotification)
         {
@@ -166,6 +219,7 @@ namespace Sparrow.LowMemory
                 ExtremelyLowMemoryThreshold = lowMemoryThreshold * 0.2;
                 UseTotalDirtyMemInsteadOfMemUsage = useTotalDirtyMemInsteadOfMemUsage;
                 TemporaryDirtyMemoryAllowedPercentage = temporaryDirtyMemoryAllowedPercentage;
+                LargeObjectHeapCompactionThresholdPercentage = largeObjectHeapCompactionThresholdPercentage;
                 _enableHighTemporaryDirtyMemoryUse = enableHighTemporaryDirtyMemoryUse;
 
                 _lowMemoryMonitor = monitor;
@@ -259,14 +313,9 @@ namespace Sparrow.LowMemory
             if (_lowMemoryMonitor != null)
             {
                 memInfoForLog = _lowMemoryMonitor.GetMemoryInfoOnce();
-                var availableMemForLog = memInfoForLog.AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes);
 
                 AddLowMemEvent(LowMemoryState ? LowMemReason.LowMemStateSimulation : LowMemReason.BackToNormalSimulation,
-                    availableMemForLog,
-                    -2,
-                    memInfoForLog.TotalScratchDirtyMemory.GetValue(SizeUnit.Bytes),
-                    memInfoForLog.TotalPhysicalMemory.GetValue(SizeUnit.Bytes),
-                    memInfoForLog.CurrentCommitCharge.GetValue(SizeUnit.Bytes));
+                    memInfoForLog, totalUnmanaged: -2);
             }
 
             if (_logger.IsInfoEnabled)
@@ -308,12 +357,7 @@ namespace Sparrow.LowMemory
                             _logger.Info("Low memory detected, will try to reduce memory usage...");
 
                         }
-                        AddLowMemEvent(LowMemReason.LowMemOnTimeoutChk,
-                            memoryInfo.AvailableMemory.GetValue(SizeUnit.Bytes),
-                            totalUnmanagedAllocations,
-                            memoryInfo.TotalScratchDirtyMemory.GetValue(SizeUnit.Bytes),
-                            memoryInfo.TotalPhysicalMemory.GetValue(SizeUnit.Bytes),
-                            memoryInfo.CurrentCommitCharge.GetValue(SizeUnit.Bytes));
+                        AddLowMemEvent(LowMemReason.LowMemOnTimeoutChk, memoryInfo, totalUnmanagedAllocations);
                     }
                     catch (OutOfMemoryException)
                     {
@@ -338,15 +382,11 @@ namespace Sparrow.LowMemory
                 {
                     if (_logger.IsInfoEnabled)
                         _logger.Info("Back to normal memory usage detected");
-                    AddLowMemEvent(LowMemReason.BackToNormal,
-                        memoryInfo.AvailableMemory.GetValue(SizeUnit.Bytes),
-                        totalUnmanagedAllocations,
-                        memoryInfo.TotalScratchDirtyMemory.GetValue(SizeUnit.Bytes),
-                        memoryInfo.TotalPhysicalMemory.GetValue(SizeUnit.Bytes),
-                        memoryInfo.CurrentCommitCharge.GetValue(SizeUnit.Bytes));
+                    
+                    AddLowMemEvent(LowMemReason.BackToNormal, memoryInfo, totalUnmanagedAllocations);
                 }
                 LowMemoryState = false;
-                RunLowMemoryHandlers(false, memoryInfo);
+                RunLowMemoryHandlers(false, memoryInfo, isLowMemory);
                 timeout = memoryInfo.AvailableMemory < LowMemoryThreshold * 2 ? 1000 : 5000;
             }
 
@@ -400,17 +440,17 @@ namespace Sparrow.LowMemory
             return LowMemorySeverity.None;
         }
 
-        private void AddLowMemEvent(LowMemReason reason, long availableMem, long totalUnmanaged, long totalScratchDirty, long physicalMem, long currentcommitCharge)
+        private void AddLowMemEvent(LowMemReason reason, MemoryInfoResult memoryInfo, long totalUnmanaged)
         {
             var lowMemEventDetails = new LowMemEventDetails
             {
                 Reason = reason,
-                FreeMem = availableMem,
+                FreeMem = memoryInfo.AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes),
                 TotalUnmanaged = totalUnmanaged,
-                TotalScratchDirty = totalScratchDirty,
-                PhysicalMem = physicalMem,
+                TotalScratchDirty = _lowMemoryMonitor.GetDirtyMemoryState().TotalDirty.GetValue(SizeUnit.Bytes),
+                PhysicalMem = memoryInfo.TotalPhysicalMemory.GetValue(SizeUnit.Bytes),
                 LowMemThreshold = LowMemoryThreshold.GetValue(SizeUnit.Bytes),
-                CurrentCommitCharge = currentcommitCharge,
+                CurrentCommitCharge = memoryInfo.CurrentCommitCharge.GetValue(SizeUnit.Bytes),
                 Time = DateTime.UtcNow
             };
 

@@ -1,8 +1,11 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.IO;
+using Raven.Client;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 using Sparrow.Server;
 using Voron;
 
@@ -14,6 +17,15 @@ namespace Raven.Server.Documents.Replication.ReplicationItems
         public LazyStringValue Id;
 
         public BlittableJsonReaderObject Values;
+
+        public override DynamicJsonValue ToDebugJson()
+        {
+            var djv = base.ToDebugJson();
+            djv[nameof(Collection)] = Collection?.ToString(CultureInfo.InvariantCulture) ?? Constants.Documents.Collections.EmptyCollection;
+            djv[nameof(Id)] = Id.ToString(CultureInfo.InvariantCulture);
+            return djv;
+        }
+
         public override long AssertChangeVectorSize()
         {
             return sizeof(byte) + // type
@@ -94,6 +106,8 @@ namespace Raven.Server.Documents.Replication.ReplicationItems
         public override void InnerDispose()
         {
             Values?.Dispose();
+            Collection?.Dispose();
+            Id?.Dispose();
         }
     }
 }

@@ -103,6 +103,8 @@ namespace Raven.Server.Config
 
         public TrafficWatchConfiguration TrafficWatch { get; }
 
+        public ExportImportConfiguration ExportImport { get; }
+
         internal string ConfigPath => _customConfigPath
                        ?? Path.Combine(AppContext.BaseDirectory, "settings.json");
 
@@ -153,6 +155,7 @@ namespace Raven.Server.Config
             Migration = new MigrationConfiguration();
             TrafficWatch = new TrafficWatchConfiguration();
             Integrations = new IntegrationsConfiguration();
+            ExportImport = new ExportImportConfiguration();
         }
 
         private void AddJsonConfigurationVariables(string customConfigPath = null)
@@ -214,6 +217,7 @@ namespace Raven.Server.Config
             Migration.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             TrafficWatch.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Integrations.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
+            ExportImport.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
 
             PostInit();
 
@@ -277,23 +281,37 @@ namespace Raven.Server.Config
         {
             var results = new HashSet<ConfigurationEntryMetadata>();
 
-            var type = typeof(RavenConfiguration);
-            foreach (var configurationCategoryProperty in type.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            foreach (var configurationCategoryProperty in typeof(RavenConfiguration).GetProperties(BindingFlags.Instance | BindingFlags.Public))
             {
                 var propertyType = configurationCategoryProperty.PropertyType;
                 if (propertyType.IsSubclassOf(typeof(ConfigurationCategory)) == false)
                     continue;
 
-                foreach (var configurationProperty in propertyType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
-                {
-                    if (configurationProperty.GetCustomAttributes<ConfigurationEntryAttribute>(inherit: true).Any() == false)
-                        continue;
-
-                    results.Add(new ConfigurationEntryMetadata(configurationCategoryProperty, configurationProperty));
-                }
+                foreach (var metadata in GetConfigurationEntryMetadataFor(configurationCategoryProperty, propertyType))
+                    results.Add(metadata);
             }
 
             return results;
+
+            static IEnumerable<ConfigurationEntryMetadata> GetConfigurationEntryMetadataFor(PropertyInfo configurationCategoryProperty, Type propertyType)
+            {
+                foreach (var configurationProperty in propertyType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+                {
+                    var configurationPropertyType = configurationProperty.PropertyType;
+                    if (configurationPropertyType.IsSubclassOf(typeof(ConfigurationCategory)))
+                    {
+                        foreach (var metadata in GetConfigurationEntryMetadataFor(configurationProperty, configurationPropertyType))
+                            yield return metadata;
+
+                        yield break;
+                    }
+
+                    if (configurationProperty.GetCustomAttributes<ConfigurationEntryAttribute>(inherit: true).Any() == false)
+                        continue;
+
+                    yield return new ConfigurationEntryMetadata(configurationCategoryProperty, configurationProperty);
+                }
+            }
         });
 
         public static bool ContainsKey(string key)
@@ -490,7 +508,6 @@ namespace Raven.Server.Config
                     {
                         if (createdDirectory != null)
                         {
-                            Interlocked.Decrement(ref _pathCounter);
                             IOExtensions.DeleteDirectory(createdDirectory);
                         }
                     }

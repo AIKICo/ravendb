@@ -32,6 +32,8 @@ namespace Raven.Server.NotificationCenter
             _config = config;
             Options = new NotificationCenterOptions();
             Paging = new Paging(this, _notificationsStorage, database);
+            ConflictRevisionsExceeded = new ConflictRevisionsExceeded(this, _notificationsStorage, database);
+            TombstoneNotifications = new TombstoneNotifications(this, _notificationsStorage, database);
             Indexing = new Indexing(this, _notificationsStorage, database);
             RequestLatency = new RequestLatency(this, _notificationsStorage, database);
             EtlNotifications = new EtlNotifications(this, _notificationsStorage, _database);
@@ -58,6 +60,8 @@ namespace Raven.Server.NotificationCenter
         public Task<NotificationCenter> InitializeTask => _initializeTaskSource.Task;
         
         public readonly Paging Paging;
+        public readonly ConflictRevisionsExceeded ConflictRevisionsExceeded;
+        public readonly TombstoneNotifications TombstoneNotifications;
         public readonly Indexing Indexing;
         public readonly RequestLatency RequestLatency;
         public readonly EtlNotifications EtlNotifications;
@@ -192,6 +196,7 @@ namespace Raven.Server.NotificationCenter
         public new void Dispose()
         {
             Paging?.Dispose();
+            ConflictRevisionsExceeded?.Dispose();
             Indexing?.Dispose();
             RequestLatency?.Dispose();
             SlowWrites?.Dispose();

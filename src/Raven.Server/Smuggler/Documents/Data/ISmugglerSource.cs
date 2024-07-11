@@ -52,11 +52,14 @@ namespace Raven.Server.Smuggler.Documents.Data
 
         IAsyncEnumerable<(string Hub, ReplicationHubAccess Access)> GetReplicationHubCertificatesAsync();
 
-        IAsyncEnumerable<TimeSeriesItem> GetTimeSeriesAsync(List<string> collectionsToExport);
+        IAsyncEnumerable<TimeSeriesItem> GetTimeSeriesAsync(ITimeSeriesActions action, List<string> collectionsToExport);
 
         Task<long> SkipTypeAsync(DatabaseItemType type, Action<long> onSkipped, CancellationToken token);
 
         SmugglerSourceType GetSourceType();
+
+        IAsyncEnumerable<TimeSeriesDeletedRangeItemForSmuggler> GetTimeSeriesDeletedRangesAsync(ITimeSeriesActions action, List<string> collectionsToExport);
+
     }
 
     public enum SmugglerSourceType

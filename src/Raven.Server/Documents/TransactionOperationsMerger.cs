@@ -18,12 +18,10 @@ using Sparrow.Json;
 using Sparrow.Json.Sync;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
-using Sparrow.Server.Json.Sync;
 using Sparrow.Server.Meters;
 using Sparrow.Server.Utils;
 using Sparrow.Utils;
 using Voron;
-using Voron.Debugging;
 using Voron.Global;
 using Voron.Impl;
 
@@ -73,7 +71,7 @@ namespace Raven.Server.Documents
 
         public void Start()
         {
-            _txLongRunningOperation = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => MergeOperationThreadProc(), null, TransactionMergerThreadName);
+            _txLongRunningOperation = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => MergeOperationThreadProc(), null, ThreadNames.ForTransactionMerging(TransactionMergerThreadName, _parent.Name));
         }
 
         public interface IRecordableCommand
@@ -115,8 +113,7 @@ namespace Raven.Server.Documents
         }
 
         /// <summary>
-        /// Enqueue the command to be eventually executed. If the command implements
-        ///  IDisposable, the command will be disposed after it is run and a tx is committed.
+        /// Enqueue the command to be eventually executed.
         /// </summary>
         public async Task Enqueue(MergedTransactionCommand cmd)
         {
@@ -142,6 +139,11 @@ namespace Raven.Server.Documents
                     // Expected: "Invalid attempt made to decrement the event's count below zero."
                 }
             }
+        }
+
+        public void EnqueueSync(MergedTransactionCommand cmd)
+        {
+            Enqueue(cmd).GetAwaiter().GetResult();
         }
 
         private static void ThrowTxMergerWasDisposed()
@@ -557,12 +559,9 @@ namespace Raven.Server.Documents
                         case PendingOperations.CompletedAll:
                             try
                             {
-                                tx.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
-
                                 _recording.State?.TryRecord(context, TxInstruction.Commit);
                                 tx.Commit();
 
-                                SlowWriteNotification.Notify(stats, _parent);
                                 _recording.State?.TryRecord(context, TxInstruction.DisposeTx, tx.Disposed == false);
                                 tx.Dispose();
                             }
@@ -666,10 +665,9 @@ namespace Raven.Server.Documents
                         _log.Info($"BeginAsyncCommit on {previous.Transaction.InnerTransaction.LowLevelTransaction.Id} with {_operations.Count} additional operations pending");
 
                     currentReturnContext = _parent.DocumentsStorage.ContextPool.AllocateOperationContext(out current);
-                    CommitStats commitStats = null;
+
                     try
                     {
-                        previous.Transaction.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out commitStats);
                         _recording.State?.TryRecord(current, TxInstruction.BeginAsyncCommitAndStartNewTransaction);
                         current.Transaction = previous.Transaction.BeginAsyncCommitAndStartNewTransaction(current);
                     }
@@ -686,7 +684,7 @@ namespace Raven.Server.Documents
                             try
                             {
                                 //already throwing, attempt to complete previous tx
-                                CompletePreviousTransaction(previous, previous.Transaction, commitStats, ref previousPendingOps, throwOnError: false);
+                                CompletePreviousTransaction(previous, previous.Transaction, ref previousPendingOps, throwOnError: false);
                             }
                             finally
                             {
@@ -716,7 +714,7 @@ namespace Raven.Server.Documents
                             transactionMeter.Dispose();
                         }
                         calledCompletePreviousTx = true;
-                        CompletePreviousTransaction(previous, previous.Transaction, commitStats, ref previousPendingOps, throwOnError: true);
+                        CompletePreviousTransaction(previous, previous.Transaction, ref previousPendingOps, throwOnError: true);
                     }
                     catch (Exception e)
                     {
@@ -728,7 +726,6 @@ namespace Raven.Server.Documents
                                 CompletePreviousTransaction(
                                     previous,
                                     previous.Transaction,
-                                    commitStats,
                                     ref previousPendingOps,
                                     // if this previous threw, it won't throw again
                                     throwOnError: false);
@@ -775,11 +772,8 @@ namespace Raven.Server.Documents
                         case PendingOperations.CompletedAll:
                             try
                             {
-                                previous.Transaction.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
                                 _recording.State?.TryRecord(current, TxInstruction.Commit);
                                 previous.Transaction.Commit();
-
-                                SlowWriteNotification.Notify(stats, _parent);
                             }
                             catch (Exception e)
                             {
@@ -803,7 +797,7 @@ namespace Raven.Server.Documents
             }
             catch
             {
-                if (current.Transaction != null)
+                if (current?.Transaction != null)
                 {
                     _recording.State?.TryRecord(current, TxInstruction.DisposeTx, current.Transaction.Disposed == false);
                     current.Transaction.Dispose();
@@ -816,7 +810,6 @@ namespace Raven.Server.Documents
         private void CompletePreviousTransaction(
             DocumentsOperationContext context,
             RavenTransaction previous,
-            CommitStats commitStats,
             ref List<MergedTransactionCommand> previousPendingOps,
             bool throwOnError)
         {
@@ -824,12 +817,6 @@ namespace Raven.Server.Documents
             {
                 _recording.State?.TryRecord(context, TxInstruction.EndAsyncCommit);
                 previous.EndAsyncCommit();
-
-                //not sure about this 'if'
-                if (commitStats != null)
-                {
-                    SlowWriteNotification.Notify(commitStats, _parent);
-                }
 
                 if (_log.IsInfoEnabled)
                     _log.Info($"EndAsyncCommit on {previous.InnerTransaction.LowLevelTransaction.Id}");
@@ -895,7 +882,7 @@ namespace Raven.Server.Documents
                         $"Operation was cancelled by the transaction merger for transaction #{llt.Id} due to high dirty memory in scratch files." +
                         $" This might be caused by a slow IO storage. Current memory usage: " +
                         $"Total Physical Memory: {MemoryInformation.TotalPhysicalMemory}, " +
-                        $"Total Scratch Allocated Memory: {new Size(dirtyMemoryState.TotalDirtyInBytes, SizeUnit.Bytes)} " +
+                        $"Total Scratch Allocated Memory: {dirtyMemoryState.TotalDirty} " +
                         $"(which is above {_parent.Configuration.Memory.TemporaryDirtyMemoryAllowedPercentage * 100}%)");
                 }
 
@@ -1091,11 +1078,8 @@ namespace Raven.Server.Documents
 
                                     op.Execute(context, _recording.State);
 
-                                    tx.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
-
                                     _recording.State?.TryRecord(context, TxInstruction.Commit);
                                     tx.Commit();
-                                    SlowWriteNotification.Notify(stats, _parent);
                                 }
                             }
 

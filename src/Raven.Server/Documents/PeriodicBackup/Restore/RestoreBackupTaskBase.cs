@@ -10,8 +10,9 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Smuggler;
-using Raven.Client.Extensions;
+using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Http;
+using Raven.Client.Json.Serialization;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
@@ -24,6 +25,7 @@ using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Commands.Indexes;
+using Raven.Server.ServerWide.Commands.Subscriptions;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents;
 using Raven.Server.Smuggler.Documents.Data;
@@ -37,7 +39,11 @@ using Voron.Data.Tables;
 using Voron.Impl.Backup;
 using Voron.Util.Settings;
 using BackupUtils = Raven.Client.Documents.Smuggler.BackupUtils;
+using RavenServerBackupUtils = Raven.Server.Utils.BackupUtils;
 using Index = Raven.Server.Documents.Indexes.Index;
+using Sparrow;
+using Sparrow.Server.Exceptions;
+using Sparrow.Server.Utils;
 
 namespace Raven.Server.Documents.PeriodicBackup.Restore
 {
@@ -50,6 +56,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
         private readonly OperationCancelToken _operationCancelToken;
         private bool _hasEncryptionKey;
         private readonly bool _restoringToDefaultDataDirectory;
+        private ZipArchive _zipArchiveForSnapshot;
 
         public RestoreBackupConfigurationBase RestoreFromConfiguration { get; }
 
@@ -123,10 +130,10 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
 
         protected async Task<Stream> CopyRemoteStreamLocally(Stream stream)
         {
-            return await CopyRemoteStreamLocally(stream, _serverStore.Configuration.Storage.TempPath);
+            return await CopyRemoteStreamLocally(stream, _serverStore.Configuration);
         }
 
-        public static async Task<Stream> CopyRemoteStreamLocally(Stream stream, PathSetting tempPath)
+        public static async Task<Stream> CopyRemoteStreamLocally(Stream stream, RavenConfiguration configuration)
         {
             if (stream.CanSeek)
                 return stream;
@@ -134,10 +141,13 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             // This is meant to be used by ZipArchive, which will copy the data locally because is *must* be seekable.
             // To avoid reading everything to memory, we copy to a local file instead. Note that this also ensure that we
             // can process files > 2GB in size. https://github.com/dotnet/runtime/issues/59027
-            var basePath = tempPath?.FullPath ?? Path.GetTempPath();
-            var filePath = Path.Combine(basePath, $"{Guid.NewGuid()}.restore-local-file");
+
+            var filePath = RavenServerBackupUtils.GetBackupTempPath(configuration, $"{Guid.NewGuid()}.snapshot-restore", out PathSetting basePath).FullPath;
+            IOExtensions.CreateDirectory(basePath.FullPath);
             var file = SafeFileStream.Create(filePath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read,
                 32 * 1024, FileOptions.DeleteOnClose);
+
+            AssertFreeSpace(stream, basePath.FullPath);
 
             try
             {
@@ -163,7 +173,38 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
 
                 throw;
             }
+        }
 
+        private static void AssertFreeSpace(Stream stream, string basePath)
+        {
+            long streamLength;
+
+            try
+            {
+                streamLength = stream.Length;
+            }
+            catch (NotSupportedException)
+            {
+                // nothing we can do
+                return;
+            }
+
+            var spaceInfo = DiskUtils.GetDiskSpaceInfo(basePath);
+            if (spaceInfo == null)
+            {
+                if (Logger.IsInfoEnabled)
+                    Logger.Info($"Failed to get space info for '{basePath}'");
+
+                return;
+            }
+
+            // + we need to download the snapshot
+            // + leave 1GB of free space
+            var freeSpaceNeeded = new Sparrow.Size(streamLength, SizeUnit.Bytes) + new Sparrow.Size(1, SizeUnit.Gigabytes);
+
+            if (freeSpaceNeeded > spaceInfo.TotalFreeSpace)
+                throw new DiskFullException($"There is not enough space on '{basePath}', we need at least {freeSpaceNeeded} in order to successfully copy the snapshot backup file locally. " +
+                                            $"Currently available space is {spaceInfo.TotalFreeSpace}.");
         }
 
         protected abstract Task<Stream> GetStream(string path);
@@ -173,8 +214,6 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
         protected abstract Task<List<string>> GetFilesForRestore();
 
         protected abstract string GetBackupPath(string smugglerFile);
-
-        protected abstract string GetSmugglerBackupPath(string smugglerFile);
 
         protected abstract string GetBackupLocation();
 
@@ -296,15 +335,21 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                         databaseRecord.DatabaseState = DatabaseStateStatus.RestoreInProgress;
 
                         await SaveDatabaseRecordAsync(databaseName, databaseRecord, restoreSettings.DatabaseValues, result, onProgress);
+                        _serverStore.ForTestingPurposes?.RestoreDatabaseAfterSavingDatabaseRecord?.Invoke();
                         database.ClusterTransactionId = databaseRecord.Topology.ClusterTransactionIdBase64;
                         database.DatabaseGroupId = databaseRecord.Topology.DatabaseTopologyIdBase64;
 
+                        database.TxMerger.Start();
+
+                        result.Files.FileCount = filesToRestore.Count + (snapshotRestore ? 1 : 0);
+                        
                         using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                         {
                             if (snapshotRestore)
                             {
-                                await RestoreFromSmugglerFile(onProgress, database, firstFile, context);
-                                await SmugglerRestore(database, filesToRestore, context, databaseRecord, onProgress, result);
+                                await RestoreFromSmugglerFile(onProgress, database, firstFile, context, result);
+                                await HandleSubscriptionFromSnapshot(filesToRestore, restoreSettings.Subscriptions, databaseName, database);
+                                await SmugglerRestore(database, filesToRestore, context, databaseRecord, onProgress, result, new SnapshotDatabaseDestination(database, restoreSettings.Subscriptions));
 
                                 result.SnapshotRestore.Processed = true;
 
@@ -332,12 +377,12 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                             }
                             else
                             {
-                                await SmugglerRestore(database, filesToRestore, context, databaseRecord, onProgress, result);
+                                await SmugglerRestore(database, filesToRestore, context, databaseRecord, onProgress, result, new DatabaseDestination(database));
                             }
 
                             DisableOngoingTasksIfNeeded(databaseRecord);
 
-                            Raven.Server.Smuggler.Documents.DatabaseSmuggler.EnsureProcessed(result, skipped: false);
+                            Raven.Server.Smuggler.Documents.DatabaseSmuggler.EnsureProcessed(result, skipped: false, indexesSkipped: result.Indexes.Skipped);
 
                             onProgress.Invoke(result.Progress);
                         }
@@ -435,7 +480,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     Index index = null;
                     try
                     {
-                        index = Index.Open(indexPath, database, generateNewDatabaseId: true);
+                        index = Index.Open(indexPath, database, generateNewDatabaseId: true, out _);
                     }
                     catch (Exception e)
                     {
@@ -449,56 +494,66 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             }
         }
 
+        private static void RemoveSubscriptionFromDatabaseValues(RestoreSettings restoreSettings)
+        {
+            foreach (var keyValue in restoreSettings.DatabaseValues)
+            {
+                if (keyValue.Key.StartsWith(SubscriptionState.Prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    var subscriptionState = JsonDeserializationClient.SubscriptionState(keyValue.Value);
+                    restoreSettings.Subscriptions.Add(keyValue.Key, subscriptionState);
+                }
+            }
+
+            foreach (var keyValue in restoreSettings.Subscriptions)
+            {
+                restoreSettings.DatabaseValues.Remove(keyValue.Key);
+            }
+        }
+
+        private static async Task HandleSubscriptionFromSnapshot(List<string> filesToRestore, Dictionary<string, SubscriptionState> subscription, 
+            string databaseName, DocumentDatabase database)
+        {
+            //When dealing with multiple files, we will manage subscriptions using the smuggler.
+            if (filesToRestore.Count > 0)
+                return;
+
+            foreach (var (name, state) in subscription)
+            {
+                var command = new PutSubscriptionCommand(databaseName, state.Query, state.MentorNode, RaftIdGenerator.DontCareId)
+                {
+                    Disabled = state.Disabled,
+                    InitialChangeVector = state.ChangeVectorForNextBatchStartingPoint,
+                };
+                //There's no need to wait for the execution of this command at this point since we will wait for subsequent commands later.
+                await database.ServerStore.SendToLeaderAsync(command);
+            }
+        }
+
         private async Task SaveDatabaseRecordAsync(string databaseName, DatabaseRecord databaseRecord, Dictionary<string,
-            BlittableJsonReaderObject> databaseValues, RestoreResult restoreResult, Action<IOperationProgress> onProgress)
+            BlittableJsonReaderObject> databaseValues, SmugglerResult restoreResult, Action<IOperationProgress> onProgress)
         {
             // at this point we restored a large portion of the database or all of it	
             // we'll retry saving the database record since a failure here will cause us to abort the entire restore operation	
 
-            var index = await RunWithRetries(async () =>
+            var index = await BackupHelper.RunWithRetriesAsync(maxRetries: 10, async () =>
                 {
                     var result = await _serverStore.WriteDatabaseRecordAsync(
                         databaseName, databaseRecord, null, RaftIdGenerator.NewId(), databaseValues, isRestore: true);
                     return result.Index;
                 },
-                "Saving the database record",
-                "Failed to save the database record, the restore is aborted");
+                infoMessage: "Saving the database record",
+                errorMessage: "Failed to save the database record, the restore is aborted",
+                restoreResult, onProgress, _operationCancelToken);
 
-            await RunWithRetries(async () =>
+            await BackupHelper.RunWithRetriesAsync(maxRetries: 10, async () =>
                 {
                     await _serverStore.Cluster.WaitForIndexNotification(index, TimeSpan.FromSeconds(30));
                     return index;
                 },
-                $"Verifying that the change to the database record propagated to node {_serverStore.NodeTag}",
-                $"Failed to verify that the change to the database record was propagated to node {_serverStore.NodeTag}, the restore is aborted");
-
-            async Task<long> RunWithRetries(Func<Task<long>> action, string infoMessage, string errorMessage)
-            {
-                const int maxRetries = 10;
-                var retries = 0;
-
-                while (true)
-                {
-                    try
-                    {
-                        _operationCancelToken.Token.ThrowIfCancellationRequested();
-
-                        restoreResult.AddInfo(infoMessage);
-                        onProgress.Invoke(restoreResult.Progress);
-
-                        return await action();
-                    }
-                    catch (TimeoutException)
-                    {
-                        if (++retries < maxRetries)
-                            continue;
-
-                        restoreResult.AddError(errorMessage);
-                        onProgress.Invoke(restoreResult.Progress);
-                        throw;
-                    }
-                }
-            }
+                infoMessage: $"Verifying that the change to the database record propagated to node {_serverStore.NodeTag}",
+                errorMessage: $"Failed to verify that the change to the database record was propagated to node {_serverStore.NodeTag}, the restore is aborted",
+                restoreResult, onProgress, _operationCancelToken);
         }
 
         private async Task<List<string>> GetOrderedFilesToRestore()
@@ -536,90 +591,94 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             RestoreSettings restoreSettings = null;
 
             var fullBackupPath = GetBackupPath(backupPath);
-            using (var zip = await GetZipArchiveForSnapshot(fullBackupPath))
+            _zipArchiveForSnapshot = await GetZipArchiveForSnapshot(fullBackupPath);
+
+            var restorePath = new VoronPathSetting(RestoreFromConfiguration.DataDirectory);
+            if (Directory.Exists(restorePath.FullPath) == false)
+                Directory.CreateDirectory(restorePath.FullPath);
+
+            // validate free space
+            var snapshotSize = _zipArchiveForSnapshot.Entries.Sum(entry => entry.Length);
+            BackupHelper.AssertFreeSpaceForSnapshot(restorePath.FullPath, snapshotSize, "restore a backup", Logger);
+
+            foreach (var zipEntries in _zipArchiveForSnapshot.Entries.GroupBy(x => x.FullName.Substring(0, x.FullName.Length - x.Name.Length)))
             {
-                var restorePath = new VoronPathSetting(RestoreFromConfiguration.DataDirectory);
-                if (Directory.Exists(restorePath.FullPath) == false)
-                    Directory.CreateDirectory(restorePath.FullPath);
+                var directory = zipEntries.Key;
 
-                // validate free space
-                var snapshotSize = zip.Entries.Sum(entry => entry.Length);
-                BackupHelper.AssertFreeSpaceForSnapshot(restorePath.FullPath, snapshotSize, "restore a backup", Logger);
-
-                foreach (var zipEntries in zip.Entries.GroupBy(x => x.FullName.Substring(0, x.FullName.Length - x.Name.Length)))
+                if (string.IsNullOrWhiteSpace(directory))
                 {
-                    var directory = zipEntries.Key;
-
-                    if (string.IsNullOrWhiteSpace(directory))
+                    foreach (var zipEntry in zipEntries)
                     {
-                        foreach (var zipEntry in zipEntries)
+                        if (string.Equals(zipEntry.Name, RestoreSettings.SettingsFileName, StringComparison.OrdinalIgnoreCase))
                         {
-                            if (string.Equals(zipEntry.Name, RestoreSettings.SettingsFileName, StringComparison.OrdinalIgnoreCase))
+                            await using (var entryStream = zipEntry.Open())
                             {
-                                await using (var entryStream = zipEntry.Open())
+                                var snapshotEncryptionKey = RestoreFromConfiguration.EncryptionKey != null
+                                    ? Convert.FromBase64String(RestoreFromConfiguration.EncryptionKey)
+                                    : null;
+
+                                await using (var decompressionStream = FullBackup.GetDecompressionStream(entryStream))
+                                await using (var stream = await GetInputStreamAsync(decompressionStream, snapshotEncryptionKey))
                                 {
-                                    var snapshotEncryptionKey = RestoreFromConfiguration.EncryptionKey != null
-                                        ? Convert.FromBase64String(RestoreFromConfiguration.EncryptionKey)
-                                        : null;
+                                    var json = await context.ReadForMemoryAsync(stream, "read database settings for restore");
+                                    json.BlittableValidation();
 
-                                    await using (var stream = GetInputStream(entryStream, snapshotEncryptionKey))
-                                    {
-                                        var json = await context.ReadForMemoryAsync(stream, "read database settings for restore");
-                                        json.BlittableValidation();
+                                    restoreSettings = JsonDeserializationServer.RestoreSettings(json);
+                                    // It's necessary to modify the subscriptionId to prevent collisions with the current database index.
+                                    //we will handle subscription with smuggler
+                                    RemoveSubscriptionFromDatabaseValues(restoreSettings);
+                                    restoreSettings.DatabaseRecord.DatabaseName = RestoreFromConfiguration.DatabaseName;
+                                    DatabaseHelper.Validate(RestoreFromConfiguration.DatabaseName, restoreSettings.DatabaseRecord, _serverStore.Configuration);
 
-                                        restoreSettings = JsonDeserializationServer.RestoreSettings(json);
+                                    if (restoreSettings.DatabaseRecord.Encrypted && _hasEncryptionKey == false)
+                                        throw new ArgumentException("Database snapshot is encrypted but the encryption key is missing!");
 
-                                        restoreSettings.DatabaseRecord.DatabaseName = RestoreFromConfiguration.DatabaseName;
-                                        DatabaseHelper.Validate(RestoreFromConfiguration.DatabaseName, restoreSettings.DatabaseRecord, _serverStore.Configuration);
-
-                                        if (restoreSettings.DatabaseRecord.Encrypted && _hasEncryptionKey == false)
-                                            throw new ArgumentException("Database snapshot is encrypted but the encryption key is missing!");
-
-                                        if (restoreSettings.DatabaseRecord.Encrypted == false && _hasEncryptionKey)
-                                            throw new ArgumentException("Cannot encrypt a non encrypted snapshot backup during restore!");
-                                    }
+                                    if (restoreSettings.DatabaseRecord.Encrypted == false && _hasEncryptionKey)
+                                        throw new ArgumentException("Cannot encrypt a non encrypted snapshot backup during restore!");
                                 }
                             }
                         }
-
-                        continue;
                     }
 
-                    var restoreDirectory = directory.StartsWith(Constants.Documents.PeriodicBackup.Folders.Documents, StringComparison.OrdinalIgnoreCase)
-                        ? restorePath
-                        : restorePath.Combine(directory);
-
-                    var isSubDirectory = PathUtil.IsSubDirectory(restoreDirectory.FullPath, restorePath.FullPath);
-                    if (isSubDirectory == false)
-                    {
-                        var extensions = zipEntries
-                            .Select(x => Path.GetExtension(x.Name))
-                            .Distinct()
-                            .ToArray();
-
-                        if (extensions.Length != 1 || string.Equals(extensions[0], TableValueCompressor.CompressionRecoveryExtension, StringComparison.OrdinalIgnoreCase) == false)
-                            throw new InvalidOperationException($"Encountered invalid directory '{directory}' in snapshot file with following file extensions: {string.Join(", ", extensions)}");
-
-                        // this enables backward compatibility of snapshot backups with compression recovery files before fix was made in RavenDB-17173
-                        // the underlying issue was that we were putting full path when compression recovery files were backed up using snapshot
-                        // because of that the end restore directory was not a sub-directory of a restore path
-                        // which could result in a file already exists exception
-                        // since restoring of compression recovery files is not mandatory then it is safe to skip them
-                        continue;
-                    }
-
-                    BackupMethods.Full.Restore(
-                        zipEntries,
-                        restoreDirectory,
-                        journalDir: null,
-                        onProgress: message =>
-                        {
-                            restoreResult.AddInfo(message);
-                            restoreResult.SnapshotRestore.ReadCount++;
-                            onProgress.Invoke(restoreResult.Progress);
-                        },
-                        cancellationToken: _operationCancelToken.Token);
+                    continue;
                 }
+
+                var restoreDirectory = directory.StartsWith(Constants.Documents.PeriodicBackup.Folders.Documents, StringComparison.OrdinalIgnoreCase)
+                    ? restorePath
+                    : restorePath.Combine(directory);
+
+                var isSubDirectory = PathUtil.IsSubDirectory(restoreDirectory.FullPath, restorePath.FullPath);
+                if (isSubDirectory == false)
+                {
+                    var extensions = zipEntries
+                        .Select(x => Path.GetExtension(x.Name))
+                        .Distinct()
+                        .ToArray();
+
+                    if (extensions.Length != 1 || string.Equals(extensions[0], TableValueCompressor.CompressionRecoveryExtension, StringComparison.OrdinalIgnoreCase) ==
+                        false)
+                        throw new InvalidOperationException(
+                            $"Encountered invalid directory '{directory}' in snapshot file with following file extensions: {string.Join(", ", extensions)}");
+
+                    // this enables backward compatibility of snapshot backups with compression recovery files before fix was made in RavenDB-17173
+                    // the underlying issue was that we were putting full path when compression recovery files were backed up using snapshot
+                    // because of that the end restore directory was not a sub-directory of a restore path
+                    // which could result in a file already exists exception
+                    // since restoring of compression recovery files is not mandatory then it is safe to skip them
+                    continue;
+                }
+
+                BackupMethods.Full.Restore(
+                    zipEntries,
+                    restoreDirectory,
+                    journalDir: null,
+                    onProgress: message =>
+                    {
+                        restoreResult.AddInfo(message);
+                        restoreResult.SnapshotRestore.ReadCount++;
+                        onProgress.Invoke(restoreResult.Progress);
+                    },
+                    cancellationToken: _operationCancelToken.Token);
             }
 
             if (restoreSettings == null)
@@ -629,7 +688,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
         }
 
         protected async Task SmugglerRestore(DocumentDatabase database, List<string> filesToRestore, DocumentsOperationContext context,
-            DatabaseRecord databaseRecord, Action<IOperationProgress> onProgress, RestoreResult result)
+            DatabaseRecord databaseRecord, Action<IOperationProgress> onProgress, RestoreResult result, DatabaseDestination lastFileDestination)
         {
             Debug.Assert(onProgress != null);
 
@@ -663,9 +722,14 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             for (var i = 0; i < filesToRestore.Count - 1; i++)
             {
                 result.AddInfo($"Restoring file {(i + 1):#,#;;0}/{filesToRestore.Count:#,#;;0}");
+
+                var fileName = filesToRestore[i];
+                result.Files.CurrentFileName = fileName;
+                result.Files.CurrentFile++;
+
                 onProgress.Invoke(result.Progress);
 
-                var filePath = GetBackupPath(filesToRestore[i]);
+                var filePath = GetBackupPath(fileName);
                 await ImportSingleBackupFile(database, onProgress, result, filePath, context, destination, options, isLastFile: false,
                     onDatabaseRecordAction: smugglerDatabaseRecord =>
                     {
@@ -675,13 +739,20 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             }
 
             options.OperateOnTypes = oldOperateOnTypes;
-            var lastFilePath = GetBackupPath(filesToRestore.Last());
 
             result.AddInfo($"Restoring file {filesToRestore.Count:#,#;;0}/{filesToRestore.Count:#,#;;0}");
 
+            var lastFileName = filesToRestore.Last();
+            result.Files.CurrentFileName = lastFileName;
+            result.Files.CurrentFile++;
+
+            result.Indexes.Skipped = RestoreFromConfiguration.SkipIndexes;
+
             onProgress.Invoke(result.Progress);
 
-            await ImportSingleBackupFile(database, onProgress, result, lastFilePath, context, destination, options, isLastFile: true,
+            var lastFilePath = GetBackupPath(lastFileName);
+
+            await ImportSingleBackupFile(database, onProgress, result, lastFilePath, context, lastFileDestination, options, isLastFile: true,
                 onIndexAction: indexAndType =>
                 {
                     if (this.RestoreFromConfiguration.SkipIndexes)
@@ -738,31 +809,13 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                     databaseRecord.ElasticSearchConnectionStrings = smugglerDatabaseRecord.ElasticSearchConnectionStrings;
                     databaseRecord.QueueEtls = smugglerDatabaseRecord.QueueEtls;
                     databaseRecord.QueueConnectionStrings = smugglerDatabaseRecord.QueueConnectionStrings;
+                    databaseRecord.IndexesHistory = smugglerDatabaseRecord.IndexesHistory;
 
                     // need to enable revisions before import
                     database.DocumentsStorage.RevisionsStorage.InitializeFromDatabaseRecord(smugglerDatabaseRecord);
                 });
 
-            long totalExecutedCommands = 0;
-
-            //when restoring from a backup, the database doesn't exist yet and we cannot rely on the DocumentDatabase to execute the database cluster transaction commands
-            while (true)
-            {
-                _operationCancelToken.Token.ThrowIfCancellationRequested();
-
-                using (database.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext serverContext))
-                using (serverContext.OpenReadTransaction())
-                {
-                    // the commands are already batched (10k or 16MB), so we are executing only 1 at a time
-                    var executed = await database.ExecuteClusterTransaction(serverContext, batchSize: 1);
-                    if (executed.Count == 0)
-                        break;
-
-                    totalExecutedCommands += executed.Sum(x => x.Commands.Length);
-                    result.AddInfo($"Executed {totalExecutedCommands:#,#;;0} cluster transaction commands.");
-                    onProgress.Invoke(result.Progress);
-                }
-            }
+            result.Files.CurrentFileName = null;
         }
 
         private bool IsDefaultDataDirectory(string dataDirectory, string databaseName)
@@ -878,8 +931,8 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
             Action<DatabaseRecord> onDatabaseRecordAction = null)
         {
             await using (var fileStream = await GetStream(filePath))
-            await using (var inputStream = GetInputStream(fileStream, database.MasterKey))
-            await using (var gzipStream = new GZipStream(inputStream, CompressionMode.Decompress))
+            await using (var inputStream = await GetInputStreamAsync(fileStream, database.MasterKey))
+            await using (var gzipStream = await RavenServerBackupUtils.GetDecompressionStreamAsync(inputStream))
             using (var source = new StreamSource(gzipStream, context, database))
             {
                 var smuggler = new Smuggler.Documents.DatabaseSmuggler(database, source, destination,
@@ -900,7 +953,9 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
         /// <param name="database"></param>
         /// <param name="smugglerFile"></param>
         /// <param name="context"></param>
-        protected async Task RestoreFromSmugglerFile(Action<IOperationProgress> onProgress, DocumentDatabase database, string smugglerFile, DocumentsOperationContext context)
+        /// <param name="result"></param>
+        protected async Task RestoreFromSmugglerFile(Action<IOperationProgress> onProgress, DocumentDatabase database, string smugglerFile,
+            DocumentsOperationContext context, RestoreResult result)
         {
             var destination = new DatabaseDestination(database);
 
@@ -911,51 +966,61 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                 SkipRevisionCreation = true
             };
 
-            var lastPath = GetSmugglerBackupPath(smugglerFile);
+            result.Files.CurrentFileName = smugglerFile; 
+            result.Files.CurrentFile++;
 
-            using (var zip = await GetZipArchiveForSnapshot(lastPath))
+            onProgress.Invoke(result.Progress);
+
+            if (_zipArchiveForSnapshot == null)
+                throw new InvalidOperationException($"Restoring of smuggler values failed because {nameof(_zipArchiveForSnapshot)} is null");
+
+            var entry = _zipArchiveForSnapshot.GetEntry(RestoreSettings.SmugglerValuesFileName);
+            if (entry != null)
             {
-                foreach (var entry in zip.Entries)
+                await using (var input = entry.Open())
+                await using (var inputStream = await GetSnapshotInputStreamAsync(input, database.Name))
+                await using (var uncompressed = await RavenServerBackupUtils.GetDecompressionStreamAsync(inputStream))
                 {
-                    if (entry.Name == RestoreSettings.SmugglerValuesFileName)
+                    var source = new StreamSource(uncompressed, context, database);
+                    var smuggler = new Smuggler.Documents.DatabaseSmuggler(database, source, destination,
+                        database.Time, smugglerOptions, onProgress: onProgress, token: _operationCancelToken.Token)
                     {
-                        await using (var input = entry.Open())
-                        await using (var inputStream = GetSnapshotInputStream(input, database.Name))
-                        await using (var uncompressed = new GZipStream(inputStream, CompressionMode.Decompress))
-                        {
-                            var source = new StreamSource(uncompressed, context, database);
-                            var smuggler = new Smuggler.Documents.DatabaseSmuggler(database, source, destination,
-                                database.Time, smugglerOptions, onProgress: onProgress, token: _operationCancelToken.Token)
-                            {
-                                BackupKind = BackupKind.Incremental
-                            };
+                        BackupKind = BackupKind.Incremental
+                    };
 
-                            await smuggler.ExecuteAsync(ensureStepsProcessed: true, isLastFile: true);
-                        }
-                        break;
-                    }
+                    await smuggler.ExecuteAsync(ensureStepsProcessed: true, isLastFile: true);
                 }
             }
         }
 
-        private Stream GetInputStream(Stream stream, byte[] databaseEncryptionKey)
+        private async Task<Stream> GetInputStreamAsync(Stream stream, byte[] databaseEncryptionKey)
         {
             if (RestoreFromConfiguration.BackupEncryptionSettings == null ||
                 RestoreFromConfiguration.BackupEncryptionSettings.EncryptionMode == EncryptionMode.None)
                 return stream;
+
+            byte[] encryptionKey;
 
             if (RestoreFromConfiguration.BackupEncryptionSettings.EncryptionMode == EncryptionMode.UseDatabaseKey)
             {
                 if (databaseEncryptionKey == null)
                     throw new ArgumentException("Stream is encrypted but the encryption key is missing!");
 
-                return new DecryptingXChaCha20Oly1305Stream(stream, databaseEncryptionKey);
+                encryptionKey = databaseEncryptionKey;
+            }
+            else
+            {
+                encryptionKey = Convert.FromBase64String(RestoreFromConfiguration.BackupEncryptionSettings.Key);
             }
 
-            return new DecryptingXChaCha20Oly1305Stream(stream, Convert.FromBase64String(RestoreFromConfiguration.BackupEncryptionSettings.Key));
+            var decryptingStream = new DecryptingXChaCha20Oly1305Stream(stream, encryptionKey);
+
+            await decryptingStream.InitializeAsync();
+
+            return decryptingStream;
         }
 
-        private Stream GetSnapshotInputStream(Stream fileStream, string database)
+        private async Task<Stream> GetSnapshotInputStreamAsync(Stream fileStream, string database)
         {
             using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
             using (ctx.OpenReadTransaction())
@@ -963,7 +1028,11 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                 var key = _serverStore.GetSecretKey(ctx, database);
                 if (key != null)
                 {
-                    return new DecryptingXChaCha20Oly1305Stream(fileStream, key);
+                    var decryptingStream = new DecryptingXChaCha20Oly1305Stream(fileStream, key);
+
+                    await decryptingStream.InitializeAsync();
+
+                    return decryptingStream;
                 }
             }
 
@@ -981,7 +1050,8 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
 
         protected virtual void Dispose()
         {
-            _operationCancelToken.Dispose();
+            using (_zipArchiveForSnapshot)
+                _operationCancelToken.Dispose();
         }
     }
 }

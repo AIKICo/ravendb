@@ -11,13 +11,15 @@ import getPossibleMentorsCommand = require("commands/database/tasks/getPossibleM
 import connectionStringRavenEtlModel = require("models/database/settings/connectionStringRavenEtlModel");
 import jsonUtil = require("common/jsonUtil");
 import discoveryUrl = require("models/database/settings/discoveryUrl");
+import licenseModel from "models/auth/licenseModel";
 
 class editExternalReplicationTask extends viewModelBase {
 
     view = require("views/database/tasks/editExternalReplicationTask.html");
+    licenseType = licenseModel.licenseStatus().Type; //TODO Get feature availability form API
     connectionStringView = require("views/database/settings/connectionStringRaven.html");
     certificateUploadInfoForOngoingTasks = require("views/partial/certificateUploadInfoForOngoingTasks.html");
-    pinResponsibleNodeButtonsScriptView = require("views/partial/pinResponsibleNodeButtonsScript.html");
+    taskResponsibleNodeSectionView = require("views/partial/taskResponsibleNodeSection.html");
     pinResponsibleNodeTextScriptView = require("views/partial/pinResponsibleNodeTextScript.html");
 
     editedExternalReplication = ko.observable<ongoingTaskReplicationEditModel>();

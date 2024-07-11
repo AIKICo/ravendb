@@ -1,19 +1,20 @@
 ﻿using System;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using Nito.Disposables;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Exceptions;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Documents;
+using Raven.Server.Documents.PeriodicBackup.GoogleCloud;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
 using Tests.Infrastructure;
-using Xunit;
-using Nito.Disposables;
-using Raven.Server.Documents.PeriodicBackup.GoogleCloud;
 using Tests.Infrastructure.Entities;
+using Xunit;
 using Xunit.Abstractions;
 
 namespace SlowTests.Server.Documents.PeriodicBackup.Restore
@@ -27,9 +28,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
         private readonly string _cloudPathPrefix = $"{nameof(RestoreFromGoogleCloud)}-{Guid.NewGuid()}";
 
         [Fact]
-        public async Task restore_google_cloud_settings_tests()
+        public void restore_google_cloud_settings_tests()
         {
-            await using (CleanupAsync())
             using (var store = GetDocumentStore(new Options
             {
                 ModifyDatabaseName = s => $"{s}_2"
@@ -58,7 +58,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             }
         }
 
-        [GoogleCloudFact, Trait("Category", "Smuggler")]
+        [GoogleCloudRetryFact, Trait("Category", "Smuggler")]
         public async Task can_backup_and_restore()
         {
             await using (CleanupAsync())
@@ -74,7 +74,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
                 var googleCloudSettings = GetGoogleCloudSettings();
                 var config = Backup.CreateBackupConfiguration(googleCloudSettings: googleCloudSettings);
                 var backupTaskId = await Backup.UpdateConfigAndRunBackupAsync(Server, config, store);
-                var backupResult = (BackupResult)store.Maintenance.Send(new GetOperationStateOperation(await Backup.GetBackupOperationIdAsync(store, backupTaskId))).Result;
+                var id = await Backup.GetBackupOperationIdAsync(store, backupTaskId);
+                var backupResult = (await store.Maintenance.SendAsync(new GetOperationStateOperation(id))).Result as BackupResult;
                 Assert.NotNull(backupResult);
                 Assert.True(backupResult.Counters.Processed);
                 Assert.Equal(1, backupResult.Counters.ReadCount);
@@ -129,7 +130,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
             }
         }
 
-        [GoogleCloudFact, Trait("Category", "Smuggler")]
+        [GoogleCloudRetryFact, Trait("Category", "Smuggler")]
         public async Task can_backup_and_restore_snapshot()
         {
             await using (CleanupAsync())
@@ -218,7 +219,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
 
         private GoogleCloudSettings GetGoogleCloudSettings(string subPath = null)
         {
-            var testSettings = GoogleCloudFactAttribute.GoogleCloudSettings;
+            var testSettings = GoogleCloudRetryFactAttribute.GoogleCloudSettings;
 
             if (testSettings == null)
                 return null;
@@ -239,33 +240,34 @@ namespace SlowTests.Server.Documents.PeriodicBackup.Restore
         {
             return new AsyncDisposable(async () =>
             {
-            var settings = GetGoogleCloudSettings();
-            if (settings == null)
-                return;
+                var settings = GetGoogleCloudSettings();
+                if (settings == null)
+                    return;
 
-            try
-            {
-                using (var client = new RavenGoogleCloudClient(settings, DefaultConfiguration))
+                try
                 {
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = new RavenGoogleCloudClient(settings, DefaultConfiguration, cancellationToken: cts.Token))
+                    {
                         var cloudObjects = await client.ListObjectsAsync(settings.RemoteFolderName);
 
-                    foreach (var cloudObject in cloudObjects)
-                    {
-                        try
+                        foreach (var cloudObject in cloudObjects)
                         {
+                            try
+                            {
                                 await client.DeleteObjectAsync(cloudObject.Name);
-                        }
-                        catch (Exception)
-                        {
-                            // ignored
+                            }
+                            catch (Exception)
+                            {
+                                // ignored
+                            }
                         }
                     }
                 }
-            }
-            catch (Exception)
-            {
-                // ignored
-            }
+                catch (Exception)
+                {
+                    // ignored
+                }
             });
         }
     }

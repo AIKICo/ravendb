@@ -88,6 +88,10 @@
                                 <input id="importDocumentsTombstones" type="checkbox" data-bind="checked: includeDocumentsTombstones" />
                                 <label for="importDocumentsTombstones" class="margin-right margin-right-sm">Include Documents Tombstones</label>
                             </div>
+                            <div class="toggle">
+                                <input id="importTimeSeriesDeletedRanges" type="checkbox" data-bind="checked: includeTimeSeriesDeletedRanges" />
+                                <label for="importTimeSeriesDeletedRanges" class="margin-right margin-right-sm">Include Time Series Deleted Ranges</label>
+                            </div>
                         </div>
                     </div>
                     <div class="col-lg-5">
@@ -99,7 +103,13 @@
                             </div>
                             <div class="margin-left margin-left-lg">
                                 <div class="toggle">
-                                    <input id="importAnalyzers" type="checkbox" data-bind="checked: removeAnalyzers" />
+                                    <input id="toggleIndexHistory" type="checkbox"
+                                           data-bind="checked: databaseModel.includeIndexHistory, enable: includeIndexes" />
+                                    <label for="toggleIndexHistory">Include Index History</label>
+                                </div>
+                                <div class="toggle">
+                                    <input id="importAnalyzers" type="checkbox"
+                                           data-bind="checked: removeAnalyzers, enable: includeIndexes" />
                                     <label for="importAnalyzers">Remove Analyzers</label>
                                 </div>
                             </div>
@@ -165,6 +175,37 @@
                 <h3>Advanced</h3>
                 <div class="margin-left margin-left-lg">
                     <div class="margin-bottom">
+                        <div class="toggle">
+                            <input id="collections" type="checkbox" data-bind="checked: includeAllCollections" />
+                            <label for="collections">Import all collections</label>
+                        </div>
+                        <div data-bind="collapse: !includeAllCollections()">
+                            <div class="row margin-bottom">
+                                <div class="flex-horizontal col-lg-3">
+                                    <input class="form-control" placeholder="Enter a collection" autocomplete="off" data-bind="textInput: $root.inputCollection" />
+                                    <button class="btn btn-info" data-bind="click: $root.addCollection, disable: !$root.inputCollection()">
+                                        <i class="icon-plus"></i><span>Add Collection</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="margin-top margin-bottom" data-bind="visible: includedCollections().length">
+                                <label>
+                                    <strong>Collections Selected:</strong>
+                                </label>
+                                <div class="row">
+                                    <div class="col-lg-3">
+                                        <ul class="well collection-list" data-bind="foreach: includedCollections">
+                                            <li>
+                                                <div class="name" data-bind="text: $data"></div>
+                                                <a title="Remove collection" href="#" data-bind="click: $root.removeCollection">
+                                                    <i class="icon-trash"></i>
+                                                </a>
+                                            </li>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="toggle">
                             <input id="useTransformScript" type="checkbox" data-bind="checked: $root.showTransformScript" />
                             <label for="useTransformScript" class="use-transform-script margin-right margin-right-sm">Use Transform script </label>

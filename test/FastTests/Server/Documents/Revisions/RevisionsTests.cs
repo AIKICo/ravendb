@@ -622,7 +622,7 @@ namespace FastTests.Server.Documents.Revisions
 
                 var db = await Databases.GetDocumentDatabaseInstanceFor(store);
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 for (int i = 0; i < 10; i++)
                 {
@@ -643,7 +643,7 @@ namespace FastTests.Server.Documents.Revisions
                 await RevisionsHelper.SetupRevisions(store, Server.ServerStore, configuration);
 
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 for (int i = 0; i < 10; i++)
                 {
@@ -706,7 +706,7 @@ namespace FastTests.Server.Documents.Revisions
 
                 var db = await Databases.GetDocumentDatabaseInstanceFor(store);
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 for (int i = 0; i < 10; i++)
                 {
@@ -722,7 +722,7 @@ namespace FastTests.Server.Documents.Revisions
                 await RevisionsHelper.SetupRevisions(store, Server.ServerStore, configuration);
 
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 for (int i = 0; i < 10; i++)
                 {
@@ -771,7 +771,7 @@ namespace FastTests.Server.Documents.Revisions
 
                 var db = await Databases.GetDocumentDatabaseInstanceFor(store);
                 using (var token = new OperationCancelToken(db.Configuration.Databases.OperationTimeout.AsTimeSpan, db.DatabaseShutdown, CancellationToken.None))
-                    await db.DocumentsStorage.RevisionsStorage.EnforceConfiguration(_ => { }, token);
+                    await db.DocumentsStorage.RevisionsStorage.EnforceConfigurationAsync(_ => { }, token);
 
                 using (var session = store.OpenAsyncSession())
                 {
@@ -1381,7 +1381,7 @@ namespace FastTests.Server.Documents.Revisions
                 await RevisionsHelper.SetupRevisions(Server.ServerStore, store.Database,
                     modifyConfiguration: configuration => configuration.Collections["Users"].PurgeOnDelete = false);
 
-                var deletedRevisions = await store.Commands().GetRevisionsBinEntriesAsync(long.MaxValue);
+                var deletedRevisions = await store.Commands().GetRevisionsBinEntriesAsync(0);
                 Assert.Equal(0, deletedRevisions.Count());
 
                 var id = "users/1";
@@ -1417,7 +1417,7 @@ namespace FastTests.Server.Documents.Revisions
                 Assert.Equal(useSession ? 1 : 0, statistics.CountOfDocuments);
                 Assert.Equal(4, statistics.CountOfRevisionDocuments);
 
-                deletedRevisions = await store.Commands().GetRevisionsBinEntriesAsync(long.MaxValue);
+                deletedRevisions = await store.Commands().GetRevisionsBinEntriesAsync(0);
                 Assert.Equal(1, deletedRevisions.Count());
 
                 using (var session = store.OpenAsyncSession())

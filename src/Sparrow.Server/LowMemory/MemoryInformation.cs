@@ -10,6 +10,7 @@ using Sparrow.Logging;
 using Sparrow.Platform;
 using Sparrow.Platform.Posix;
 using Sparrow.Platform.Posix.macOS;
+using Sparrow.Server.Platform.Posix;
 using Sparrow.Server.Utils;
 using Sparrow.Utils;
 using NativeMemory = Sparrow.Utils.NativeMemory;
@@ -20,10 +21,6 @@ namespace Sparrow.LowMemory
     {
         private static readonly Logger Logger = LoggingSource.Instance.GetLogger<MemoryInfoResult>("Server");
 
-        private static readonly ConcurrentQueue<Tuple<long, DateTime>> MemByTime = new ConcurrentQueue<Tuple<long, DateTime>>();
-        private static DateTime _memoryRecordsSet;
-        private static readonly TimeSpan MemByTimeThrottleTime = TimeSpan.FromMilliseconds(100);
-
         private static readonly byte[] VmRss = Encoding.UTF8.GetBytes("VmRSS:");
         private static readonly byte[] VmSwap = Encoding.UTF8.GetBytes("VmSwap:");
         private static readonly byte[] MemAvailable = Encoding.UTF8.GetBytes("MemAvailable:");
@@ -31,17 +28,6 @@ namespace Sparrow.LowMemory
         private static readonly byte[] MemTotal = Encoding.UTF8.GetBytes("MemTotal:");
         private static readonly byte[] SwapTotal = Encoding.UTF8.GetBytes("SwapTotal:");
         private static readonly byte[] Committed_AS = Encoding.UTF8.GetBytes("Committed_AS:");
-
-        private const string CgroupMemoryLimit = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
-        private const string CgroupMaxMemoryUsage = "/sys/fs/cgroup/memory/memory.max_usage_in_bytes";
-        private const string CgroupMemoryUsage = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
-
-        public static long HighLastOneMinute;
-        public static long LowLastOneMinute = long.MaxValue;
-        public static long HighLastFiveMinutes;
-        public static long LowLastFiveMinutes = long.MaxValue;
-        public static long HighSinceStartup;
-        public static long LowSinceStartup = long.MaxValue;
 
         private static readonly int ProcessId;
 
@@ -193,7 +179,7 @@ namespace Sparrow.LowMemory
             LowMemoryNotification.Instance.SimulateLowMemoryNotification();
 
             throw new EarlyOutOfMemoryException($"The amount of available memory to commit on the system is low. " +
-                                                MemoryUtils.GetExtendedMemoryInfo(memInfo), memInfo);
+                                                MemoryUtils.GetExtendedMemoryInfo(memInfo, GetDirtyMemoryState()), memInfo);
 
         }
 
@@ -437,7 +423,7 @@ namespace Sparrow.LowMemory
             }
         }
 
-        public static long GetTotalScratchAllocatedMemory()
+        public static long GetTotalScratchAllocatedMemoryInBytes()
         {
             long totalScratchAllocated = 0;
             foreach (var scratchGetAllocated in DirtyMemoryObjects)
@@ -455,26 +441,29 @@ namespace Sparrow.LowMemory
 
             var totalPhysicalMemoryInBytes = fromProcMemInfo.TotalMemory.GetValue(SizeUnit.Bytes);
 
-            var cgroupMemoryLimit = KernelVirtualFileSystemUtils.ReadNumberFromCgroupFile(CgroupMemoryLimit);
-            var cgroupMaxMemoryUsage = KernelVirtualFileSystemUtils.ReadNumberFromCgroupFile(CgroupMaxMemoryUsage);
+            var cgroupMemoryLimit = CGroupHelper.CGroup.GetPhysicalMemoryLimit();
+            var cgroupMaxMemoryUsage = CGroupHelper.CGroup.GetMaxMemoryUsage();
             // here we need to deal with _soft_ limit, so we'll take the largest of these values
             var maxMemoryUsage = Math.Max(cgroupMemoryLimit ?? 0, cgroupMaxMemoryUsage ?? 0);
-            if (maxMemoryUsage != 0 && maxMemoryUsage <= totalPhysicalMemoryInBytes)
+            var constrainedByCgroups = maxMemoryUsage != 0 && maxMemoryUsage <= totalPhysicalMemoryInBytes;
+            if (constrainedByCgroups)
             {
                 // running in a limited cgroup
                 var commitedMemoryInBytes = 0L;
                 var cgroupMemoryUsage = LowMemoryNotification.Instance.UseTotalDirtyMemInsteadOfMemUsage // RDBS-45
                     ? fromProcMemInfo.TotalDirty.GetValue(SizeUnit.Bytes)
-                    : KernelVirtualFileSystemUtils.ReadNumberFromCgroupFile(CgroupMemoryUsage);
+                    : CGroupHelper.CGroup.GetPhysicalMemoryUsage();
 
                 if (cgroupMemoryUsage != null)
                 {
                     commitedMemoryInBytes = cgroupMemoryUsage.Value;
                     fromProcMemInfo.Commited.Set(commitedMemoryInBytes, SizeUnit.Bytes);
-                    fromProcMemInfo.AvailableMemory.Set(maxMemoryUsage - cgroupMemoryUsage.Value, SizeUnit.Bytes);
+                    var availableMemory = Math.Min(maxMemoryUsage - cgroupMemoryUsage.Value, fromProcMemInfo.AvailableMemory.GetValue(SizeUnit.Bytes));
+                    fromProcMemInfo.AvailableMemory.Set(availableMemory, SizeUnit.Bytes);
                     var realAvailable = maxMemoryUsage - cgroupMemoryUsage.Value + fromProcMemInfo.SharedCleanMemory.GetValue(SizeUnit.Bytes);
                     if (realAvailable < 0)
                         realAvailable = 0;
+                    realAvailable = Math.Min(realAvailable, fromProcMemInfo.AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes));
                     fromProcMemInfo.AvailableMemoryForProcessing.Set(realAvailable, SizeUnit.Bytes);
                 }
 
@@ -493,8 +482,6 @@ namespace Sparrow.LowMemory
                 swapUsage.Set(procStatus.Swap, SizeUnit.Bytes);
             }
 
-            SetMemoryRecords(fromProcMemInfo.AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes));
-
             return new MemoryInfoResult
             {
                 TotalCommittableMemory = fromProcMemInfo.CommitLimit,
@@ -512,7 +499,7 @@ namespace Sparrow.LowMemory
                 WorkingSetSwapUsage = fromProcMemInfo.WorkingSetSwap,
                 
                 IsExtended = extended,
-                Remarks = maxMemoryUsage != 0 ? "Memory constrained by cgroups limits" :  null
+                Remarks = constrainedByCgroups ? "Memory constrained by cgroups limits" :  null
             };
         }
 
@@ -572,8 +559,6 @@ namespace Sparrow.LowMemory
 
             var availableMemoryForProcessing = availableMemory; // mac (unlike other linux distros) does calculate accurate available memory
             var workingSet = new Size(process?.WorkingSet64 ?? 0, SizeUnit.Bytes);
-
-            SetMemoryRecords(availableMemoryForProcessing.GetValue(SizeUnit.Bytes));
 
             return new MemoryInfoResult
             {
@@ -674,8 +659,6 @@ namespace Sparrow.LowMemory
                     remarks = "Memory limited by Job Object limits";
                 }
             }
-            
-            SetMemoryRecords(availableMemoryForProcessingInBytes);
 
             return new MemoryInfoResult
             {
@@ -744,25 +727,6 @@ namespace Sparrow.LowMemory
             return totalMapped;
         }
 
-        public static MemoryInfoResult.MemoryUsageLowHigh GetMemoryUsageRecords()
-        {
-            return new MemoryInfoResult.MemoryUsageLowHigh
-            {
-                High = new MemoryInfoResult.MemoryUsageIntervals
-                {
-                    LastOneMinute = new Size(HighLastOneMinute, SizeUnit.Bytes),
-                    LastFiveMinutes = new Size(HighLastFiveMinutes, SizeUnit.Bytes),
-                    SinceStartup = new Size(HighSinceStartup, SizeUnit.Bytes)
-                },
-                Low = new MemoryInfoResult.MemoryUsageIntervals
-                {
-                    LastOneMinute = new Size(LowLastOneMinute, SizeUnit.Bytes),
-                    LastFiveMinutes = new Size(LowLastFiveMinutes, SizeUnit.Bytes),
-                    SinceStartup = new Size(LowSinceStartup, SizeUnit.Bytes)
-                }
-            };
-        }
-
         public static long GetWorkingSetInBytes()
         {
             if (PlatformDetails.RunningOnLinux)
@@ -774,64 +738,15 @@ namespace Sparrow.LowMemory
             }
         }
 
-        private static void SetMemoryRecords(long availableMemoryForProcessingInBytes)
-        {
-            var now = DateTime.UtcNow;
-
-            if (HighSinceStartup < availableMemoryForProcessingInBytes)
-                HighSinceStartup = availableMemoryForProcessingInBytes;
-            if (LowSinceStartup > availableMemoryForProcessingInBytes)
-                LowSinceStartup = availableMemoryForProcessingInBytes;
-
-            while (MemByTime.TryPeek(out var existing) &&
-                   (now - existing.Item2) > TimeSpan.FromMinutes(5))
-            {
-                if (MemByTime.TryDequeue(out _) == false)
-                    break;
-            }
-
-            if (now - _memoryRecordsSet < MemByTimeThrottleTime)
-                return;
-
-            _memoryRecordsSet = now;
-
-            MemByTime.Enqueue(new Tuple<long, DateTime>(availableMemoryForProcessingInBytes, now));
-
-            long highLastOneMinute = 0;
-            long lowLastOneMinute = long.MaxValue;
-            long highLastFiveMinutes = 0;
-            long lowLastFiveMinutes = long.MaxValue;
-
-            foreach (var item in MemByTime)
-            {
-                if (now - item.Item2 < TimeSpan.FromMinutes(1))
-                {
-                    if (highLastOneMinute < item.Item1)
-                        highLastOneMinute = item.Item1;
-                    if (lowLastOneMinute > item.Item1)
-                        lowLastOneMinute = item.Item1;
-                }
-                if (highLastFiveMinutes < item.Item1)
-                    highLastFiveMinutes = item.Item1;
-                if (lowLastFiveMinutes > item.Item1)
-                    lowLastFiveMinutes = item.Item1;
-            }
-
-            HighLastOneMinute = highLastOneMinute;
-            LowLastOneMinute = lowLastOneMinute;
-            HighLastFiveMinutes = highLastFiveMinutes;
-            LowLastFiveMinutes = lowLastFiveMinutes;
-        }
-
         public static DirtyMemoryState GetDirtyMemoryState()
         {
-            var totalScratchMemory = GetTotalScratchAllocatedMemory();
+            var totalScratchMemory = new Size(GetTotalScratchAllocatedMemoryInBytes(), SizeUnit.Bytes);
 
             return new DirtyMemoryState
             {
-                IsHighDirty = totalScratchMemory > TotalPhysicalMemory.GetValue(SizeUnit.Bytes) *
-                              LowMemoryNotification.Instance.TemporaryDirtyMemoryAllowedPercentage,
-                TotalDirtyInBytes = totalScratchMemory
+                IsHighDirty = totalScratchMemory > 
+                              TotalPhysicalMemory * LowMemoryNotification.Instance.TemporaryDirtyMemoryAllowedPercentage,
+                TotalDirty = totalScratchMemory
             };
         }
     }

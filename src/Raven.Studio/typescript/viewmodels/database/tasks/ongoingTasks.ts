@@ -27,11 +27,21 @@ import etlScriptDefinitionCache = require("models/database/stats/etlScriptDefini
 import ongoingTaskReplicationSinkListModel = require("models/database/tasks/ongoingTaskReplicationSinkListModel");
 import accessManager = require("common/shell/accessManager");
 import generalUtils = require("common/generalUtils");
+import copyToClipboard from "common/copyToClipboard";
 
 class ongoingTasks extends viewModelBase {
 
     view = require("views/database/tasks/ongoingTasks.html");
     databaseGroupLegendView = require("views/partial/databaseGroupLegend.html");
+    
+    private static tombstoneWarning = `<div class="margin-top margin-top-lg text-warning bg-warning padding padding-xs flex-horizontal">
+                <div class="flex-start">
+                    <small><i class="icon-warning"></i></small>
+                </div>
+                <div>
+                    <small>Warning: Please note that disabling this task will cause continuous tombstone accumulation until it is re-enabled or deleted, leading to increased disk space usage.</small>
+                </div>
+             </div>`
     
     private clusterManager = clusterTopologyManager.default;
     myNodeTag = ko.observable<string>();
@@ -89,7 +99,7 @@ class ongoingTasks extends viewModelBase {
     
     constructor() {
         super();
-        this.bindToCurrentInstance("confirmRemoveOngoingTask", "confirmEnableOngoingTask", "confirmDisableOngoingTask", "toggleDetails", "showItemPreview");
+        this.bindToCurrentInstance("confirmRemoveOngoingTask", "confirmEnableOngoingTask", "confirmDisableOngoingTask", "toggleDetails", "showItemPreview", "copyTransactionalIdToClipboard");
 
         this.initObservables();
     }
@@ -280,7 +290,7 @@ class ongoingTasks extends viewModelBase {
     
     private refresh() {
         if (!this.activeDatabase()) {
-            return;
+            return; 
         }
         return $.when<any>(this.fetchDatabaseInfo(), this.fetchOngoingTasks());
     }
@@ -549,8 +559,10 @@ class ongoingTasks extends viewModelBase {
     confirmDisableOngoingTask(model: ongoingTaskListModel | ongoingTaskReplicationHubDefinitionListModel) {
         const db = this.activeDatabase();
 
+        const extraHtml = model.taskType() !== "Subscription" ? ongoingTasks.tombstoneWarning : "";
+        
         this.confirmationMessage("Disable Task",
-            `You're disabling ${model.taskType()} task:<br><ul><li><strong>${model.taskName()}</strong></li></ul>`, {
+            `You're disabling ${model.taskType()} task:<br><ul><li><strong>${generalUtils.escapeHtml(model.taskName())}</strong></li></ul>${extraHtml}`, {
                 buttons: ["Cancel", "Disable"],
                 html: true
             })
@@ -607,6 +619,10 @@ class ongoingTasks extends viewModelBase {
     
     getTaskNameForUI(taskType: StudioTaskType) {
         return ko.pureComputed(() => ongoingTaskModel.formatStudioTaskType(taskType));
+    }
+    
+    copyTransactionalIdToClipboard(transactionId: string) {
+        copyToClipboard.copy(transactionId, "Transactional Id was copied to clipboard.");
     }
 }
 

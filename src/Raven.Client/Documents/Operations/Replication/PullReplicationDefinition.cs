@@ -56,6 +56,22 @@ namespace Raven.Client.Documents.Operations.Replication
             };
         }
 
+        public DynamicJsonValue ToAuditJson()
+        {
+            return new DynamicJsonValue
+            {
+                [nameof(Name)] = Name,
+                [nameof(TaskId)] = TaskId,
+                [nameof(Disabled)] = Disabled,
+                [nameof(MentorNode)] = MentorNode,
+                [nameof(PinToMentorNode)] = PinToMentorNode,
+                [nameof(DelayReplicationFor)] = DelayReplicationFor,
+                [nameof(Mode)] = Mode,
+                [nameof(WithFiltering)] = WithFiltering,
+                [nameof(PreventDeletionsMode)] = PreventDeletionsMode
+            };
+        }
+
         internal void Validate(bool useSsl)
         {
             if (string.IsNullOrEmpty(Name))
@@ -68,6 +84,17 @@ namespace Raven.Client.Documents.Operations.Replication
 #pragma warning restore CS0618 // Type or member is obsolete
                 {
                     throw new InvalidOperationException("Your server is unsecured and therefore you can't define pull replication with a certificate.");
+                }
+
+                if (WithFiltering)
+                {
+                    throw new InvalidOperationException($"Server must be secured in order to use filtering in pull replication {Name}.");
+                }
+
+                if (Mode.HasFlag(PullReplicationMode.SinkToHub))
+                {
+                    throw new InvalidOperationException(
+                        $"Server must be secured in order to use {nameof(Mode)} {nameof(PullReplicationMode.SinkToHub)} in pull replication {Name}");
                 }
             }
         }

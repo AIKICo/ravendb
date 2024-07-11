@@ -1,17 +1,30 @@
 <div class="content-margin edit-replication-task edit-ongoing-task">
     <form class="flex-form" data-bind="submit: saveExternalReplication">
         <div class="row flex-row absolute-fill">
+            
             <div class="col-xs-12 col-lg-6 flex-vertical">
-                <div class="flex-header">
-                    <button type="submit" class="btn btn-primary" data-bind="disable: $root.spinners.save() || !$root.dirtyFlag().isDirty(), css: { 'btn-spinner': $root.spinners.save }">
-                        <i class="icon-save"></i><span>Save</span>
-                    </button>
+                
+                <div class="flex-header" >
+                    <span data-bind="if: licenseType !== 'Community'">
+                        <button type="submit" class="btn btn-primary" data-bind="disable: $root.spinners.save() || !$root.dirtyFlag().isDirty(), css: { 'btn-spinner': $root.spinners.save }">
+                            <i class="icon-save"></i><span>Save</span>
+                        </button>
+                    </span>
                     <button data-bind="click: cancelOperation" class="btn btn-default" title="Return to Ongoing Tasks View">
                         <i class="icon-cancel"></i><span>Cancel</span>
                     </button>
                 </div>
-                <div class="panel">
+                <div data-bind="if: licenseType === 'Community'"  class="margin-top margin-bottom">
+                    <a 
+                    href="https://ravendb.net/l/FLDLO4" target="_blank" 
+                    class="badge license-restricted-badge"
+                    data-toggle="tooltip" data-placement="right" title="Available in Professional and Enterprise license">
+                        Professional +
+                    </a>
+                </div>
+                <div class="panel" data-bind="css: { 'pe-none item-disabled': licenseType === 'Community' }">
                     <div class="panel-body" data-bind="with: editedExternalReplication">
+                        
                         <h3 data-bind="text: $parent.isAddingNewReplicationTask() ? `New External Replication` : `Edit External Replication`"></h3>
                         <div class="form-group margin-top margin-top-lg" data-bind="validationElement: taskName">
                             <label for="taskName" class="control-label">Task Name</label>
@@ -62,34 +75,11 @@
                         <div class="form-group">
                             <label class="control-label">&nbsp;</label>
                             <div class="toggle" data-placement="right" data-toggle="tooltip" title="Toggle on to set a responsible node for the task" data-animation="true">
-                                <input id="responsibleNode" type="checkbox" data-bind="checked: manualChooseMentor">
+                                <input id="responsibleNode" type="checkbox" data-bind="checked: manualChooseMentor, disable: $root.possibleMentors().length === 0">
                                 <label for="responsibleNode">Set responsible node</label>
                             </div>
                         </div>
-                        <div data-bind="validationElement: mentorNode, collapse: manualChooseMentor">
-                            <div class="form-group" data-bind="css: { 'margin-bottom-xs': mentorNode() }">
-                                <div>
-                                    <label class="control-label">Responsible Node</label>
-                                </div>
-                                <div class="flex-grow">
-                                    <button class="btn btn-block dropdown-toggle text-left" data-toggle="dropdown">
-                                        <span data-bind="text: mentorNode() ? 'Node ' + mentorNode() : 'Select responsible node'"></span>
-                                        <span class="caret"></span>
-                                    </button>
-                                    <ul class="dropdown-menu" data-bind="foreach: $root.possibleMentors">
-                                        <li><a href="#" data-bind="text: 'Node ' + $data, click: $parent.mentorNode.bind($parent.mentorNode, $data)"></a></li>
-                                    </ul>
-                                    <span class="help-block" data-bind="validationMessage: mentorNode"></span>
-                                </div>
-                                <div data-bind="compose: $root.pinResponsibleNodeButtonsScriptView"></div>
-                            </div>
-                            <div data-bind="visible: mentorNode">
-                                <div class="form-group small">
-                                    <label class="control-label">&nbsp;</label>
-                                    <div class="flex-grow" data-bind="compose: $root.pinResponsibleNodeTextScriptView"></div>
-                                </div>
-                            </div>
-                        </div>
+                        <div data-bind="compose: $root.taskResponsibleNodeSectionView"></div>
                         <div class="form-group">
                             <label class="control-label">&nbsp;</label>
                             <div class="toggle">

@@ -4,7 +4,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
-using Raven.Server.Commercial;
 using Raven.Server.Commercial.LetsEncrypt;
 using Raven.Server.Utils;
 
@@ -12,17 +11,15 @@ namespace Raven.Server.Commercial.SetupWizard;
 
 public static class LetsEncryptSetupUtils
 {
-        private const string AcmeClientUrl = "https://acme-v02.api.letsencrypt.org/directory";
-
-        public static async Task<byte[]> Setup(SetupInfo setupInfo,  SetupProgressAndResult progress, bool registerTcpDnsRecords, CancellationToken token)
+        public static async Task<byte[]> Setup(SetupInfo setupInfo,  SetupProgressAndResult progress, bool registerTcpDnsRecords, string acmeUrl, CancellationToken token)
         {
             progress.Processed++;
             progress?.AddInfo("Setting up RavenDB in Let's Encrypt security mode.");
             
             if (EmailValidator.IsValid(setupInfo.Email) == false)
                 throw new ArgumentException("Invalid e-mail format" + setupInfo.Email);
-
-            var acmeClient = new LetsEncryptClient(AcmeClientUrl);
+            
+            var acmeClient = new LetsEncryptClient(acmeUrl);
 
             await acmeClient.Init(setupInfo.Email, token);
 
@@ -57,7 +54,7 @@ public static class LetsEncryptSetupUtils
                 try
                 {
                     var content = new StringContent(serializeObject, Encoding.UTF8, "application/json");
-                    var response = await ApiHttpClient.Instance.PostAsync($"/api/v1/dns-n-cert/claim", content, CancellationToken.None).ConfigureAwait(false);
+                    var response = await ApiHttpClient.Instance.PostAsync($"/api/v1/dns-n-cert/claim", content, token).ConfigureAwait(false);
                     response.EnsureSuccessStatusCode();
                     progress?.AddInfo($"Successfully claimed this domain: {setupInfo.Domain}.");
                 }
@@ -70,7 +67,7 @@ public static class LetsEncryptSetupUtils
                     Challenge = challengeResult.Challenge,
                     SetupInfo = setupInfo,
                     Progress = progress,
-                    Token = CancellationToken.None,
+                    Token = token,
                     RegisterTcpDnsRecords = registerTcpDnsRecords
                 });
                 progress?.AddInfo($"Updating DNS record(s) and challenge(s) in {setupInfo.Domain.ToLower()}.{setupInfo.RootDomain.ToLower()}.");
@@ -95,8 +92,7 @@ public static class LetsEncryptSetupUtils
                 SetupInfo = setupInfo,
                 Client = acmeClient,
                 ChallengeResult = challengeResult,
-                Token = CancellationToken.None
-                
+                Token = token
             });
 
             progress.Processed++;

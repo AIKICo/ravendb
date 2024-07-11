@@ -5,9 +5,9 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-using FastTests;
 using FastTests.Server.Replication;
 using FastTests.Utils;
+using Nito.AsyncEx;
 using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
@@ -28,6 +28,7 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Raven.Tests.Core.Utils.Entities;
+using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -143,63 +144,11 @@ namespace SlowTests.Cluster
             }
         }
 
-        [Fact]
-        public async Task CanCreateClusterTransactionRequest2()
+        [RavenTheory(RavenTestCategory.ClusterTransactions)]
+        [RavenData(DatabaseMode = RavenDatabaseMode.All)]
+        public async Task ServeSeveralClusterTransactionRequests(Options options)
         {
-            DebuggerAttachedTimeout.DisableLongTimespan = true;
-            var (_, leader) = await CreateRaftCluster(2);
-            using (var leaderStore = GetDocumentStore(new Options
-            {
-                Server = leader,
-                ReplicationFactor = 2
-            }))
-            {
-                var count = 0;
-                var parallelism = RavenTestHelper.DefaultParallelOptions.MaxDegreeOfParallelism;
-
-                for (var i = 0; i < 10; i++)
-                {
-                    var tasks = new List<Task>();
-                    for (var j = 0; j < parallelism; j++)
-                    {
-                        tasks.Add(Task.Run(async () =>
-                        {
-                            using (var session = leaderStore.OpenAsyncSession(new SessionOptions
-                            {
-                                TransactionMode = TransactionMode.ClusterWide
-                            }))
-                            {
-                                session.Advanced.ClusterTransaction.CreateCompareExchangeValue($"usernames/{Interlocked.Increment(ref count)}", new User());
-                                await session.SaveChangesAsync();
-                            }
-
-                            await ActionWithLeader((l) =>
-                              {
-                                  l.ServerStore.Engine.CurrentLeader?.StepDown();
-                                  return Task.CompletedTask;
-                              });
-                        }));
-                    }
-
-                    await Task.WhenAll(tasks.ToArray());
-                    using (var session = leaderStore.OpenAsyncSession(new SessionOptions
-                    {
-                        TransactionMode = TransactionMode.ClusterWide
-                    }))
-                    {
-                        var results = await session.Advanced.ClusterTransaction.GetCompareExchangeValuesAsync<User>(
-                            Enumerable.Range(i * parallelism, parallelism).Select(x =>
-                                $"usernames/{Interlocked.Increment(ref count)}").ToArray());
-                        Assert.Equal(parallelism, results.Count);
-                    }
-                }
-            }
-        }
-
-        [Fact]
-        public async Task ServeSeveralClusterTransactionRequests()
-        {
-            using (var store = GetDocumentStore())
+            using (var store = GetDocumentStore(options))
             using (var session = store.OpenAsyncSession(new SessionOptions
             {
                 TransactionMode = TransactionMode.ClusterWide
@@ -591,8 +540,8 @@ namespace SlowTests.Cluster
             {
                 Name = "Indych"
             };
-            var mre1 = new ManualResetEvent(false);
-            var mre2 = new ManualResetEvent(false);
+            var mre1 = new AsyncManualResetEvent();
+            var mre2 = new AsyncManualResetEvent();
             using (var store = GetDocumentStore())
             {
                 var task1 = Task.Run(async () =>
@@ -603,7 +552,7 @@ namespace SlowTests.Cluster
                     }))
                     {
                         mre1.Set();
-                        mre2.WaitOne();
+                        await mre2.WaitAsync();
                         session.Advanced.ClusterTransaction.CreateCompareExchangeValue("usernames/ayende", user1);
                         await session.StoreAsync(user1, "users/1");
                         await session.SaveChangesAsync();
@@ -618,7 +567,7 @@ namespace SlowTests.Cluster
                     }))
                     {
                         mre2.Set();
-                        mre1.WaitOne();
+                        await mre1.WaitAsync();
                         session.Advanced.ClusterTransaction.CreateCompareExchangeValue("usernames/karmel", user3);
                         await session.StoreAsync(user3, "users/3");
                         await session.SaveChangesAsync();

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Sparrow.Collections;
 using Sparrow.Platform;
@@ -7,6 +8,8 @@ namespace Sparrow.Json
 {
     public abstract class AbstractBlittableJsonDocumentBuilder : IDisposable
     {
+        private bool _disposed;
+
         private readonly GlobalPoolItem _cacheItem;
         protected readonly ListCache<PropertyTag> _propertiesCache;
         protected readonly ListCache<int> _positionsCache;
@@ -15,6 +18,15 @@ namespace Sparrow.Json
         private static readonly ObjectPool<FastStack<BuildingState>> ContinuationPool = new (() => new FastStack<BuildingState>(32));
 
         protected readonly FastStack<BuildingState> _continuationState;
+
+        private static readonly PerCoreContainer<GlobalPoolItem> GlobalCache;
+
+        static AbstractBlittableJsonDocumentBuilder()
+        {
+            GlobalCache = PlatformDetails.Is32Bits 
+                ? new PerCoreContainer<GlobalPoolItem>(4) 
+                : new PerCoreContainer<GlobalPoolItem>();
+        }
 
         protected AbstractBlittableJsonDocumentBuilder()
         {
@@ -33,6 +45,8 @@ namespace Sparrow.Json
             // PERF: We are clearing the array without removing the references because the type is an struct.
             _continuationState.WeakClear();
             ContinuationPool.Free(_continuationState);
+
+            _disposed = true;
         }
 
         protected void ClearState()
@@ -46,7 +60,12 @@ namespace Sparrow.Json
             }
         }
 
-        private static readonly PerCoreContainer<GlobalPoolItem> GlobalCache = new PerCoreContainer<GlobalPoolItem>();
+        [Conditional("DEBUG")]
+        protected void AssertNotDisposed()
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(GetType().Name);
+        }
 
         protected struct BuildingState
         {

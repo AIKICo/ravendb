@@ -14,9 +14,11 @@ using Raven.Server;
 using Raven.Server.Monitoring.Snmp;
 using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Context;
+using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Tests.Infrastructure;
 using Xunit;
+using Xunit.Sdk;
 
 namespace FastTests;
 
@@ -45,6 +47,32 @@ public partial class RavenTestBase
             await _parent.Server.ServerStore.Cluster.WaitForIndexNotification(updateIndex, TimeSpan.FromSeconds(10));
         }
 
+        public async Task<long> WaitForRaftCommandToBeAppendedInClusterAsync(List<RavenServer> nodes, string commandType, int timeout = 15_000, int interval = 100)
+        {
+            // Assuming that I have only 1 command of this type (commandType) in the raft log
+            var tasks = new List<Task<bool>>();
+            foreach (var server in nodes)
+            {
+                var t = WaitForValueAsync( () =>
+                {
+                    var commandFound = TryGetLastRaftIndexForCommand(server, commandType, out _);
+                    return Task.FromResult(commandFound);
+                }, true, timeout: timeout, interval: interval);
+                tasks.Add(t);
+            }
+
+            await Task.WhenAll(tasks);
+
+            foreach (var t in tasks)
+            {
+                if (await t == false)
+                    return -1;
+            }
+
+            TryGetLastRaftIndexForCommand(nodes[0], commandType, out var index);
+            return index;
+        }
+
         public async Task CreateIndexInClusterAsync(IDocumentStore store, AbstractIndexCreationTask index, List<RavenServer> nodes = null)
         {
             var results = (await store.Maintenance.ForDatabase(store.Database)
@@ -58,8 +86,14 @@ public partial class RavenTestBase
 
         public long LastRaftIndexForCommand(RavenServer server, string commandType)
         {
-            var updateIndex = 0L;
-            var commandFound = false;
+            var commandFound = TryGetLastRaftIndexForCommand(server, commandType, out var updateIndex);
+            Assert.True(commandFound, $"{commandType} wasn't found in the log.");
+            return updateIndex;
+        }
+
+        public bool TryGetLastRaftIndexForCommand(RavenServer server, string commandType, out long updateIndex)
+        {
+            updateIndex = 0L;
             using (server.ServerStore.Engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
             using (context.OpenReadTransaction())
             {
@@ -68,14 +102,12 @@ public partial class RavenTestBase
                     var type = entry[nameof(RachisLogHistory.LogHistoryColumn.Type)].ToString();
                     if (type == commandType)
                     {
-                        commandFound = true;
-                        Assert.True(long.TryParse(entry[nameof(RachisLogHistory.LogHistoryColumn.Index)].ToString(), out updateIndex));
+                        updateIndex = long.Parse(entry[nameof(RachisLogHistory.LogHistoryColumn.Index)].ToString());
                     }
                 }
             }
 
-            Assert.True(commandFound, $"{commandType} wasn't found in the log.");
-            return updateIndex;
+            return updateIndex > 0L;
         }
 
         public IEnumerable<DynamicJsonValue> GetRaftCommands(RavenServer server, string commandType = null)
@@ -208,6 +240,51 @@ public partial class RavenTestBase
             WaitForValue(() => server.ServerStore.Observer != null, true);
 
             server.ServerStore.Observer.Suspended = true;
+        }
+
+        public async Task AssertNumberOfCommandsPerNode(long expectedNumberOfCommands, List<RavenServer> servers, string commandType, int timeout = 30_000, int interval = 1_000)
+        {
+            var numberOfCommandsPerNode = new Dictionary<string, long>();
+            var isExpectedNumberOfCommandsPerNode = await WaitForValueAsync(() =>
+                {
+                    numberOfCommandsPerNode = new Dictionary<string, long>();
+
+                    foreach (var server in servers)
+                    {
+                        var nodeTag = server.ServerStore.NodeTag;
+                        var numberOfCommands = GetRaftCommands(server, commandType).Count();
+
+                        numberOfCommandsPerNode.Add(nodeTag, numberOfCommands);
+                    }
+
+                    return Task.FromResult(numberOfCommandsPerNode.All(x => x.Value == expectedNumberOfCommands));
+                },
+                expectedVal: true,
+                timeout, interval);
+
+            Assert.True(isExpectedNumberOfCommandsPerNode, BuildErrorMessage());
+            
+            return;
+            string BuildErrorMessage()
+            {
+                var stringBuilder = new StringBuilder();
+
+                using (var context = JsonOperationContext.ShortTermSingleUse())
+                {
+                    stringBuilder.AppendLine($"Expected number of commands per node: {expectedNumberOfCommands}. Actual number of commands per node: ");
+                    foreach ((string nodeTag, long numberOfCommands) in numberOfCommandsPerNode)
+                    {
+                        stringBuilder.AppendLine($"Node tag: '{nodeTag}' with actual number of commands: '{numberOfCommands}'. Commands:");
+
+                        var server = servers.Find(x => x.ServerStore.NodeTag == nodeTag);
+                        var raftCommands = GetRaftCommands(server).Select(djv => context.ReadObject(djv, "raftCommand").ToString()).ToArray();
+
+                        stringBuilder.AppendLine($"{string.Join($"{Environment.NewLine}\t", raftCommands)}");
+                    }
+                }
+
+                return stringBuilder.ToString();
+            }
         }
     }
 }

@@ -16,6 +16,7 @@ using Raven.Client.Util;
 using Raven.Server;
 using Raven.Server.Config;
 using Sparrow.Json;
+using Sparrow.Server;
 using Tests.Infrastructure;
 using Xunit;
 using Xunit.Abstractions;
@@ -41,7 +42,8 @@ namespace InterversionTests
             return base.GetNewServer(options, caller);
         }
 
-        protected async Task<List<ProcessNode>> CreateCluster(string[] peers, IDictionary<string, string> customSettings = null, X509Certificate2 certificate = null)
+        protected async Task<List<ProcessNode>> CreateCluster(string[] peers, X509Certificate2 certificate = null
+            , bool watcherCluster = false)
         {
             var processes = new List<ProcessNode>();
             foreach (var peer in peers)
@@ -49,40 +51,43 @@ namespace InterversionTests
                 processes.Add(await GetServerAsync(peer));
             }
 
-            var chosenOne = processes[0];
+            var leader = processes[0];
 
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(chosenOne.Url, certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leader.Url, certificate, DocumentConventions.DefaultForServer))
             using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context))
             {
                 foreach (var processNode in processes)
                 {
-                    if (processNode == chosenOne)
+                    if (processNode == leader)
                         continue;
 
-                    var addCommand = new AddClusterNodeCommand(processNode.Url);
+                    var addCommand = new AddClusterNodeCommand(processNode.Url, watcher: watcherCluster);
                     await requestExecutor.ExecuteAsync(addCommand, context);
                 }
 
+                var result = watcherCluster ? (1, peers.Length - 1) : (peers.Length, 0);
                 var clusterCreated = await WaitForValueAsync(async () =>
                 {
                     var clusterTopology = new GetClusterTopologyCommand();
                     await requestExecutor.ExecuteAsync(clusterTopology, context);
-                    return clusterTopology.Result.Topology.Members.Count;
-                }, peers.Length);
+                    var clusterTopology1 = clusterTopology.Result.Topology;
 
-                Assert.True(clusterCreated == peers.Length, "Failed to create initial cluster");
+                    return (clusterTopology1.Members.Count, clusterTopology1.Watchers.Count);
+                }, result);
+
+                Assert.True(clusterCreated == result, "Failed to create initial cluster");
             }
 
             return processes;
         }
 
         protected async Task<(RavenServer Leader, List<ProcessNode> Peers, List<RavenServer> LocalPeers)> CreateMixedCluster(
-            string[] peers, int localPeers = 0, IDictionary<string, string> customSettings = null, X509Certificate2 certificate = null)
+            string[] peers, int localPeers = 0, IDictionary<string, string> customSettings = null, X509Certificate2 certificate = null, bool watcherCluster = true)
         {
             var leaderServer = GetNewServer(new ServerCreationOptions { CustomSettings = customSettings });
             await leaderServer.ServerStore.EnsureNotPassiveAsync(leaderServer.WebUrl);
 
-            var nodeAdded = new ManualResetEvent(false);
+            var nodeAdded = new AsyncManualResetEvent();
             var expectedMembers = 2;
             leaderServer.ServerStore.Engine.TopologyChanged += (sender, clusterTopology) =>
             {
@@ -98,16 +103,16 @@ namespace InterversionTests
             };
 
             using (leaderServer.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(leaderServer.WebUrl, certificate, DocumentConventions.DefaultForServer))
+            using (var requestExecutor = ClusterRequestExecutor.CreateForShortTermUse(leaderServer.WebUrl, certificate, DocumentConventions.DefaultForServer))
             {
                 var local = new List<RavenServer>();
 
                 for (int i = 0; i < localPeers; i++)
                 {
                     var peer = GetNewServer(new ServerCreationOptions { CustomSettings = customSettings });
-                    var addCommand = new AddClusterNodeCommand(peer.WebUrl);
+                    var addCommand = new AddClusterNodeCommand(peer.WebUrl, watcher: watcherCluster);
                     await requestExecutor.ExecuteAsync(addCommand, context);
-                    Assert.True(nodeAdded.WaitOne(TimeSpan.FromSeconds(30)));
+                    Assert.True(await nodeAdded.WaitAsync(TimeSpan.FromSeconds(30)));
                     nodeAdded.Reset();
                     local.Add(peer);
                 }
@@ -122,7 +127,7 @@ namespace InterversionTests
                 {
                     var addCommand = new AddClusterNodeCommand(processNode.Url);
                     await requestExecutor.ExecuteAsync(addCommand, context);
-                    Assert.True(nodeAdded.WaitOne(TimeSpan.FromSeconds(30)));
+                    Assert.True(await nodeAdded.WaitAsync(TimeSpan.FromSeconds(30)));
                     nodeAdded.Reset();
                 }
 
@@ -218,9 +223,9 @@ namespace InterversionTests
             }), stores);
         }
 
-        protected static async Task<string> CreateDatabase(IDocumentStore store, int replicationFactor = 1, [CallerMemberName] string dbName = null)
+        protected static async Task<string> CreateDatabase(IDocumentStore store, int replicationFactor = 1, [CallerMemberName] string dbName = null, DatabaseRecord record = null)
         {
-            var doc = new DatabaseRecord(dbName)
+            var doc = record ?? new DatabaseRecord(dbName)
             {
                 Settings =
                 {

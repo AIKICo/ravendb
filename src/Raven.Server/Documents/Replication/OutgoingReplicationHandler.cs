@@ -36,6 +36,7 @@ using Sparrow.Json.Parsing;
 using Sparrow.Json.Sync;
 using Sparrow.Logging;
 using Sparrow.Server;
+using Sparrow.Server.Utils;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron;
@@ -164,7 +165,8 @@ namespace Raven.Server.Documents.Replication
         public void Start()
         {
             _longRunningSendingWork =
-                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => HandleReplicationErrors(Replication), null, OutgoingReplicationThreadName);
+                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => HandleReplicationErrors(Replication), null, ThreadNames.ForOutgoingReplication(OutgoingReplicationThreadName, 
+                    _database.Name, Destination.FromString(), IsPullReplicationAsHub));
         }
 
         public void StartPullReplicationAsHub(Stream stream, TcpConnectionHeaderMessage.SupportedFeatures supportedVersions)
@@ -174,7 +176,8 @@ namespace Raven.Server.Documents.Replication
             IsPullReplicationAsHub = true;
             OutgoingReplicationThreadName = $"Pull replication as hub {FromToString}";
             _longRunningSendingWork =
-                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => HandleReplicationErrors(PullReplication), null, OutgoingReplicationThreadName);
+                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => HandleReplicationErrors(PullReplication), null, ThreadNames.ForOutgoingReplication(OutgoingReplicationThreadName, 
+                    _database.Name, Destination.FromString(), IsPullReplicationAsHub));
         }
 
         private string _outgoingReplicationThreadName;
@@ -229,7 +232,9 @@ namespace Raven.Server.Documents.Replication
                     if (rawRecord == null)
                         throw new InvalidOperationException($"The database record for {database.Name} does not exist?!");
 
-                    if (rawRecord.IsEncrypted && Destination.Url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false)
+                    if (rawRecord.IsEncrypted 
+                        && Destination.Url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false 
+                        && _parent._server.Server.AllowEncryptedDatabasesOverHttp == false)
                         throw new InvalidOperationException(
                             $"{database.Name} is encrypted, and require HTTPS for replication, but had endpoint with url {Destination.Url} to database {Destination.Database}");
                 }
@@ -1206,7 +1211,7 @@ namespace Raven.Server.Documents.Replication
             _missingAttachmentsAlert = AlertRaised.Create(
                 _database.Name,
                 "Replication delay due to a missing attachments loop",
-                msg + $"{Environment.NewLine}Please try to delete the missing attachment from '{_database.Name}' (see additional information regarding the document and attachment below)",
+                msg + $"{Environment.NewLine}Please try to delete the missing attachment from '{_database.Name}' on node {_database.ServerStore.NodeTag} (see additional information regarding the document and attachment below)",
                 AlertType.Replication,
                 NotificationSeverity.Error,
                 details: new ExceptionDetails { Exception = exceptionDetails});
@@ -1233,8 +1238,10 @@ namespace Raven.Server.Documents.Replication
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void OnChangeInternal(bool triggeredByReplicationThread)
         {
-            if (triggeredByReplicationThread)
+            if (triggeredByReplicationThread || 
+                ForTestingPurposes?.DisableWaitForChangesForExternalReplication == true)
                 return;
+
             _waitForChanges.Set();
         }
 
@@ -1330,6 +1337,8 @@ namespace Raven.Server.Documents.Replication
             public Action OnDocumentSenderFetchNewItem;
 
             public Action<Dictionary<Slice, AttachmentReplicationItem>> OnMissingAttachmentStream;
+
+            public bool DisableWaitForChangesForExternalReplication;
         }
     }
 

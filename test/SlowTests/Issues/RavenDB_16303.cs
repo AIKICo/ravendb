@@ -1,7 +1,8 @@
 ﻿using System;
-using System.Data.SqlClient;
+using System.Data.Common;
+using Microsoft.Data.SqlClient;
+using System.Diagnostics;
 using System.Threading;
-using MySql.Data.MySqlClient;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 using Raven.Client.Documents.Operations.ConnectionStrings;
@@ -190,9 +191,12 @@ loadToTestGuidEtls(item);"
                 case MigrationProvider.Oracle:
                     return @"Oracle.ManagedDataAccess.Client";
                 case MigrationProvider.MsSQL:
-                    return @"System.Data.SqlClient";
-                case MigrationProvider.MySQL:
-                    return @"MySql.Data.MySqlClient";
+                    return @"Microsoft.Data.SqlClient";
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    return @"MySqlConnector.MySqlConnectorFactory";
                 case MigrationProvider.NpgSQL:
                     return @"Npgsql";
                 default:
@@ -244,8 +248,11 @@ loadToTestGuidEtls(item);"
                         connection.Close();
                     }
                     return;
-                case MigrationProvider.MySQL:
-                    using (var connection = new MySqlConnection(connectionString))
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    using (var connection = GetMySqlConnection(provider, connectionString))
                     {
                         connection.Open();
 
@@ -329,8 +336,11 @@ loadToTestGuidEtls(item);"
                         connection.Close();
                     }
                     return;
-                case MigrationProvider.MySQL:
-                    using (var connection = new MySqlConnection(connectionString))
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    using (var connection = GetMySqlConnection(provider, connectionString))
                     {
                         connection.Open();
 
@@ -403,8 +413,11 @@ loadToTestGuidEtls(item);"
                         connection.Close();
                     }
                     return;
-                case MigrationProvider.MySQL:
-                    using (var connection = new MySqlConnection(connectionString))
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    using (var connection = GetMySqlConnection(provider, connectionString))
                     {
                         connection.Open();
                         using (var dbCommand = connection.CreateCommand())
@@ -477,15 +490,19 @@ loadToTestGuidEtls(item);"
                         connection.Close();
                     }
                     return;
-                case MigrationProvider.MySQL:
-                    using (var connection = new MySqlConnection(connectionString))
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    using (var connection = GetMySqlConnection(provider, connectionString))
                     {
                         connection.Open();
                         using (var dbCommand = connection.CreateCommand())
                         {
                             dbCommand.CommandTimeout = 10 * 60;
                             dbCommand.CommandText = "SELECT `Guid` FROM `TestGuidEtls`";
-                            using (MySqlDataReader r = dbCommand.ExecuteReader())
+                            
+                            using (var r = dbCommand.ExecuteReader())
                             {
                                 r.Read();
                                 var g = new Guid((string)r.GetValue(0));
@@ -558,8 +575,11 @@ loadToTestGuidEtls(item);"
                         connection.Close();
                     }
                     return;
-                case MigrationProvider.MySQL:
-                    using (var connection = new MySqlConnection(connectionString))
+#pragma warning disable CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySql_Data:
+#pragma warning restore CS0618 // Type or member is obsolete
+                case MigrationProvider.MySQL_MySqlConnector:
+                    using (var connection = GetMySqlConnection(provider, connectionString))
                     {
                         connection.Open();
                         using (var dbCommand = connection.CreateCommand())
@@ -597,6 +617,14 @@ loadToTestGuidEtls(item);"
                 default:
                     throw new InvalidOperationException(nameof(provider));
             }
+        }
+
+        private static DbConnection GetMySqlConnection(MigrationProvider provider, string connectionString)
+        {
+#pragma warning disable CS0618 // Type or member is obsolete
+            Debug.Assert(provider is MigrationProvider.MySQL_MySql_Data or MigrationProvider.MySQL_MySqlConnector);
+#pragma warning restore CS0618 // Type or member is obsolete
+            return new MySqlConnector.MySqlConnection(connectionString);
         }
     }
 }

@@ -16,6 +16,7 @@ using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Json;
 using Sparrow.Server;
+using Sparrow.Server.Utils;
 using Sparrow.Utils;
 using Voron;
 using Voron.Data;
@@ -483,7 +484,7 @@ namespace Raven.Server.Rachis
             {
                 KeepAliveAndExecuteAction(() =>
                 {
-                    onFullSnapshotInstalledTask = ReadAndCommitSnapshot(context, snapshot, cts.Token);
+                    onFullSnapshotInstalledTask = ReadAndCommitSnapshot(snapshot, cts.Token);
                 }, cts, "ReadAndCommitSnapshot");
             }
 
@@ -554,10 +555,11 @@ namespace Raven.Server.Rachis
             }
         }
 
-        private Task ReadAndCommitSnapshot(ClusterOperationContext context, InstallSnapshot snapshot, CancellationToken token)
+        private Task ReadAndCommitSnapshot(InstallSnapshot snapshot, CancellationToken token)
         {
             Task onFullSnapshotInstalledTask = null;
 
+            using (_engine.ContextPool.AllocateOperationContext(out ClusterOperationContext context))
             using (context.OpenWriteTransaction())
             {
                 var lastTerm = _engine.GetTermFor(context, snapshot.LastIncludedIndex);
@@ -1014,11 +1016,15 @@ namespace Raven.Server.Rachis
                     {
                         if (_engine.GetTermFor(context, negotiation.PrevLogIndex) == negotiation.PrevLogTerm)
                         {
-                            minIndex = Math.Min(midpointIndex + 1, maxIndex);
+                            if (negotiation.PrevLogIndex < midpointIndex)
+                                //If the value from the leader is lower, it mean that the term of the follower mid value in the leader doesn't match to the term in the follower 
+                                maxIndex = Math.Max(midpointIndex - 1, minIndex);
+                            
+                            minIndex = Math.Min(negotiation.PrevLogIndex, maxIndex);
                         }
                         else
                         {
-                            maxIndex = Math.Max(midpointIndex - 1, minIndex);
+                            maxIndex = Math.Max(negotiation.PrevLogIndex - 1, minIndex);
                         }
                     }
                 }
@@ -1143,8 +1149,7 @@ namespace Raven.Server.Rachis
                 PoolOfThreads.GlobalRavenThreadPool.LongRunning(
                     action: x => Run(x),
                     state: negotiation,
-                    name: $"Follower thread from {_connection} in term {negotiation.Term}");
-
+                    ThreadNames.ForFollower($"Follower thread from {_connection} in term {negotiation.Term}", _connection.ToString(), negotiation.Term));
         }
 
         private void Run(object obj)

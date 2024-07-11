@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Client;
 using Parquet;
@@ -31,7 +32,7 @@ namespace SlowTests.Server.Documents.ETL.Olap
         private readonly string _azureTestsPrefix = $"olap/tests/{nameof(AzureTests)}-{Guid.NewGuid()}";
         private const string CollectionName = "Orders";
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task CanUploadToAzure()
         {
             var settings = GetAzureSettings();
@@ -87,7 +88,8 @@ loadToOrders(partitionBy(key),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var result = await client.ListBlobsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -106,7 +108,7 @@ loadToOrders(partitionBy(key),
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task SimpleTransformation()
         {
             var settings = GetAzureSettings();
@@ -153,7 +155,8 @@ loadToOrders(partitionBy(key),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var result = await client.ListBlobsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -213,7 +216,7 @@ loadToOrders(partitionBy(key),
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task CanLoadToMultipleTables()
         {
             const string salesTableName = "Sales";
@@ -322,7 +325,8 @@ loadToOrders(partitionBy(key), orderData);
                     SetupAzureEtl(store, script, settings);
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var result = await client.ListBlobsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -355,7 +359,8 @@ loadToOrders(partitionBy(key), orderData);
                     }
 
                     //sales
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{salesTableName}";
                         var result = await client.ListBlobsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -395,7 +400,7 @@ loadToOrders(partitionBy(key), orderData);
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task CanModifyPartitionColumnName()
         {
             var settings = GetAzureSettings();
@@ -471,7 +476,8 @@ loadToOrders(partitionBy(['order_date', key]),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await client.ListBlobsAsync(prefix, string.Empty, false);
@@ -490,7 +496,7 @@ loadToOrders(partitionBy(['order_date', key]),
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task SimpleTransformation_NoPartition()
         {
             var settings = GetAzureSettings();
@@ -530,7 +536,8 @@ loadToOrders(noPartition(),
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
 
@@ -599,7 +606,7 @@ loadToOrders(noPartition(),
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task SimpleTransformation_MultiplePartitions()
         {
             var settings = GetAzureSettings();
@@ -666,7 +673,8 @@ loadToOrders(partitionBy(
 
                     var expectedFields = new[] { "RequireAt", "ShipVia", "Company", ParquetTransformedItems.DefaultIdColumn, ParquetTransformedItems.LastModifiedColumn };
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var cloudObjects = await client.ListBlobsAsync(prefix, delimiter: "/", listFolders: true);
                         var list = cloudObjects.List.ToList();
@@ -736,7 +744,7 @@ loadToOrders(partitionBy(
             }
         }
 
-        [AzureFact]
+        [AzureRetryFact]
         public async Task CanUseCustomPrefix()
         {
             var settings = GetAzureSettings();
@@ -790,7 +798,8 @@ loadToOrders(partitionBy(['year', year], ['month', month], ['source', $customPar
 
                     etlDone.Wait(TimeSpan.FromMinutes(1));
 
-                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration))
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                    using (var client = RavenAzureClient.Create(settings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                     {
                         var prefix = $"{settings.RemoteFolderName}/{CollectionName}";
                         var cloudObjects = await client.ListBlobsAsync(prefix, delimiter: string.Empty, listFolders: false);
@@ -848,7 +857,7 @@ loadToOrders(partitionBy(['year', year], ['month', month], ['source', $customPar
 
         private AzureSettings GetAzureSettings([CallerMemberName] string caller = null)
         {
-            var settings = AzureFactAttribute.AzureSettings;
+            var settings = AzureRetryFactAttribute.AzureSettings;
             if (settings == null)
                 return null;
 
@@ -889,7 +898,8 @@ loadToOrders(partitionBy(['year', year], ['month', month], ['source', $customPar
 
             try
             {
-                using (var client = RavenAzureClient.Create(azureSettings, DefaultBackupConfiguration))
+                using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+                using (var client = RavenAzureClient.Create(azureSettings, DefaultBackupConfiguration, cancellationToken: cts.Token))
                 {
                     var result = await client.ListBlobsAsync(prefix, delimiter, listFolder);
                     List<string> filesToDelete;

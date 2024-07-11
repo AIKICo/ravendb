@@ -183,7 +183,10 @@ namespace Raven.Client.Documents.Indexes
         {
             if (ValidCSharpName(name))
             {
-                Out("." + name);
+                if (KeywordsInCSharp.Contains(name))
+                    Out(".@" + name);
+                else
+                    Out("." + name);
             }
             else
             {
@@ -841,6 +844,43 @@ namespace Raven.Client.Documents.Indexes
                 Out('M');
                 return node;
             }
+            if (node.Value is DateTime dateTime && dateTime.Equals(default))
+            {
+                Out("default(");
+                Out(nameof(DateTime));
+                Out(')');
+                return node;
+            }
+            if (node.Value is DateTimeOffset dateTimeOffset && dateTimeOffset.Equals(default))
+            {
+                Out("default(");
+                Out(nameof(DateTimeOffset));
+                Out(')');
+                return node;
+            }
+            if (node.Value is TimeSpan timeSpan && timeSpan.Equals(default))
+            {
+                Out("default(");
+                Out(nameof(TimeSpan));
+                Out(')');
+                return node;
+            }
+#if FEATURE_DATEONLY_TIMEONLY_SUPPORT
+            if (node.Value is DateOnly dateOnly && dateOnly.Equals(default))
+            {
+                Out("default(");
+                Out(nameof(DateOnly));
+                Out(')');
+                return node;
+            }
+            if (node.Value is TimeOnly timeOnly && timeOnly.Equals(default))
+            {
+                Out("default(");
+                Out(nameof(TimeOnly));
+                Out(')');
+                return node;
+            }
+#endif
             Out(s);
             return node;
         }
@@ -852,8 +892,6 @@ namespace Raven.Client.Documents.Indexes
 
             StringExtensions.EscapeString(_out, value);
         }
-
-
 
         private void OutLiteral(char c)
         {
@@ -1342,7 +1380,7 @@ namespace Raven.Client.Documents.Indexes
                     Out($"As{node.Type.Name}(");
                 }
 
-                
+
                 OutMember(node.Expression, node.Member, exprType);
                 Out(")");
                 return node;
@@ -1359,7 +1397,13 @@ namespace Raven.Client.Documents.Indexes
         /// <returns></returns>
         protected override MemberAssignment VisitMemberAssignment(MemberAssignment assignment)
         {
-            Out(assignment.Member.Name);
+            var memberName = assignment.Member.Name;
+            
+            if (KeywordsInCSharp.Contains(memberName))
+                Out("@" + memberName);
+            else
+                Out(memberName);
+            
             Out(" = ");
             var constantExpression = assignment.Expression as ConstantExpression;
             if (constantExpression != null && constantExpression.Value == null)
@@ -1398,7 +1442,7 @@ namespace Raven.Client.Documents.Indexes
                 Out("new");
             }
             else
-            { 
+            {
                 Visit(node.NewExpression);
                 if (TypeExistsOnServer(node.Type) == false)
                 {
@@ -1606,8 +1650,10 @@ namespace Raven.Client.Documents.Indexes
                 }
                 Out(".");
             }
-            else if (isDictionaryReturn && isDictionaryReturnMethodExtension == false)
+            else if (isDictionaryReturn && isDictionaryReturnMethodExtension == false && 
+                     node is not { Method.Name: "get_Item" }) // we don't want to erase the indexer, see: RavenDB-20145
             {
+                // this portion is covered by tests such as: DynamicDictionaryIndexShouldWorkWithMethods and SlowTests.MailingList.IndexCompilation
                 if (isExtension)
                 {
                     // TODO: remove if unnecessary
@@ -2112,9 +2158,8 @@ namespace Raven.Client.Documents.Indexes
         {
             // hack: the only way to detect anonymous types right now
             return type.IsDefined(typeof(CompilerGeneratedAttribute), false)
-                && type.IsGenericType && type.Name.Contains("AnonymousType")
-                && (type.Name.StartsWith("<>") || type.Name.StartsWith("VB$"))
-                && type.Attributes.HasFlag(TypeAttributes.NotPublic);
+                   && type.IsGenericType && type.Name.Contains("AnonymousType")
+                   && (type.Name.StartsWith("<>") || type.Name.StartsWith("VB$"));
         }
 
         public static readonly HashSet<string> KeywordsInCSharp = new HashSet<string>(new[]

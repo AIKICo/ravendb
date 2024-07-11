@@ -6,8 +6,8 @@ import sqlColumn = require("models/database/tasks/sql/sqlColumn");
 import sqlReference = require("models/database/tasks/sql/sqlReference");
 
 class sqlMigration {
-    
-    static possibleProviders: Raven.Server.SqlMigration.MigrationProvider[] = ["MsSQL", "MySQL", "NpgSQL", "Oracle"];
+
+    static possibleProviders: Raven.Server.SqlMigration.MigrationProvider[] = ["MsSQL", "MySQL_MySqlConnector", "NpgSQL", "Oracle", "MySQL_MySql_Data"];
     
     databaseType = ko.observable<Raven.Server.SqlMigration.MigrationProvider>("MsSQL");
     binaryToAttachment = ko.observable<boolean>(true);
@@ -21,7 +21,8 @@ class sqlMigration {
         trimSuffix: ko.observable<boolean>(true),
         suffixToTrim: ko.observable<string>("_id"),
         detectManyToMany: ko.observable<boolean>(true),
-        includeUnsupported: ko.observable<boolean>(false)
+        includeUnsupported: ko.observable<boolean>(false),
+        
     };
 
     // cache connection strings between page views
@@ -45,7 +46,9 @@ class sqlMigration {
     mySqlValidationGroup: KnockoutValidationGroup;
 
     npgSql = {
-        connectionString: ko.observable<string>(sqlMigration.savedNpgsqlConnectionString)
+        connectionString: ko.observable<string>(sqlMigration.savedNpgsqlConnectionString),
+        includeSchemas: ko.observable<boolean>(false),
+        schemas: ko.observable<string>()
     };
 
     npgSqlValidationGroup: KnockoutValidationGroup;
@@ -94,6 +97,12 @@ class sqlMigration {
         this.npgSql.connectionString.extend({
             required: true
         });
+        
+        this.npgSql.schemas.extend({
+            required: {
+                onlyIf: () => this.npgSql.includeSchemas()
+            }
+        });
 
         this.oracle.connectionString.extend({
             required: true
@@ -114,7 +123,8 @@ class sqlMigration {
         this.npgSqlValidationGroup = ko.validatedObservable({
             connectionString: this.npgSql.connectionString,
             batchSize: this.batchSize,
-            maxDocumentsToImportPerTable: this.maxDocumentsToImportPerTable
+            maxDocumentsToImportPerTable: this.maxDocumentsToImportPerTable,
+            schemas: this.npgSql.schemas
         });
 
         this.oracleValidationGroup = ko.validatedObservable({
@@ -151,9 +161,11 @@ class sqlMigration {
     labelForProvider(type: Raven.Server.SqlMigration.MigrationProvider) {
         switch (type) {
             case "MsSQL":
-                return "Microsoft SQL Server (System.Data.SqlClient)";
-            case "MySQL":
-                return "MySQL Server (MySql.Data.MySqlClient)";
+                return "Microsoft SQL Server (Microsoft.Data.SqlClient)";
+            case "MySQL_MySql_Data":
+                return "DEPRECATED: MySQL Server (MySql.Data.MySqlClient)";
+            case "MySQL_MySqlConnector":
+                return "MySQL Server (MySqlConnector.MySqlConnectorFactory)";
             case "NpgSQL":
                 return "PostgreSQL (Npgsql)";
             case "Oracle":
@@ -288,10 +300,12 @@ class sqlMigration {
 
     getFactoryName() {
         switch (this.databaseType()) {
-            case "MySQL":
+            case "MySQL_MySql_Data":
                 return "MySql.Data.MySqlClient";
+            case "MySQL_MySqlConnector":
+                return "MySqlConnector.MySqlConnectorFactory";
             case "MsSQL":
-                return "System.Data.SqlClient";
+                return "Microsoft.Data.SqlClient";
             case "NpgSQL":
                 return "Npgsql";
             case "Oracle":
@@ -308,7 +322,8 @@ class sqlMigration {
         }
         
         switch (this.databaseType()) {
-            case "MySQL":
+            case "MySQL_MySql_Data":
+            case "MySQL_MySqlConnector":
                 return this.mySql.connectionString();
                 
             case "MsSQL":
@@ -326,9 +341,12 @@ class sqlMigration {
     }
     
     toSourceDto(): Raven.Server.SqlMigration.Model.SourceSqlDatabase {
+        const schemas = this.databaseType() === "NpgSQL" && this.npgSql.includeSchemas() ? this.npgSql.schemas().split(",") : null;
+        
         return {
             ConnectionString: this.getConnectionString(),
-            Provider: this.databaseType()
+            Provider: this.databaseType(),
+            Schemas: schemas
         }
     }
     
@@ -377,7 +395,8 @@ class sqlMigration {
 
     getValidationGroup(): KnockoutValidationGroup {
         switch (this.databaseType()) {
-            case "MySQL":
+            case "MySQL_MySql_Data":
+            case "MySQL_MySqlConnector":
                 return this.mySqlValidationGroup;
 
             case "MsSQL":
@@ -498,6 +517,10 @@ class sqlMigration {
             const reference = table.findReference(nested);
             reference.name(nested.Name);
             this.onEmbedTable(reference);
+
+            if (nested.SqlKeysStorage) {
+                reference.effectiveInnerTable().sqlKeysStorage(nested.SqlKeysStorage);
+            }
             
             this.applyConfigurationToCollection(reference.effectiveInnerTable(), nested, "embed");
         });

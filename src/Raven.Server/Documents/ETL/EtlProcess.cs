@@ -43,6 +43,7 @@ using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
+using Sparrow.Server.Utils;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Size = Sparrow.Size;
@@ -54,7 +55,7 @@ namespace Raven.Server.Documents.ETL
         public string Tag { get; protected set; }
 
         public abstract EtlType EtlType { get; }
-        
+
         public virtual string EtlSubType { get; }
 
         public abstract long TaskId { get; }
@@ -97,6 +98,8 @@ namespace Raven.Server.Documents.ETL
         public abstract OngoingTaskConnectionStatus GetConnectionStatus();
 
         public abstract EtlProcessProgress GetProgress(DocumentsOperationContext documentsContext);
+
+        internal abstract bool IsRunning { get; }
 
         public static EtlProcessState GetProcessState(DocumentDatabase database, string configurationName, string transformationName)
         {
@@ -148,6 +151,8 @@ namespace Raven.Server.Documents.ETL
         private readonly ServerStore _serverStore;
 
         public readonly TConfiguration Configuration;
+
+        internal override bool IsRunning => _longRunningWork != null;
 
         protected EtlProcess(Transformation transformation, TConfiguration configuration, DocumentDatabase database, ServerStore serverStore, string tag)
         {
@@ -285,7 +290,7 @@ namespace Raven.Server.Documents.ETL
         {
             if (Transformation.ApplyToAllDocuments)
             {
-                var timeSeries = Database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, fromEtag, long.MaxValue).GetEnumerator();
+                var timeSeries = Database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, fromEtag, long.MaxValue, TimeSeriesSegmentEntryFields.ForEtl).GetEnumerator();
                 scope.EnsureDispose(timeSeries);
                 merged.AddEnumerator(ConvertTimeSeriesEnumerator(context, timeSeries, null));
 
@@ -297,7 +302,7 @@ namespace Raven.Server.Documents.ETL
             {
                 foreach (var collection in Transformation.Collections)
                 {
-                    var timeSeries = Database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, collection, fromEtag, long.MaxValue).GetEnumerator();
+                    var timeSeries = Database.DocumentsStorage.TimeSeriesStorage.GetTimeSeriesFrom(context, collection, fromEtag, long.MaxValue, TimeSeriesSegmentEntryFields.ForEtl).GetEnumerator();
                     scope.EnsureDispose(timeSeries);
                     merged.AddEnumerator(ConvertTimeSeriesEnumerator(context, timeSeries, collection));
 
@@ -314,7 +319,16 @@ namespace Raven.Server.Documents.ETL
         {
             using (var transformer = GetTransformer(context))
             {
-                transformer.Initialize(debugMode: _testMode != null);
+                try
+                {
+                    transformer.Initialize(debugMode: _testMode != null);
+                }
+                catch (JavaScriptParseException e)
+                {
+                    HandleTransformationScriptParseException(stats, e);
+
+                    return transformer.GetTransformedResults();
+                }
 
                 var batchSize = 0;
                 var extractedItemsSize = 0;
@@ -393,27 +407,7 @@ namespace Raven.Server.Documents.ETL
                         }
                         catch (JavaScriptParseException e)
                         {
-                            var message = $"[{Name}] Could not parse transformation script. Stopping ETL process.";
-
-                            if (Logger.IsOperationsEnabled)
-                                Logger.Operations(message, e);
-
-                            var alert = AlertRaised.Create(
-                                Database.Name,
-                                Tag,
-                                message,
-                                AlertType.Etl_InvalidScript,
-                                NotificationSeverity.Error,
-                                key: Name,
-                                details: new ExceptionDetails(e));
-
-                            Database.NotificationCenter.Add(alert);
-
-                            stats.RecordBatchTransformationCompleteReason(message);
-                            stats.RecordTransformationError();
-
-                            Stop(reason: message);
-
+                            HandleTransformationScriptParseException(stats, e);
                             break;
                         }
                         catch (Exception e)
@@ -439,6 +433,35 @@ namespace Raven.Server.Documents.ETL
             }
         }
 
+        private void HandleTransformationScriptParseException(TStatsScope stats, Exception e)
+        {
+            var message = $"[{Name}] Could not parse transformation script. Stopping ETL process.";
+
+            if (Logger.IsOperationsEnabled)
+                Logger.Operations(message, e);
+
+            var key = $"{Tag}/{Name}";
+            var details = new EtlErrorsDetails();
+
+            details.Errors.Enqueue(new EtlErrorInfo { Date = SystemTime.UtcNow, Error = e.ToString() });
+
+            var alert = AlertRaised.Create(
+                Database.Name,
+                Tag,
+                message,
+                AlertType.Etl_TransformationError,
+                NotificationSeverity.Error,
+                key: key,
+                details: details);
+
+            Database.NotificationCenter.Add(alert);
+
+            stats.RecordBatchTransformationCompleteReason(message);
+            stats.RecordTransformationError();
+
+            Stop(reason: message);
+        }
+
         public bool Load(IEnumerable<TTransformed> items, DocumentsOperationContext context, TStatsScope stats)
         {
             using (var loadScope = stats.For(EtlOperations.Load))
@@ -457,7 +480,7 @@ namespace Raven.Server.Documents.ETL
                 }
                 catch (Exception e)
                 {
-                    if (CancellationToken.IsCancellationRequested == false) 
+                    if (CancellationToken.IsCancellationRequested == false)
                     {
                         string msg = $"Failed to load transformed data for '{Name}'";
 
@@ -469,7 +492,7 @@ namespace Raven.Server.Documents.ETL
                         stats.RecordLoadFailure();
                         stats.RecordBatchStopReason($"{msg} : {e}");
 
-                        EnterFallbackMode();
+                        EnterFallbackMode(Statistics.LastLoadErrorTime);
 
                         Statistics.RecordLoadError(e.ToString(), documentId: null, count: stats.NumberOfExtractedItems.Sum(x => x.Value));
                     }
@@ -479,14 +502,14 @@ namespace Raven.Server.Documents.ETL
             }
         }
 
-        private void EnterFallbackMode()
+        private void EnterFallbackMode(DateTime? lastErrorTime)
         {
-            if (Statistics.LastLoadErrorTime == null)
+            if (lastErrorTime == null)
                 FallbackTime = TimeSpan.FromSeconds(5);
             else
             {
                 // double the fallback time (but don't cross Etl.MaxFallbackTime)
-                var secondsSinceLastError = (Database.Time.GetUtcNow() - Statistics.LastLoadErrorTime.Value).TotalSeconds;
+                var secondsSinceLastError = (Database.Time.GetUtcNow() - lastErrorTime.Value).TotalSeconds;
 
                 FallbackTime = TimeSpan.FromSeconds(Math.Min(Database.Configuration.Etl.MaxFallbackTime.AsTimeSpan.TotalSeconds, Math.Max(5, secondsSinceLastError * 2)));
             }
@@ -645,7 +668,7 @@ namespace Raven.Server.Documents.ETL
             if (_longRunningWork != null)
                 return;
 
-            if (Transformation.Disabled || Configuration.Disabled)
+            if (Transformation.Disabled || Configuration.Disabled || Database.DisableOngoingTasks)
                 return;
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(Database.DatabaseShutdown);
@@ -666,7 +689,7 @@ namespace Raven.Server.Documents.ETL
                     if (Logger.IsOperationsEnabled)
                         Logger.Operations($"Failed to run ETL {Name}", e);
                 }
-            }, null, threadName);
+            }, null, ThreadNames.ForEtlProcess(threadName, Tag, Name));
 
             if (Logger.IsOperationsEnabled)
                 Logger.Operations($"Starting {Tag} process: '{Name}'.");
@@ -818,20 +841,33 @@ namespace Raven.Server.Documents.ETL
 
                     if (didWork)
                     {
-                        try
+                        DateTime? lastUpdateStateErrorTime = null;
+                        while (true)
                         {
-                            UpdateEtlProcessState(state);
-                            Database.EtlLoader.OnBatchCompleted(ConfigurationName, TransformationName, Statistics);
-                        }
-                        catch (Exception e)
-                        {
-                            if (CancellationToken.IsCancellationRequested == false)
+                            try
                             {
-                                if (Logger.IsOperationsEnabled) 
+                                UpdateEtlProcessState(state);
+                                break;
+                            }
+                            catch (Exception e)
+                            {
+                                if (CancellationToken.IsCancellationRequested)
+                                    return;
+
+                                if (Logger.IsOperationsEnabled)
                                     Logger.Operations($"{Tag} Failed to update state of ETL process '{Name}'", e);
+
+                                EnterFallbackMode(lastUpdateStateErrorTime);
+                                lastUpdateStateErrorTime = Database.Time.GetUtcNow();
+
+                                if (CancellationToken.WaitHandle.WaitOne(FallbackTime.Value))
+                                    return;
+
+                                FallbackTime = null;
                             }
                         }
 
+                        Database.EtlLoader.OnBatchCompleted(ConfigurationName, TransformationName, Statistics);
                         continue;
                     }
                     try
@@ -857,7 +893,8 @@ namespace Raven.Server.Documents.ETL
 
                                 if (timeLeftToWait > TimeSpan.Zero)
                                 {
-                                    Thread.Sleep(timeLeftToWait);
+                                    if (CancellationToken.WaitHandle.WaitOne(timeLeftToWait))
+                                        return;
                                 }
                             }
 
@@ -1292,7 +1329,7 @@ namespace Raven.Server.Documents.ETL
                                     throw new NotSupportedException($"Unknown Queue ETL type in script test: {queueEtl.GetType().FullName}");
                             }
                         }
-                        
+
 
                     default:
                         throw new NotSupportedException($"Unknown ETL type in script test: {testScript.Configuration.EtlType}");

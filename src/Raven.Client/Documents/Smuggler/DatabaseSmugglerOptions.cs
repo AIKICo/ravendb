@@ -15,7 +15,8 @@ namespace Raven.Client.Documents.Smuggler
                                                               DatabaseItemType.Attachments |
                                                               DatabaseItemType.CounterGroups |
                                                               DatabaseItemType.Subscriptions |
-                                                              DatabaseItemType.TimeSeries;
+                                                              DatabaseItemType.TimeSeries |
+                                                              DatabaseItemType.TimeSeriesDeletedRanges;
 
         public const DatabaseRecordItemType DefaultOperateOnDatabaseRecordTypes = DatabaseRecordItemType.Client |
                                                                                   DatabaseRecordItemType.ConflictSolverConfig |
@@ -41,7 +42,9 @@ namespace Raven.Client.Documents.Smuggler
                                                                                   DatabaseRecordItemType.ElasticSearchEtls |
                                                                                   DatabaseRecordItemType.PostgreSQLIntegration |
                                                                                   DatabaseRecordItemType.QueueConnectionStrings |
-                                                                                  DatabaseRecordItemType.QueueEtls;
+                                                                                  DatabaseRecordItemType.QueueEtls |
+                                                                                  DatabaseRecordItemType.IndexesHistory |
+                                                                                  DatabaseRecordItemType.Refresh;
 
         private const int DefaultMaxStepsForTransformScript = 10 * 1000;
 
@@ -72,6 +75,14 @@ namespace Raven.Client.Documents.Smuggler
         public string EncryptionKey { get; set; }
 
         public List<string> Collections { get; set; }
+
+        /// <summary>
+        /// In case the database is corrupted (for example, Compression Dictionaries are lost), it is possible to export all the remaining data.
+        /// If '<c>true</c>', the process will continue in the presence of corrupted data, with an entry of error data into the export result report.
+        /// If '<c>false</c>', the process of export will be interrupted in the presence of corrupted data. 
+        /// The default value is '<c>false</c>'.
+        /// </summary>
+        public bool SkipCorruptedData { get; set; }
     }
 
     internal interface IDatabaseSmugglerOptions
@@ -84,5 +95,11 @@ namespace Raven.Client.Documents.Smuggler
         string TransformScript { get; set; }
         int MaxStepsForTransformScript { get; set; }
         List<string> Collections { get; set; }
+    }
+
+    public enum ExportCompressionAlgorithm
+    {
+        Zstd,
+        Gzip
     }
 }

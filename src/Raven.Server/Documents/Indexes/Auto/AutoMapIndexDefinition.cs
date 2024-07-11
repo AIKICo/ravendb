@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using Raven.Client;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Indexes.Spatial;
 using Raven.Server.Extensions;
+using Raven.Server.Json;
 using Sparrow.Json;
 using Sparrow.Server.Json.Sync;
 using Voron;
@@ -12,8 +14,8 @@ namespace Raven.Server.Documents.Indexes.Auto
 {
     public class AutoMapIndexDefinition : AutoIndexDefinitionBaseServerSide
     {
-        public AutoMapIndexDefinition(string collection, AutoIndexField[] fields, IndexDeploymentMode? deploymentMode, long? indexVersion = null)
-            : base(AutoIndexNameFinder.FindMapIndexName(collection, fields), collection, fields, deploymentMode, indexVersion)
+        internal AutoMapIndexDefinition(string collection, AutoIndexField[] fields, IndexDeploymentMode? deploymentMode, long? indexVersion = null, ClusterState clusterState = null)
+            : base(AutoIndexNameFinder.FindMapIndexName(collection, fields), collection, fields, deploymentMode, indexVersion, clusterState)
         {
         }
 
@@ -137,6 +139,12 @@ namespace Raven.Server.Documents.Indexes.Auto
                 json.TryGet(nameof(AutoIndexField.Indexing), out string indexing);
                 json.TryGet(nameof(AutoIndexField.HasSuggestions), out bool hasSuggestions);
                 json.TryGet(nameof(AutoIndexField.HasQuotedName), out bool hasQuotedName);
+                json.TryGet(nameof(AutoIndexField.Spatial), out BlittableJsonReaderObject spatialBlittable);
+
+                AutoSpatialOptions spatial = null;
+                
+                if (spatialBlittable != null)
+                    spatial = JsonDeserializationServer.AutoSpatialOptions(spatialBlittable);
 
                 var field = new AutoIndexField
                 {
@@ -145,6 +153,7 @@ namespace Raven.Server.Documents.Indexes.Auto
                     Indexing = (AutoFieldIndexing)Enum.Parse(typeof(AutoFieldIndexing), indexing),
                     HasSuggestions = hasSuggestions,
                     HasQuotedName = hasQuotedName,
+                    Spatial = spatial
                 };
 
                 fields[i] = field;

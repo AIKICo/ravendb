@@ -29,7 +29,9 @@ namespace Raven.Client.Documents.Smuggler
         CompareExchangeTombstones = 1 << 17,
         TimeSeries = 1 << 18,
 
-        ReplicationHubCertificates = 1 << 19
+        ReplicationHubCertificates = 1 << 19,
+
+        TimeSeriesDeletedRanges = 1 << 20
     }
 
     [Flags]
@@ -62,5 +64,7 @@ namespace Raven.Client.Documents.Smuggler
         PostgreSQLIntegration = 1 << 23,
         QueueConnectionStrings = 1 << 24,
         QueueEtls = 1 << 25,
+        IndexesHistory = 1 << 26,
+        Refresh = 1 << 27
     }
 }

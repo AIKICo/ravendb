@@ -238,7 +238,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
                 {
                     if (field.Value.AggregationOperation == AggregationOperation.None)
                     {
-                        throw new InvalidQueryException($"Field '{field.Key}' isn't neither an aggregation operation nor part of the group by key", query.Metadata.QueryText,
+                        throw new InvalidQueryException($"Field '{field.Key}' is neither an aggregation operation nor part of the group by key", query.Metadata.QueryText,
                             query.QueryParameters);
                     }
                 }
@@ -355,6 +355,23 @@ namespace Raven.Server.Documents.Queries.Dynamic
                     {
                         existingField.SetAggregation(field.AggregationOperation);
                     }
+                }
+            }
+
+            if (query.Metadata.CountInJs.HasValue)
+            {
+                if (mapFields.TryGetValue(Constants.Documents.Indexing.Fields.CountFieldName, out var countField) == false)
+                {
+                    mapFields.Add(Constants.Documents.Indexing.Fields.CountFieldName, DynamicQueryMappingItem.Create(QueryFieldName.Count, AggregationOperation.Count));
+                }
+            }
+
+            if (query.Metadata.SumInJs is not null)
+            {
+                if (mapFields.TryGetValue(query.Metadata.SumInJs, out var sumField) == false)
+                {
+                    var queryFieldName = new QueryFieldName(query.Metadata.SumInJs, false);
+                    mapFields.Add(query.Metadata.SumInJs, DynamicQueryMappingItem.Create(queryFieldName, AggregationOperation.Sum));
                 }
             }
 

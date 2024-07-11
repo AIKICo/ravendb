@@ -137,7 +137,7 @@ namespace Raven.Server.ServerWide
             // Database SEP SubscriptionId SEP type SEP key
             // type is Revision or Document
             // key is lowered docId for document or current change vector for revision
-            Key, 
+            Key,
             ChangeVector,
             BatchId,
         }
@@ -295,7 +295,7 @@ namespace Raven.Server.ServerWide
             SubscriptionStateSchema.DefineKey(new TableSchema.SchemaIndexDef
             {
                 StartIndex = (int)SubscriptionStateTable.Key,
-                Count =  1,
+                Count = 1,
                 IsGlobal = false,
                 Name = SubscriptionStateKeySlice
             });
@@ -310,7 +310,7 @@ namespace Raven.Server.ServerWide
 
         public long LastNotifiedIndex => Interlocked.Read(ref _rachisLogIndexNotifications.LastModifiedIndex);
 
-        private readonly RachisLogIndexNotifications _rachisLogIndexNotifications = new RachisLogIndexNotifications(CancellationToken.None);
+        public readonly RachisLogIndexNotifications _rachisLogIndexNotifications = new RachisLogIndexNotifications(CancellationToken.None);
 
         public override void Dispose()
         {
@@ -335,12 +335,8 @@ namespace Raven.Server.ServerWide
                 switch (type)
                 {
                     case nameof(ClusterTransactionCommand):
-                        var errors = ExecuteClusterTransaction(context, cmd, index);
-                        if (errors != null)
-                        {
-                            result = errors;
-                            leader?.SetStateOf(index, errors);
-                        }
+                        result = ExecuteClusterTransaction(context, cmd, index);
+                        leader?.SetStateOf(index, result);
                         break;
 
                     case nameof(CleanUpClusterStateCommand):
@@ -397,25 +393,25 @@ namespace Raven.Server.ServerWide
                     case nameof(IncrementClusterIdentityCommand):
                         if (ValidatePropertyExistence(cmd, nameof(IncrementClusterIdentityCommand), nameof(IncrementClusterIdentityCommand.Prefix), out errorMessage) == false)
                             throw new RachisApplyException(errorMessage);
-                        SetValueForTypedDatabaseCommand(context, type, cmd, index, leader, out result);
+                        SetValueForTypedDatabaseCommand(context, type, cmd, index, out result);
                         leader?.SetStateOf(index, result);
-                        SetIndexForBackup(context, cmd, index, type);
+                        SetIndexForBackup(context, UpdateValueForDatabaseCommand.GetDatabaseNameFromJson(cmd), index, type);
                         break;
 
                     case nameof(IncrementClusterIdentitiesBatchCommand):
                         if (ValidatePropertyExistence(cmd, nameof(IncrementClusterIdentitiesBatchCommand), nameof(IncrementClusterIdentitiesBatchCommand.DatabaseName), out errorMessage) == false)
                             throw new RachisApplyException(errorMessage);
-                        SetValueForTypedDatabaseCommand(context, type, cmd, index, leader, out result);
+                        SetValueForTypedDatabaseCommand(context, type, cmd, index, out result);
                         leader?.SetStateOf(index, result);
-                        SetIndexForBackup(context, cmd, index, type);
+                        SetIndexForBackup(context, UpdateValueForDatabaseCommand.GetDatabaseNameFromJson(cmd), index, type);
                         break;
 
                     case nameof(UpdateClusterIdentityCommand):
                         if (ValidatePropertyExistence(cmd, nameof(UpdateClusterIdentityCommand), nameof(UpdateClusterIdentityCommand.Identities), out errorMessage) == false)
                             throw new RachisApplyException(errorMessage);
-                        SetValueForTypedDatabaseCommand(context, type, cmd, index, leader, out result);
+                        SetValueForTypedDatabaseCommand(context, type, cmd, index, out result);
                         leader?.SetStateOf(index, result);
-                        SetIndexForBackup(context, cmd, index, type);
+                        SetIndexForBackup(context, UpdateValueForDatabaseCommand.GetDatabaseNameFromJson(cmd), index, type);
                         break;
 
                     case nameof(PutSortersCommand):
@@ -463,7 +459,7 @@ namespace Raven.Server.ServerWide
                     case nameof(PutQueueConnectionStringCommand):
                     case nameof(RemoveRavenConnectionStringCommand):
                     case nameof(RemoveSqlConnectionStringCommand):
-                    case nameof(RemoveOlapConnectionStringCommand): 
+                    case nameof(RemoveOlapConnectionStringCommand):
                     case nameof(RemoveElasticSearchConnectionStringCommand):
                     case nameof(RemoveQueueConnectionStringCommand):
                     case nameof(UpdatePullReplicationAsHubCommand):
@@ -473,6 +469,8 @@ namespace Raven.Server.ServerWide
                     case nameof(UpdateUnusedDatabaseIdsCommand):
                     case nameof(EditLockModeCommand):
                     case nameof(EditPostgreSqlConfigurationCommand):
+                    case nameof(PutIndexHistoryCommand):
+                    case nameof(DeleteIndexHistoryCommand):
                         UpdateDatabase(context, type, cmd, index, leader, serverStore);
                         break;
 
@@ -487,14 +485,14 @@ namespace Raven.Server.ServerWide
                     case nameof(UpdateSubscriptionClientConnectionTime):
                     case nameof(UpdateSnmpDatabaseIndexesMappingCommand):
                     case nameof(RemoveEtlProcessStateCommand):
-                        SetValueForTypedDatabaseCommand(context, type, cmd, index, leader, out _);
+                    case nameof(DelayBackupCommand):
+                        SetValueForTypedDatabaseCommand(context, type, cmd, index, out _);
                         break;
 
                     case nameof(AddOrUpdateCompareExchangeCommand):
                     case nameof(RemoveCompareExchangeCommand):
                         ExecuteCompareExchange(context, type, cmd, index, out result);
                         leader?.SetStateOf(index, result);
-                        SetIndexForBackup(context, cmd, index, type);
                         break;
 
                     case nameof(InstallUpdatedServerCertificateCommand):
@@ -551,6 +549,10 @@ namespace Raven.Server.ServerWide
 
                     case nameof(ToggleDatabasesStateCommand):
                         ToggleDatabasesState(cmd, context, type, index);
+                        break;
+
+                    case nameof(UpdateResponsibleNodeForTasksCommand):
+                        UpdateResponsibleNodeForTasks(cmd, context, type, index);
                         break;
 
                     case nameof(PutServerWideBackupConfigurationCommand):
@@ -662,7 +664,7 @@ namespace Raven.Server.ServerWide
                     _parent.Log.Operations(error, e);
 
                 AddUnrecoverableNotification(error, e);
-                NotifyLeaderAboutError(index, leader, e);
+                NotifyLeaderAboutFatalError(index, leader, e);
                 throw;
             }
             finally
@@ -724,13 +726,15 @@ namespace Raven.Server.ServerWide
 
             PutSubscriptionCommand updateCommand = null;
             Exception exception = null;
-            var actionsByDatabase = new Dictionary<string, List<Func<Task>>>();
+            var actions = new List<Func<Task>>();
+            var databases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
             try
             {
                 foreach (BlittableJsonReaderObject command in subscriptionCommands)
                 {
-                    if (command.TryGet("Type", out string putSubscriptionType) == false && putSubscriptionType != nameof(PutSubscriptionCommand))
+                    if (command.TryGet("Type", out string putSubscriptionType) == false || putSubscriptionType != nameof(PutSubscriptionCommand))
                     {
                         throw new RachisApplyException($"Cannot execute {type} command, wrong format");
                     }
@@ -747,19 +751,15 @@ namespace Raven.Server.ServerWide
                     var id = updateCommand.FindFreeId(context, index);
                     updateCommand.Execute(context, items, id, record: null, _parent.CurrentState, out _);
 
-                    if (actionsByDatabase.ContainsKey(database) == false)
+                    if (databases.Add(database))
                     {
-                        actionsByDatabase[database] = new List<Func<Task>>();
+                        actions.Add(() =>
+                            Changes.OnDatabaseChanges(database, index, nameof(PutSubscriptionCommand), DatabasesLandlord.ClusterDatabaseChangeType.ValueChanged, null));
                     }
-
-                    actionsByDatabase[database].Add(() =>
-                        Changes.OnDatabaseChanges(database, index, nameof(PutSubscriptionCommand), DatabasesLandlord.ClusterDatabaseChangeType.ValueChanged, null));
                 }
 
-                foreach (var action in actionsByDatabase)
-                {
-                    ExecuteManyOnDispose(context, index, type, action.Value);
-                }
+                ExecuteManyOnDispose(context, index, type, actions);
+
             }
             catch (Exception e)
             {
@@ -772,14 +772,13 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        private void SetIndexForBackup(ClusterOperationContext context, BlittableJsonReaderObject bjro, long index, string type)
+        private static void SetIndexForBackup(ClusterOperationContext context, string databaseName, long index, string type)
         {
             if (index < 0)
                 return;
 
-            if ((bjro.TryGet(nameof(CompareExchangeCommandBase.Database), out string databaseName) == false ||
-                 string.IsNullOrEmpty(databaseName)) && type.Equals(nameof(AddOrUpdateCompareExchangeCommand)))
-                throw new RachisApplyException($"Command {type} must contain a DatabaseName property. Index {index}");
+            if (string.IsNullOrEmpty(databaseName))
+                throw new RachisApplyException($"Command '{type}' must contain a DatabaseName property. Index {index}");
 
             var dbKey = $"db/{databaseName}";
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
@@ -798,7 +797,8 @@ namespace Raven.Server.ServerWide
                     databaseRecordJson = context.ReadObject(databaseRecordJson, dbKey);
                 }
 
-                UpdateValue(index, items, keyLowered, key, databaseRecordJson);
+                using (databaseRecordJson)
+                    UpdateValue(index, items, keyLowered, key, databaseRecordJson);
             }
         }
 
@@ -830,8 +830,12 @@ namespace Raven.Server.ServerWide
 
                 var items = context.Transaction.InnerTransaction.OpenTable(CompareExchangeSchema, CompareExchange);
 
+                HashSet<string> databasesToUpdate = null;
+
                 if (hasAddCommands)
                 {
+                    databasesToUpdate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                     foreach (BlittableJsonReaderObject command in addCommands)
                     {
                         if (command.TryGet("Type", out string type) == false || type != nameof(AddOrUpdateCompareExchangeCommand))
@@ -841,12 +845,15 @@ namespace Raven.Server.ServerWide
 
                         compareExchange = (CompareExchangeCommandBase)JsonDeserializationCluster.Commands[type](command);
                         compareExchange.Execute(context, items, index);
-                        SetIndexForBackup(context, command, index, type);
+
+                        databasesToUpdate.Add(compareExchange.Database);
                     }
                 }
 
                 if (hasRemoveCommands)
                 {
+                    databasesToUpdate ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                     foreach (BlittableJsonReaderObject command in removeCommands)
                     {
                         if (command.TryGet("Type", out string type) == false || type != nameof(RemoveCompareExchangeCommand))
@@ -856,8 +863,15 @@ namespace Raven.Server.ServerWide
 
                         compareExchange = (CompareExchangeCommandBase)JsonDeserializationCluster.Commands[type](command);
                         compareExchange.Execute(context, items, index);
-                        SetIndexForBackup(context, command, index, type);
+
+                        databasesToUpdate.Add(compareExchange.Database);
                     }
+                }
+
+                if (databasesToUpdate is { Count: > 0 })
+                {
+                    foreach (var databaseName in databasesToUpdate)
+                        SetIndexForBackup(context, databaseName, index, commandType);
                 }
 
                 OnTransactionDispose(context, index);
@@ -927,14 +941,19 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        private List<ClusterTransactionCommand.ClusterTransactionErrorInfo> ExecuteClusterTransaction(ClusterOperationContext context, BlittableJsonReaderObject cmd, long index)
+        private object ExecuteClusterTransaction(ClusterOperationContext context, BlittableJsonReaderObject cmd, long index)
         {
             ClusterTransactionCommand clusterTransaction = null;
             Exception exception = null;
+            RawDatabaseRecord rawRecord = null;
             try
             {
                 clusterTransaction = (ClusterTransactionCommand)JsonDeserializationCluster.Commands[nameof(ClusterTransactionCommand)](cmd);
-                var dbTopology = UpdateDatabaseRecordId(context, index, clusterTransaction);
+                rawRecord = ReadRawDatabaseRecord(context, clusterTransaction.DatabaseName);
+                if (rawRecord == null)
+                    throw DatabaseDoesNotExistException.CreateWithMessage(clusterTransaction.DatabaseName, $"Could not execute update command of type '{nameof(ClusterTransactionCommand)}'.");
+
+                UpdateDatabaseRecordId(context, index, clusterTransaction, ref rawRecord);
 
                 if (clusterTransaction.SerializedDatabaseCommands != null &&
                     clusterTransaction.SerializedDatabaseCommands.TryGet(nameof(ClusterTransactionCommand.Options), out BlittableJsonReaderObject blittableOptions))
@@ -943,21 +962,28 @@ namespace Raven.Server.ServerWide
                 }
 
                 var compareExchangeItems = context.Transaction.InnerTransaction.OpenTable(CompareExchangeSchema, CompareExchange);
-                var error = clusterTransaction.ExecuteCompareExchangeCommands(dbTopology, context, index, compareExchangeItems);
-                if (error == null)
+                var errors = clusterTransaction.ExecuteCompareExchangeCommands(rawRecord.GetClusterTransactionId(), context, index, compareExchangeItems);
+                if (errors == null)
                 {
-                    clusterTransaction.SaveCommandsBatch(context, index);
-                    var notify = clusterTransaction.HasDocumentsInTransaction
-                        ? DatabasesLandlord.ClusterDatabaseChangeType.PendingClusterTransactions
-                        : DatabasesLandlord.ClusterDatabaseChangeType.ClusterTransactionCompleted;
+                    DatabasesLandlord.ClusterDatabaseChangeType notify;
+                    var clusterTransactionResult = new ClusterTransactionResult();
+                    if (clusterTransaction.HasDocumentsInTransaction)
+                    {
+                        clusterTransactionResult.GeneratedResult = clusterTransaction.SaveCommandsBatch(context, rawRecord, index);
+                        notify = DatabasesLandlord.ClusterDatabaseChangeType.PendingClusterTransactions;
+                    }
+                    else
+                    {
+                        notify = DatabasesLandlord.ClusterDatabaseChangeType.ClusterTransactionCompleted;
+                    }
 
                     NotifyDatabaseAboutChanged(context, clusterTransaction.DatabaseName, index, nameof(ClusterTransactionCommand), notify, null);
 
-                    return null;
+                    return clusterTransactionResult;
                 }
 
                 OnTransactionDispose(context, index);
-                return error;
+                return errors;
             }
             catch (Exception e)
             {
@@ -966,14 +992,14 @@ namespace Raven.Server.ServerWide
             }
             finally
             {
+                rawRecord?.Dispose();
                 LogCommand(nameof(ClusterTransactionCommand), index, exception, clusterTransaction);
             }
         }
 
-        private DatabaseTopology UpdateDatabaseRecordId(ClusterOperationContext context, long index, ClusterTransactionCommand clusterTransaction)
+        private void UpdateDatabaseRecordId(ClusterOperationContext context, long index,
+            ClusterTransactionCommand clusterTransaction, ref RawDatabaseRecord rawRecord)
         {
-            var rawRecord = ReadRawDatabaseRecord(context, clusterTransaction.DatabaseName);
-
             if (rawRecord == null)
                 throw DatabaseDoesNotExistException.CreateWithMessage(clusterTransaction.DatabaseName, $"Could not execute update command of type '{nameof(ClusterTransactionCommand)}'.");
 
@@ -993,15 +1019,15 @@ namespace Raven.Server.ServerWide
                         [nameof(DatabaseRecord.Topology)] = topology.ToJson()
                     };
 
-                    using (var old = databaseRecordJson)
+                    using (rawRecord)
                     {
                         databaseRecordJson = context.ReadObject(databaseRecordJson, dbKey);
                     }
 
                     UpdateValue(index, items, valueNameLowered, valueName, databaseRecordJson);
+                    rawRecord = new RawDatabaseRecord(databaseRecordJson);
                 }
             }
-            return topology;
         }
 
         private void ConfirmReceiptServerCertificate(ClusterOperationContext context, BlittableJsonReaderObject cmd, long index, ServerStore serverStore)
@@ -1321,7 +1347,6 @@ namespace Raven.Server.ServerWide
                                 finally
                                 {
                                     _rachisLogIndexNotifications.NotifyListenersAbout(index, error);
-                                    _rachisLogIndexNotifications.SetTaskCompleted(index, error);
                                 }
                             }
                         });
@@ -1335,11 +1360,10 @@ namespace Raven.Server.ServerWide
             try
             {
                 _rachisLogIndexNotifications.NotifyListenersAbout(index, null);
-                _rachisLogIndexNotifications.SetTaskCompleted(index, null);
             }
             catch (OperationCanceledException e)
             {
-                _rachisLogIndexNotifications.SetTaskCompleted(index, e);
+                _rachisLogIndexNotifications.NotifyListenersAbout(index, e);
             }
         }
 
@@ -1363,6 +1387,27 @@ namespace Raven.Server.ServerWide
             leader.SetStateOf(index, tcs => { tcs.TrySetException(e); });
         }
 
+        protected void NotifyLeaderAboutFatalError(long index, Leader leader, Exception e)
+        {
+            _rachisLogIndexNotifications.RecordNotification(new RecentLogIndexNotification
+            {
+                Type = "Error",
+                ExecutionTime = TimeSpan.Zero,
+                Index = index,
+                LeaderErrorCount = leader?.ErrorsList.Count,
+                Term = leader?.Term,
+                LeaderShipDuration = leader?.LeaderShipDuration,
+                Exception = e,
+            });
+
+            // ReSharper disable once UseNullPropagation
+            if (leader == null)
+                return;
+
+            leader.SetExceptionOf(index, e);
+        }
+
+
         private static bool ValidatePropertyExistence(BlittableJsonReaderObject cmd, string propertyTypeName, string propertyName, out string errorMessage)
         {
             errorMessage = null;
@@ -1374,9 +1419,8 @@ namespace Raven.Server.ServerWide
             return true;
         }
 
-        private void SetValueForTypedDatabaseCommand(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, Leader leader, out object result)
+        private void SetValueForTypedDatabaseCommand(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, out object result)
         {
-            result = null;
             UpdateValueForDatabaseCommand updateCommand = null;
             Exception exception = null;
             try
@@ -1401,7 +1445,7 @@ namespace Raven.Server.ServerWide
             finally
             {
                 LogCommand(type, index, exception, updateCommand);
-                NotifyDatabaseAboutChanged(context, updateCommand?.DatabaseName, index, type, DatabasesLandlord.ClusterDatabaseChangeType.ValueChanged, null);
+                NotifyDatabaseAboutChanged(context, updateCommand?.DatabaseName, index, type, DatabasesLandlord.ClusterDatabaseChangeType.ValueChanged, updateCommand?.GetState());
             }
         }
 
@@ -1490,7 +1534,7 @@ namespace Raven.Server.ServerWide
 
         private static void CleanupDatabaseReplicationCertificate(ClusterOperationContext context, string databaseName)
         {
-            using var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
+            var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
 
             string prefixString = (databaseName + "/").ToLowerInvariant();
             using var _ = Slice.From(context.Allocator, prefixString, out var prefix);
@@ -1514,8 +1558,7 @@ namespace Raven.Server.ServerWide
                 context.Transaction.InnerTransaction.OpenTable(IdentitiesSchema, Identities).DeleteByPrimaryKeyPrefix(databaseSlice);
             }
 
-            databaseLowered = $"{databaseName.ToLowerInvariant()}{SpecialChars.RecordSeparator}";
-            using (Slice.From(context.Allocator, databaseLowered, out var databaseSlice))
+            using (Slice.From(context.Allocator, databaseName.ToLowerInvariant(), SpecialChars.RecordSeparator, ByteStringType.Immutable, out var databaseSlice))
             {
                 context.Transaction.InnerTransaction.OpenTable(SubscriptionStateSchema, SubscriptionState).DeleteByPrimaryKeyPrefix(databaseSlice);
             }
@@ -1876,7 +1919,7 @@ namespace Raven.Server.ServerWide
             DeleteValueCommand delCmd = null;
             try
             {
-                delCmd = (DeleteValueCommand)CommandBase.CreateFrom(cmd);
+                delCmd = (DeleteValueCommand)JsonDeserializationCluster.Commands[type](cmd);
                 if (delCmd.Name.StartsWith("db/"))
                     throw new RachisApplyException("Cannot delete " + delCmd.Name + " using DeleteValueCommand, only via dedicated database calls");
 
@@ -1900,7 +1943,7 @@ namespace Raven.Server.ServerWide
         {
             try
             {
-                var command = (DeleteCertificateFromClusterCommand)CommandBase.CreateFrom(cmd);
+                var command = (DeleteCertificateFromClusterCommand)JsonDeserializationCluster.Commands[type](cmd);
 
                 DeleteCertificate(context, command.Name);
             }
@@ -1914,7 +1957,7 @@ namespace Raven.Server.ServerWide
         {
             try
             {
-                var command = (DeleteCertificateCollectionFromClusterCommand)CommandBase.CreateFrom(cmd);
+                var command = (DeleteCertificateCollectionFromClusterCommand)JsonDeserializationCluster.Commands[type](cmd);
 
                 foreach (var thumbprint in command.Names)
                 {
@@ -2021,7 +2064,7 @@ namespace Raven.Server.ServerWide
             try
             {
                 var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
-                command = (UpdateValueCommand<T>)CommandBase.CreateFrom(cmd);
+                command = (UpdateValueCommand<T>)JsonDeserializationCluster.Commands[type](cmd);
                 if (command.Name.StartsWith(Constants.Documents.Prefix))
                     throw new RachisApplyException("Cannot set " + command.Name + " using PutValueCommand, only via dedicated database calls");
 
@@ -2106,7 +2149,7 @@ namespace Raven.Server.ServerWide
             try
             {
                 var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
-                command = (PutValueCommand<T>)CommandBase.CreateFrom(cmd);
+                command = (PutValueCommand<T>)JsonDeserializationCluster.Commands[type](cmd);
                 if (command.Name.StartsWith(Constants.Documents.Prefix))
                     throw new RachisApplyException("Cannot set " + command.Name + " using PutValueCommand, only via dedicated database calls");
 
@@ -2147,7 +2190,7 @@ namespace Raven.Server.ServerWide
             try
             {
                 var certs = context.Transaction.InnerTransaction.OpenTable(CertificatesSchema, CertificatesSlice);
-                var command = (PutCertificateCommand)CommandBase.CreateFrom(cmd);
+                var command = (PutCertificateCommand)JsonDeserializationCluster.Commands[type](cmd);
 
                 using (Slice.From(context.Allocator, command.PublicKeyPinningHash, out var hashSlice))
                 using (Slice.From(context.Allocator, command.Name.ToLowerInvariant(), out var thumbprintSlice))
@@ -2169,7 +2212,7 @@ namespace Raven.Server.ServerWide
 
         private void BulkPutReplicationCertificate(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, ServerStore serverStore)
         {
-            var command = (BulkRegisterReplicationHubAccessCommand)CommandBase.CreateFrom(cmd);
+            var command = (BulkRegisterReplicationHubAccessCommand)JsonDeserializationCluster.Commands[type](cmd);
             try
             {
                 var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
@@ -2187,7 +2230,7 @@ namespace Raven.Server.ServerWide
 
         private void PutReplicationCertificate(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, ServerStore serverStore)
         {
-            var command = (RegisterReplicationHubAccessCommand)CommandBase.CreateFrom(cmd);
+            var command = (RegisterReplicationHubAccessCommand)JsonDeserializationCluster.Commands[type](cmd);
             try
             {
                 var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
@@ -2250,7 +2293,7 @@ namespace Raven.Server.ServerWide
 
         private void RemoveReplicationCertificate(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, ServerStore serverStore)
         {
-            var command = (UnregisterReplicationHubAccessCommand)CommandBase.CreateFrom(cmd);
+            var command = (UnregisterReplicationHubAccessCommand)JsonDeserializationCluster.Commands[type](cmd);
             try
             {
                 var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
@@ -2350,7 +2393,6 @@ namespace Raven.Server.ServerWide
                 finally
                 {
                     _rachisLogIndexNotifications.NotifyListenersAbout(index, error);
-                    _rachisLogIndexNotifications.SetTaskCompleted(index, error);
                 }
             });
         }
@@ -2407,7 +2449,7 @@ namespace Raven.Server.ServerWide
                         return;
                     }
 
-                    UpdateEtagForBackup(databaseRecord, type, index);
+                    UpdateIndexForBackup(databaseRecord, type, index);
                     var updatedDatabaseBlittable = DocumentConventions.DefaultForServer.Serialization.DefaultConverter.ToBlittable(databaseRecord, context);
                     UpdateValue(index, items, valueNameLowered, valueName, updatedDatabaseBlittable);
                 }
@@ -2446,56 +2488,52 @@ namespace Raven.Server.ServerWide
             _parent.Log.Info(msg);
         }
 
-        private void UpdateEtagForBackup(DatabaseRecord databaseRecord, string type, long index)
+        private static void UpdateIndexForBackup(DatabaseRecord databaseRecord, string type, long index)
         {
             switch (type)
             {
-                case nameof(UpdateClusterIdentityCommand):
-                case nameof(IncrementClusterIdentitiesBatchCommand):
-                case nameof(IncrementClusterIdentityCommand):
-                case nameof(AddOrUpdateCompareExchangeCommand):
-                case nameof(RemoveCompareExchangeCommand):
-                case nameof(AddOrUpdateCompareExchangeBatchCommand):
-                case nameof(UpdatePeriodicBackupCommand):
-                case nameof(UpdateExternalReplicationCommand):
+                case nameof(AddElasticSearchEtlCommand):
+                case nameof(AddOlapEtlCommand):
+                case nameof(AddQueueEtlCommand):
                 case nameof(AddRavenEtlCommand):
                 case nameof(AddSqlEtlCommand):
-                case nameof(AddOlapEtlCommand):
-                case nameof(AddElasticSearchEtlCommand):
-                case nameof(AddQueueEtlCommand):
-                case nameof(UpdateRavenEtlCommand):
-                case nameof(UpdateSqlEtlCommand):
-                case nameof(UpdateOlapEtlCommand):
-                case nameof(UpdateElasticSearchEtlCommand):
-                case nameof(UpdateQueueEtlCommand):
+                case nameof(DeleteIndexCommand):
+                case nameof(DeleteIndexHistoryCommand):
                 case nameof(DeleteOngoingTaskCommand):
+                case nameof(EditDatabaseClientConfigurationCommand):
+                case nameof(EditExpirationCommand):
+                case nameof(EditLockModeCommand):
+                case nameof(EditPostgreSqlConfigurationCommand):
+                case nameof(EditRefreshCommand):
+                case nameof(EditRevisionsConfigurationCommand):
+                case nameof(EditRevisionsForConflictsConfigurationCommand):
+                case nameof(EditTimeSeriesConfigurationCommand):
+                case nameof(PutAutoIndexCommand):
+                case nameof(PutDatabaseClientConfigurationCommand):
+                case nameof(PutDatabaseSettingsCommand):
+                case nameof(PutDatabaseStudioConfigurationCommand):
+                case nameof(PutElasticSearchConnectionStringCommand):
+                case nameof(PutIndexCommand):
+                case nameof(PutIndexHistoryCommand):
+                case nameof(PutOlapConnectionStringCommand):
+                case nameof(PutQueueConnectionStringCommand):
                 case nameof(PutRavenConnectionStringCommand):
                 case nameof(PutSqlConnectionStringCommand):
-                case nameof(PutOlapConnectionStringCommand):
-                case nameof(PutElasticSearchConnectionStringCommand):
-                case nameof(PutQueueConnectionStringCommand):
+                case nameof(RemoveElasticSearchConnectionStringCommand):
+                case nameof(RemoveOlapConnectionStringCommand):
+                case nameof(RemoveQueueConnectionStringCommand):
                 case nameof(RemoveRavenConnectionStringCommand):
                 case nameof(RemoveSqlConnectionStringCommand):
-                case nameof(RemoveOlapConnectionStringCommand):
-                case nameof(RemoveElasticSearchConnectionStringCommand):
-                case nameof(RemoveQueueConnectionStringCommand):
-                case nameof(PutIndexCommand):
-                case nameof(PutDatabaseStudioConfigurationCommand):
-                case nameof(PutDatabaseSettingsCommand):
-                case nameof(PutDatabaseClientConfigurationCommand):
-                case nameof(PutAutoIndexCommand):
-                case nameof(DeleteIndexCommand):
                 case nameof(SetIndexLockCommand):
                 case nameof(SetIndexPriorityCommand):
                 case nameof(SetIndexStateCommand):
-                case nameof(EditRevisionsConfigurationCommand):
-                case nameof(EditTimeSeriesConfigurationCommand):
-                case nameof(EditRevisionsForConflictsConfigurationCommand):
-                case nameof(EditExpirationCommand):
-                case nameof(EditRefreshCommand):
-                case nameof(EditDatabaseClientConfigurationCommand):
-                case nameof(EditLockModeCommand):
-                case nameof(EditPostgreSqlConfigurationCommand):
+                case nameof(UpdateElasticSearchEtlCommand):
+                case nameof(UpdateExternalReplicationCommand):
+                case nameof(UpdateOlapEtlCommand):
+                case nameof(UpdatePeriodicBackupCommand):
+                case nameof(UpdateQueueEtlCommand):
+                case nameof(UpdateRavenEtlCommand):
+                case nameof(UpdateSqlEtlCommand):
                     databaseRecord.EtagForBackup = index;
                     break;
             }
@@ -2649,7 +2687,11 @@ namespace Raven.Server.ServerWide
                             continue;
 
                         var record = rawRecord.MaterializedRecord;
-                        record.Topology = new DatabaseTopology();
+                        record.Topology = new DatabaseTopology
+                        {
+                            ClusterTransactionIdBase64 = rawRecord.Topology.ClusterTransactionIdBase64,
+                            DatabaseTopologyIdBase64 = rawRecord.Topology.DatabaseTopologyIdBase64
+                        };
                         record.Topology.Members.Add(newTag);
                         toShrink.Add(record);
                     }
@@ -2852,7 +2894,7 @@ namespace Raven.Server.ServerWide
             }
         }
 
-        public void ExecuteCompareExchange(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, out object result)
+        private void ExecuteCompareExchange(ClusterOperationContext context, string type, BlittableJsonReaderObject cmd, long index, out object result)
         {
             Exception exception = null;
             CompareExchangeCommandBase compareExchange = null;
@@ -2862,6 +2904,8 @@ namespace Raven.Server.ServerWide
                 compareExchange = (CompareExchangeCommandBase)JsonDeserializationCluster.Commands[type](cmd);
 
                 result = compareExchange.Execute(context, items, index);
+
+                SetIndexForBackup(context, compareExchange.Database, index, type);
 
                 OnTransactionDispose(context, index);
             }
@@ -3074,7 +3118,7 @@ namespace Raven.Server.ServerWide
                 if (cmd.TryGet(nameof(CleanCompareExchangeTombstonesCommand.Take), out long take) == false)
                     throw new RachisApplyException("Clear Compare Exchange command must contain a Take property");
 
-                var databaseNameLowered = databaseName.ToLowerInvariant();
+                var databaseNameLowered = (databaseName + "/").ToLowerInvariant();
                 result = DeleteCompareExchangeTombstonesUpToPrefix(context, databaseNameLowered, maxEtag, take);
             }
             finally
@@ -3607,9 +3651,9 @@ namespace Raven.Server.ServerWide
             {
                 cts.CancelAfter(_parent.TcpConnectionTimeout);
 
-                info = await ReplicationUtils.GetTcpInfoAsync(url, null, "Cluster", certificate, cts.Token);
+                info = await ReplicationUtils.GetServerTcpInfoAsync(url, "Cluster", certificate, cts.Token);
             }
-            
+
             TcpClient tcpClient = null;
             Stream stream = null;
             try
@@ -3618,13 +3662,19 @@ namespace Raven.Server.ServerWide
                 using (ContextPoolForReadOnlyOperations.AllocateOperationContext(out JsonOperationContext context))
                 {
                     var result = await TcpUtils.ConnectSecuredTcpSocket(info, _parent.ClusterCertificate, _parent.CipherSuitesPolicy,
-                        TcpConnectionHeaderMessage.OperationTypes.Cluster, 
-                        (string destUrl, TcpConnectionInfo tcpInfo, Stream conn, JsonOperationContext ctx, List<string> _) => NegotiateProtocolVersionAsyncForCluster(destUrl, tcpInfo, conn, ctx, tag), 
+                        TcpConnectionHeaderMessage.OperationTypes.Cluster,
+                        (string destUrl, TcpConnectionInfo tcpInfo, Stream conn, JsonOperationContext ctx, List<string> _) => NegotiateProtocolVersionAsyncForCluster(destUrl, tcpInfo, conn, ctx, tag),
                         context, _parent.TcpConnectionTimeout, null, token);
 
                     tcpClient = result.TcpClient;
                     stream = result.Stream;
                     supportedFeatures = result.SupportedFeatures;
+
+                    if (supportedFeatures.DataCompression)
+                    {
+                        stream = new ReadWriteCompressedStream(stream);
+                        result.Stream = stream;
+                    }
 
                     if (supportedFeatures.ProtocolVersion <= 0)
                     {
@@ -3666,6 +3716,11 @@ namespace Raven.Server.ServerWide
 
         private async Task<TcpConnectionHeaderMessage.SupportedFeatures> NegotiateProtocolVersionAsyncForCluster(string url, TcpConnectionInfo info, Stream stream, JsonOperationContext ctx, string tag)
         {
+            bool compressionSupport = false;
+            var version = TcpConnectionHeaderMessage.ClusterTcpVersion;
+            if (version >= TcpConnectionHeaderMessage.ClusterWithTcpCompression)
+                compressionSupport = true;
+
             var parameters = new AsyncTcpNegotiateParameters
             {
                 Database = null,
@@ -3675,7 +3730,11 @@ namespace Raven.Server.ServerWide
                 DestinationUrl = url,
                 DestinationNodeTag = tag,
                 SourceNodeTag = _parent.Tag,
-                DestinationServerId = info.ServerId
+                DestinationServerId = info.ServerId,
+                LicensedFeatures = new LicensedFeatures
+                {
+                    DataCompression = compressionSupport && _parent.ServerStore.LicenseManager.LicenseStatus.HasTcpDataCompression && _parent.ServerStore.Configuration.Server.DisableTcpCompression == false
+                }
             };
 
             return await TcpNegotiation.NegotiateProtocolVersionAsync(ctx, stream, parameters);
@@ -3690,7 +3749,7 @@ namespace Raven.Server.ServerWide
             if (command.Value.DatabaseNames == null)
                 throw new RachisInvalidOperationException($"{nameof(ToggleDatabasesStateCommand.Parameters.DatabaseNames)} is null for command type: {type}");
 
-            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName)>();
+            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName, object)>();
 
             foreach (var databaseName in command.Value.DatabaseNames)
             {
@@ -3764,13 +3823,64 @@ namespace Raven.Server.ServerWide
                     using (oldDatabaseRecord)
                     {
                         var updatedDatabaseRecord = context.ReadObject(oldDatabaseRecord, "updated-database-record");
-                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName));
+                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName, null));
                     }
                 }
             }
 
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
-            ApplyDatabaseRecordUpdates(toUpdate, type, index, index, items, context);
+            ApplyDatabaseRecordUpdates(toUpdate, type, index, items, context);
+        }
+
+        private void UpdateResponsibleNodeForTasks(BlittableJsonReaderObject cmd, ClusterOperationContext context, string type, long index)
+        {
+            var command = (UpdateResponsibleNodeForTasksCommand)JsonDeserializationCluster.Commands[type](cmd);
+            if (command.Value == null)
+                throw new RachisInvalidOperationException($"{nameof(UpdateResponsibleNodeForTasksCommand.Parameters)} is null for command type: {type}");
+
+            if (command.Value.ResponsibleNodePerDatabase == null)
+                throw new RachisInvalidOperationException($"{nameof(ToggleDatabasesStateCommand.Parameters.DatabaseNames)} is null for command type: {type}");
+
+            var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
+            Exception exception = null;
+
+
+            try
+            {
+                var actions = new List<Func<Task>>();
+
+                foreach (var keyValue in command.Value.ResponsibleNodePerDatabase)
+                {
+                    var databaseName = keyValue.Key;
+
+                    foreach (var responsibleNodeInfo in keyValue.Value)
+                    {
+                        var itemKey = ResponsibleNodeInfo.GenerateItemName(databaseName, responsibleNodeInfo.TaskId);
+
+                        using (Slice.From(context.Allocator, itemKey, out Slice valueName))
+                        using (Slice.From(context.Allocator, itemKey.ToLowerInvariant(), out Slice valueNameLowered))
+                        using (var value = context.ReadObject(responsibleNodeInfo.ToJson(), itemKey))
+                        {
+                            UpdateValue(index, items, valueNameLowered, valueName, value);
+                        }
+                    }
+
+                    actions.Add(() =>
+                        Changes.OnDatabaseChanges(databaseName, index, type, DatabasesLandlord.ClusterDatabaseChangeType.ValueChanged, null));
+                }
+
+                ExecuteManyOnDispose(context, index, type, actions);
+
+            }
+            catch (Exception e)
+            {
+                exception = e;
+                throw;
+            }
+            finally
+            {
+                LogCommand(type, index, exception, command);
+            }
         }
 
         private void UpdateDatabasesWithServerWideBackupConfiguration(ClusterOperationContext context, string type, ServerWideBackupConfiguration serverWideBackupConfiguration, long index)
@@ -3786,8 +3896,7 @@ namespace Raven.Server.ServerWide
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
 
             const string dbKey = "db/";
-            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName)>();
-            long? oldTaskId = null;
+            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName, object perDbState)>();
 
             var allServerWideBackupNames = GetSeverWideBackupNames(context);
 
@@ -3796,55 +3905,57 @@ namespace Raven.Server.ServerWide
                 foreach (var result in items.SeekByPrimaryKeyPrefix(loweredPrefix, Slices.Empty, 0))
                 {
                     var (key, _, oldDatabaseRecord) = GetCurrentItem(context, result.Value);
-                    var databaseName = key.Substring(dbKey.Length);
-                    var newBackups = new DynamicJsonArray();
-
-                    var periodicBackupConfiguration = JsonDeserializationCluster.PeriodicBackupConfiguration(serverWideBlittable);
-                    oldDatabaseRecord.TryGet(nameof(DatabaseRecord.Encrypted), out bool encrypted);
-                    PutServerWideBackupConfigurationCommand.UpdateTemplateForDatabase(periodicBackupConfiguration, databaseName, encrypted);
-
-                    if (oldDatabaseRecord.TryGet(nameof(DatabaseRecord.PeriodicBackups), out BlittableJsonReaderArray backups))
-                    {
-                        var isBackupToEditFound = false;
-                        foreach (BlittableJsonReaderObject backup in backups)
-                        {
-                            //Even though we rebuild the whole configurations list just one should be modified
-                            //In addition the same configuration should be modified in all databases
-                            if (isBackupToEditFound || IsServerWideBackupToEdit(backup, periodicBackupConfiguration.Name, allServerWideBackupNames) == false)
-                            {
-                                newBackups.Add(backup);
-                                continue;
-                            }
-
-                            isBackupToEditFound = true;
-
-                            if (backup.TryGet(nameof(PeriodicBackupConfiguration.TaskId), out long taskId))
-                            {
-                                periodicBackupConfiguration.TaskId = taskId;
-                                oldTaskId = taskId;
-                            }
-                        }
-                    }
-
-                    if (serverWideBackupConfiguration.IsExcluded(databaseName) == false)
-                    {
-                        newBackups.Add(periodicBackupConfiguration.ToJson());
-                    }
-
                     using (oldDatabaseRecord)
                     {
-                        oldDatabaseRecord.Modifications = new DynamicJsonValue(oldDatabaseRecord)
-                        {
-                            [nameof(DatabaseRecord.PeriodicBackups)] = newBackups
-                        };
+                        var databaseName = key.Substring(dbKey.Length);
+                        var newBackups = new DynamicJsonArray();
 
+                        var periodicBackupConfiguration = JsonDeserializationCluster.PeriodicBackupConfiguration(serverWideBlittable);
+                        oldDatabaseRecord.TryGet(nameof(DatabaseRecord.Encrypted), out bool encrypted);
+                        PutServerWideBackupConfigurationCommand.UpdateTemplateForDatabase(periodicBackupConfiguration, databaseName, encrypted);
+
+                        var isBackupToEditFound = false;
+                        if (oldDatabaseRecord.TryGet(nameof(DatabaseRecord.PeriodicBackups), out BlittableJsonReaderArray backups))
+                        {
+                            foreach (BlittableJsonReaderObject backup in backups)
+                            {
+                                //Even though we rebuild the whole configurations list just one should be modified
+                                //In addition the same configuration should be modified in all databases
+                                if (isBackupToEditFound || IsServerWideBackupToEdit(backup, periodicBackupConfiguration.Name, allServerWideBackupNames) == false)
+                                {
+                                    newBackups.Add(backup);
+                                    continue;
+                                }
+
+                                isBackupToEditFound = true;
+
+                                if (backup.TryGet(nameof(PeriodicBackupConfiguration.TaskId), out long taskId))
+                                {
+                                    periodicBackupConfiguration.TaskId = taskId;
+                                }
+                            }
+                        }
+
+                        long? periodicBackupTaskId = null;
+                        if (serverWideBackupConfiguration.IsExcluded(databaseName) == false)
+                        {
+                            newBackups.Add(periodicBackupConfiguration.ToJson());
+                            periodicBackupTaskId = periodicBackupConfiguration.TaskId;
+                        }
+                        else if (isBackupToEditFound == false)
+                        {
+                            continue;
+                        }
+
+                        oldDatabaseRecord.Modifications = new DynamicJsonValue(oldDatabaseRecord) { [nameof(DatabaseRecord.PeriodicBackups)] = newBackups };
                         var updatedDatabaseRecord = context.ReadObject(oldDatabaseRecord, "updated-database-record");
-                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName));
+
+                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName, perDbState: periodicBackupTaskId));
                     }
                 }
             }
 
-            ApplyDatabaseRecordUpdates(toUpdate, type, oldTaskId ?? serverWideBackupConfiguration.TaskId, index, items, context);
+            ApplyDatabaseRecordUpdates(toUpdate, type, index, items, context);
         }
 
         private static bool IsServerWideBackupToEdit(BlittableJsonReaderObject databaseTask, string serverWideTaskName, HashSet<string> allServerWideTasksNames)
@@ -3932,7 +4043,7 @@ namespace Raven.Server.ServerWide
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
 
             const string dbKey = "db/";
-            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName)>();
+            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName, object)>();
 
             using (Slice.From(context.Allocator, dbKey, out var loweredPrefix))
             {
@@ -4024,13 +4135,13 @@ namespace Raven.Server.ServerWide
                         };
 
                         var updatedDatabaseRecord = context.ReadObject(oldDatabaseRecord, "updated-database-record");
-                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName));
+                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: databaseName, null));
                     }
                 }
             }
 
             // we don't mind indexForValueChanges for ServerWideExternalReplication
-            ApplyDatabaseRecordUpdates(toUpdate, type, serverWideExternalReplication.TaskId, index, items, context);
+            ApplyDatabaseRecordUpdates(toUpdate, type, index, items, context);
         }
 
         private static unsafe HashSet<string> GetAllSeverWideExternalReplicationNames(ClusterOperationContext context)
@@ -4057,14 +4168,14 @@ namespace Raven.Server.ServerWide
         {
             if (deleteConfiguration == null)
                 throw new RachisInvalidOperationException($"No configuration was supplied to {type}: raftIndex {index}");
-            
+
             if (string.IsNullOrWhiteSpace(deleteConfiguration.TaskName))
                 throw new RachisInvalidOperationException($"Task name to delete cannot be null or white space for command type {type} : raftIndex {index}");
 
             var items = context.Transaction.InnerTransaction.OpenTable(ItemsSchema, Items);
 
             const string dbKey = "db/";
-            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName)>();
+            var toUpdate = new List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName, object)>();
             var databaseRecordTaskName = DeleteServerWideTaskCommand.GetDatabaseRecordTaskName(deleteConfiguration);
 
             using (Slice.From(context.Allocator, dbKey, out var loweredPrefix))
@@ -4153,12 +4264,12 @@ namespace Raven.Server.ServerWide
                     using (oldDatabaseRecord)
                     {
                         var updatedDatabaseRecord = context.ReadObject(oldDatabaseRecord, "updated-database-record");
-                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: key.Substring(dbKey.Length)));
+                        toUpdate.Add((Key: key, DatabaseRecord: updatedDatabaseRecord, DatabaseName: key.Substring(dbKey.Length), null));
                     }
                 }
             }
 
-            ApplyDatabaseRecordUpdates(toUpdate, type, index, index, items, context);
+            ApplyDatabaseRecordUpdates(toUpdate, type, index, items, context);
         }
 
         private void ToggleServerWideTaskState(BlittableJsonReaderObject cmd, ToggleServerWideTaskStateCommand.Parameters parameters, ClusterOperationContext context, string type, long index)
@@ -4197,9 +4308,9 @@ namespace Raven.Server.ServerWide
                    taskNameToFind.Equals(foundTaskName, StringComparison.OrdinalIgnoreCase);
         }
 
-        private void ApplyDatabaseRecordUpdates(List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName)> toUpdate, string type, long indexForValueChanges, long index, Table items, ClusterOperationContext context)
+        private void ApplyDatabaseRecordUpdates(List<(string Key, BlittableJsonReaderObject DatabaseRecord, string DatabaseName, object perDbState)> toUpdate, string type, long index, Table items, ClusterOperationContext context)
         {
-            var tasks = new List<Func<Task>> { () => Changes.OnValueChanges(indexForValueChanges, type) };
+            var tasks = new List<Func<Task>> { () => Changes.OnValueChanges(index, type) };
 
             foreach (var update in toUpdate)
             {
@@ -4209,7 +4320,7 @@ namespace Raven.Server.ServerWide
                     UpdateValue(index, items, valueNameLowered, valueName, update.DatabaseRecord);
                 }
 
-                tasks.Add(() => Changes.OnDatabaseChanges(update.DatabaseName, index, type, DatabasesLandlord.ClusterDatabaseChangeType.RecordChanged, null));
+                tasks.Add(() => Changes.OnDatabaseChanges(update.DatabaseName, index, type, DatabasesLandlord.ClusterDatabaseChangeType.RecordChanged, update.perDbState));
             }
 
             ExecuteManyOnDispose(context, index, type, tasks);
@@ -4310,7 +4421,7 @@ namespace Raven.Server.ServerWide
 
         public IEnumerable<BlittableJsonReaderObject> GetReplicationHubCertificateByHub(TransactionOperationContext context, string database, string hub, string filter, int start, int pageSize)
         {
-            using var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
+            var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
 
             string prefixString = (database + "/" + hub + "/").ToLowerInvariant();
             using var _ = Slice.From(context.Allocator, prefixString, out var prefix);
@@ -4349,7 +4460,7 @@ namespace Raven.Server.ServerWide
 
         public IEnumerable<(string Hub, ReplicationHubAccess Access)> GetReplicationHubCertificateForDatabase(TransactionOperationContext context, string database)
         {
-            using var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
+            var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
 
             string prefixString = (database + "/").ToLowerInvariant();
             using var _ = Slice.From(context.Allocator, prefixString, out var prefix);
@@ -4387,7 +4498,7 @@ namespace Raven.Server.ServerWide
 
         public bool IsReplicationCertificate(TransactionOperationContext context, string database, string hub, X509Certificate2 userCert, out DetailedReplicationHubAccess access)
         {
-            using var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
+            var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
 
             using var __ = Slice.From(context.Allocator, (database + "/" + hub + "/" + userCert.Thumbprint).ToLowerInvariant(), out var key);
 
@@ -4405,7 +4516,7 @@ namespace Raven.Server.ServerWide
 
         public unsafe bool IsReplicationCertificateByPublicKeyPinningHash(TransactionOperationContext context, string database, string hub, X509Certificate2 userCert, SecurityConfiguration securityConfiguration, out DetailedReplicationHubAccess access)
         {
-            using var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
+            var certs = context.Transaction.InnerTransaction.OpenTable(ReplicationCertificatesSchema, ReplicationCertificatesSlice);
             // maybe we need to check by public key hash?
             string publicKeyPinningHash = userCert.GetPublicKeyPinningHash();
 
@@ -4428,7 +4539,7 @@ namespace Raven.Server.ServerWide
                 new Span<byte>(p, size).CopyTo(buffer);
                 using var knownCert = CertificateLoaderUtil.CreateCertificate(buffer);
 
-                if (CertificateUtils.CertHasKnownIssuer(userCert, knownCert, securityConfiguration, out var _) == false)
+                if (CertificateUtils.CertHasKnownIssuer(userCert, knownCert, securityConfiguration) == false)
                     continue;
 
                 access = JsonDeserializationCluster.DetailedReplicationHubAccess(obj);
@@ -4437,280 +4548,5 @@ namespace Raven.Server.ServerWide
 
             return false;
         }
-    }
-
-    public class RachisLogIndexNotifications : IDisposable
-    {
-        public long LastModifiedIndex;
-        private readonly AsyncManualResetEvent _notifiedListeners;
-        private readonly ConcurrentQueue<ErrorHolder> _errors = new ConcurrentQueue<ErrorHolder>();
-        private int _numberOfErrors;
-        private readonly ConcurrentDictionary<long, TaskCompletionSource<object>> _tasksDictionary = new ConcurrentDictionary<long, TaskCompletionSource<object>>();
-
-        public readonly Queue<RecentLogIndexNotification> RecentNotifications = new Queue<RecentLogIndexNotification>();
-        internal Logger Log;
-        private SingleUseFlag _isDisposed = new SingleUseFlag();
-        private class ErrorHolder
-        {
-            public long Index;
-            public ExceptionDispatchInfo Exception;
-        }
-
-        public RachisLogIndexNotifications(CancellationToken token)
-        {
-            _notifiedListeners = new AsyncManualResetEvent(token);
-        }
-
-        public void Dispose()
-        {
-            _isDisposed.Raise();
-            _notifiedListeners.Dispose();
-            foreach (var task in _tasksDictionary.Values)
-            {
-                task.TrySetCanceled();
-            }
-        }
-
-        public async Task WaitForIndexNotification(long index, CancellationToken token)
-        {
-            Task<bool> waitAsync;
-            while (true)
-            {
-                // first get the task, then wait on it
-                waitAsync = _notifiedListeners.WaitAsync(token);
-
-                if (index <= Interlocked.Read(ref LastModifiedIndex))
-                    break;
-
-                if (token.IsCancellationRequested)
-                    ThrowCanceledException(index, LastModifiedIndex, isExecution: false);
-
-                if (await waitAsync == false)
-                {
-                    var copy = Interlocked.Read(ref LastModifiedIndex);
-                    if (index <= copy)
-                        break;
-                }
-            }
-
-            if (await WaitForTaskCompletion(index, new Lazy<Task>(waitAsync)))
-                return;
-
-            ThrowCanceledException(index, LastModifiedIndex, isExecution: true);
-        }
-
-        public async Task WaitForIndexNotification(long index, TimeSpan timeout)
-        {
-            while (true)
-            {
-                // first get the task, then wait on it
-                var waitAsync = _notifiedListeners.WaitAsync(timeout);
-
-                if (index <= Interlocked.Read(ref LastModifiedIndex))
-                    break;
-
-                if (await waitAsync == false)
-                {
-                    var copy = Interlocked.Read(ref LastModifiedIndex);
-                    if (index <= copy)
-                        break;
-
-                    ThrowTimeoutException(timeout, index, copy);
-                }
-            }
-
-            if (await WaitForTaskCompletion(index, new Lazy<Task>(TimeoutManager.WaitFor(timeout))))
-                return;
-
-            ThrowTimeoutException(timeout, index, LastModifiedIndex, isExecution: true);
-        }
-
-        private async Task<bool> WaitForTaskCompletion(long index, Lazy<Task> waitingTask)
-        {
-            if (_tasksDictionary.TryGetValue(index, out var tcs) == false)
-            {
-                // the task has already completed
-                // let's check if we had errors in it
-                foreach (var error in _errors)
-                {
-                    if (error.Index == index)
-                        error.Exception.Throw(); // rethrow
-                }
-
-                return true;
-            }
-
-            var task = tcs.Task;
-
-            if (task.IsCompleted)
-            {
-                if (task.IsFaulted)
-                {
-                    try
-                    {
-                        await task; // will throw on error
-                    }
-                    catch (Exception e)
-                    {
-                        ThrowApplyException(index, e);
-                    }
-                }
-
-                if (task.IsCanceled)
-                    ThrowCanceledException(index, LastModifiedIndex);
-
-                return true;
-            }
-
-            var result = await Task.WhenAny(task, waitingTask.Value);
-
-            if (result.IsFaulted)
-                await result; // will throw
-
-            if (task.IsCanceled)
-                ThrowCanceledException(index, LastModifiedIndex);
-
-            if (result == task)
-                return true;
-
-            return false;
-        }
-
-        private void ThrowCanceledException(long index, long lastModifiedIndex, bool isExecution = false)
-        {
-            var openingString = isExecution
-                ? $"Cancelled while waiting for task with index {index} to complete. "
-                : $"Cancelled while waiting to get an index notification for {index}. ";
-
-            var closingString = isExecution
-                ? string.Empty
-                : Environment.NewLine +
-                  PrintLastNotifications();
-
-            throw new OperationCanceledException(openingString +
-                                       $"Last commit index is: {lastModifiedIndex}. " +
-                                       $"Number of errors is: {_numberOfErrors}." + closingString);
-        }
-
-        private void ThrowTimeoutException(TimeSpan value, long index, long lastModifiedIndex, bool isExecution = false)
-        {
-            var openingString = isExecution
-                ? $"Waited for {value} for task with index {index} to complete. "
-                : $"Waited for {value} but didn't get an index notification for {index}. ";
-
-            var closingString = isExecution
-                ? string.Empty
-                : Environment.NewLine +
-                  PrintLastNotifications();
-
-            throw new TimeoutException(openingString +
-                                       $"Last commit index is: {lastModifiedIndex}. " +
-                                       $"Number of errors is: {_numberOfErrors}." + closingString);
-        }
-
-        private void ThrowApplyException(long index, Exception e)
-        {
-            throw new InvalidOperationException($"Index {index} was successfully committed, but the apply failed.", e);
-        }
-
-        private string PrintLastNotifications()
-        {
-            var notifications = RecentNotifications.ToArray();
-            var builder = new StringBuilder(notifications.Length);
-            foreach (var notification in notifications)
-            {
-                builder
-                    .Append("Index: ")
-                    .Append(notification.Index)
-                    .Append(". Type: ")
-                    .Append(notification.Type)
-                    .Append(". ExecutionTime: ")
-                    .Append(notification.ExecutionTime)
-                    .Append(". Term: ")
-                    .Append(notification.Term)
-                    .Append(". LeaderErrorCount: ")
-                    .Append(notification.LeaderErrorCount)
-                    .Append(". LeaderShipDuration: ")
-                    .Append(notification.LeaderShipDuration)
-                    .Append(". Exception: ")
-                    .Append(notification.Exception)
-                    .AppendLine();
-            }
-            return builder.ToString();
-        }
-
-        public void RecordNotification(RecentLogIndexNotification notification)
-        {
-            RecentNotifications.Enqueue(notification);
-            while (RecentNotifications.Count > 25)
-                RecentNotifications.TryDequeue(out _);
-        }
-
-        public void NotifyListenersAbout(long index, Exception e)
-        {
-            if (e != null)
-            {
-                _errors.Enqueue(new ErrorHolder
-                {
-                    Index = index,
-                    Exception = ExceptionDispatchInfo.Capture(e)
-                });
-
-                if (Interlocked.Increment(ref _numberOfErrors) > 25)
-                {
-                    _errors.TryDequeue(out _);
-                    Interlocked.Decrement(ref _numberOfErrors);
-                }
-            }
-
-            ThreadingHelper.InterlockedExchangeMax(ref LastModifiedIndex, index);
-            _notifiedListeners.SetAndResetAtomically();
-        }
-
-        public void SetTaskCompleted(long index, Exception e)
-        {
-            if (_tasksDictionary.TryGetValue(index, out var tcs))
-            {
-                // set the task as finished
-                if (e == null)
-                {
-                    if (tcs.TrySetResult(null) == false)
-                        LogFailureToSetTaskResult();
-                }
-                else
-                {
-                    if (tcs.TrySetException(e) == false)
-                        LogFailureToSetTaskResult();
-                }
-
-                void LogFailureToSetTaskResult()
-                {
-                    if (Log.IsInfoEnabled)
-                        Log.Info($"Failed to set result of task with index {index}");
-                }
-            }
-
-            _tasksDictionary.TryRemove(index, out _);
-        }
-
-        public void AddTask(long index)
-        {
-            Debug.Assert(_tasksDictionary.TryGetValue(index, out _) == false, $"{nameof(_tasksDictionary)} should not contain task with key {index}");
-            if (_isDisposed.IsRaised())
-                throw new ObjectDisposedException(nameof(RachisLogIndexNotifications));
-
-            _tasksDictionary.TryAdd(index, new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
-        }
-    }
-
-    public class RecentLogIndexNotification
-    {
-        public string Type;
-        public TimeSpan ExecutionTime;
-        public long Index;
-        public int? LeaderErrorCount;
-        public long? Term;
-        public long? LeaderShipDuration;
-        public Exception Exception;
     }
 }

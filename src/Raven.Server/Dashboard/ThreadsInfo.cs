@@ -23,6 +23,8 @@ namespace Raven.Server.Dashboard
 
         public long ThreadsCount => List.Count;
 
+        public int DedicatedThreadsCount { get; set; }
+
         public ThreadsInfo(int? take)
         {
             _take = take;
@@ -55,6 +57,7 @@ namespace Raven.Server.Dashboard
                 [nameof(ProcessCpuUsage)] = ProcessCpuUsage,
                 [nameof(ActiveCores)] = ActiveCores,
                 [nameof(ThreadsCount)] = ThreadsCount,
+                [nameof(DedicatedThreadsCount)] = DedicatedThreadsCount,
                 [nameof(List)] = new DynamicJsonArray(List.Take(_take ?? int.MaxValue).Select(x => x.ToJson()))
             };
         }
@@ -69,6 +72,8 @@ namespace Raven.Server.Dashboard
         public string Name { get; set; }
 
         public int? ManagedThreadId { get; set; }
+
+        public long? UnmanagedAllocationsInBytes { get; set; }
 
         public DateTime? StartingTime { get; set; }
 
@@ -94,6 +99,7 @@ namespace Raven.Server.Dashboard
                 [nameof(CpuUsage)] = CpuUsage,
                 [nameof(Name)] = Name,
                 [nameof(ManagedThreadId)] = ManagedThreadId,
+                [nameof(UnmanagedAllocationsInBytes)] = UnmanagedAllocationsInBytes,
                 [nameof(StartingTime)] = StartingTime,
                 [nameof(Duration)] = Duration,
                 [nameof(TotalProcessorTime)] = TotalProcessorTime,
